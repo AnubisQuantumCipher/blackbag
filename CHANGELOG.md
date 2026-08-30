@@ -44,6 +44,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A failed record list kept asserting itself after a successful one.** The
   footer went on showing "could not read the record list" over a record list
   that was plainly on screen. A list that succeeds now clears it.
+- **The agent unit could not start on a machine with no vault yet.** Its
+  sandbox names `~/.local/share/black-bag` and `~/.local/state/black-bag` in
+  `ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths`
+  do not exist — with a bare `status=226/NAMESPACE` that names no path. Anyone
+  who enabled the agent before running `init` hit it. The installer now creates
+  both directories, and the paths carry a leading `-` so a directory removed by
+  hand degrades into a readable engine-level error instead.
 
 [2.2.0]: https://github.com/AnubisQuantumCipher/blackbag/releases/tag/v2.2.0
 

@@ -69,6 +69,15 @@ fi
 #    Not enabled by default: starting it is the user's decision, because a
 #    running agent is what makes an unlocked vault survive between commands.
 mkdir -p "$UNIT_DIR"
+
+# The unit's sandbox names these directories in ReadWritePaths, and systemd
+# refuses to start a unit whose ReadWritePaths do not exist — with a bare
+# `status=226/NAMESPACE` that says nothing about which path is missing. On a
+# machine that has not run `black-bag init` yet they legitimately do not exist,
+# so create them here and let the engine own their contents.
+mkdir -p "$HOME/.local/share/black-bag" "$HOME/.local/state/black-bag"
+chmod 700 "$HOME/.local/share/black-bag" "$HOME/.local/state/black-bag"
+
 cat > "$UNIT_DIR/black-bag-agent.service" <<UNIT
 [Unit]
 Description=Black-Bag unlock agent
@@ -87,7 +96,10 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/black-bag %h/.local/state/black-bag %t/black-bag
+# Leading `-` so a directory that has been removed by hand degrades into an
+# ordinary engine-level error instead of a namespace failure the operator
+# cannot read.
+ReadWritePaths=-%h/.local/share/black-bag -%h/.local/state/black-bag -%t/black-bag
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
