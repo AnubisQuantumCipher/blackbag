@@ -2,6 +2,8 @@
 
 Credential storage for Omarchy, with a full-screen command deck.
 
+![The unlocked deck](docs/screenshots/deck.png)
+
 This is a Linux-only rebuild of the engine behind the [`black-bagg`][crate]
 crate, plus a Quickshell plugin (`khephri.blackbag`) that gives it a bar widget
 and a mission-control cockpit.
@@ -25,6 +27,43 @@ several of them load-bearing. They are written up in **[`docs/AUDIT.md`][audit]*
 
 If you read one thing before trusting this with a credential, read the
 **non-claims** section of the whitepaper.
+
+---
+
+## What it looks like
+
+**Sealed.** Four things at rest: the wordmark, the field, the rule under it, and
+one identity line. The fingerprint says which vault this claims to be; the
+witness word says whether this machine agrees. Nothing else appears unless there
+is a reason.
+
+![The sealed screen](docs/screenshots/sealed.png)
+
+**A reason.** The two hazards that earn an interruption are a vault older than
+the last one seen here, and a debugger attached to the session. A rollback warns
+but never blocks — restoring a legitimate backup must not lock you out — so the
+verb becomes *unlock anyway*. A debugger blocks completely and offers no
+override, because it reads the passphrase keystroke by keystroke and the harm is
+finished before Enter.
+
+![A detected rollback](docs/screenshots/rollback.png)
+
+**Live 2FA**, with the countdown arc that turns red in the last five seconds.
+Copying a code copies the *code*, not the stored shared secret.
+
+![The TOTP panel](docs/screenshots/totp.png)
+
+**Authoring**, because a vault you cannot fill is a viewer. Twelve kinds, each
+with the fields it actually needs, a generator on `Ctrl+G`, and `otpauth://`
+enrolment that fills in everything from one paste.
+
+![The record editor](docs/screenshots/editor.png)
+
+Note the **HYGIENE** panel in the first screenshot. GitHub and GitLab there
+share a password, and the vault says so — without ever comparing, storing, or
+displaying a secret. Every field carries a non-reversible handle, so identical
+values collide by construction. It is computed on your machine; nothing is sent
+anywhere.
 
 ---
 
