@@ -21,6 +21,7 @@ import argparse
 import pathlib
 import re
 import sys
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent
 PLUGIN = ROOT.parent / "plugin" / "khephri.blackbag"
@@ -214,6 +215,15 @@ def main():
         stale.append(name)
         if not args.check:
             target.write_text(text)
+
+    # A write and a build in the same shell chain can land in the same second,
+    # and a qmlcache artifact stamped in that second ties with the source —
+    # which make reads as "up to date", silently shipping the OLD compiled QML
+    # forever after. That cost a full debugging session: every new handler
+    # "didn't work" because the running app had never actually contained it.
+    # One second of patience closes the window for good.
+    if stale and not args.check:
+        time.sleep(1.05)
 
     if args.check:
         if stale:

@@ -823,6 +823,11 @@ function resolvePluginSettings(shellConfig, manifest, pluginId) {
 // again; `theme` and `window` are the application's own and are handled in
 // C++, not here.
 var DESKTOP_DEFAULTS = {
+  // 0 is the sentinel for "size from the viewport"; any positive number is an
+  // operator-chosen scale. Listed here because desktopSettings copies ONLY
+  // known keys — leaving it out meant the saved scale was written faithfully
+  // and then filtered out on every read, so ⌘+/⌘- never survived a restart.
+  uiScale: 0,
   staleAfterSec: 120,
   clipboardClearSec: 30,
   revealSeconds: 10,

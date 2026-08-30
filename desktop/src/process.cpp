@@ -66,6 +66,12 @@ void Process::start() {
   mErrDecoder = QStringDecoder(QStringDecoder::Utf8);
   mSettled = false;
 
+  // Each run starts with empty sinks, exactly as Quickshell's do. Skipping
+  // this is how "the record list broke after the first refresh" happens: the
+  // second run's JSON lands appended to the first run's, and the parse throws.
+  if (mStdout) mStdout->reset();
+  if (mStderr) mStderr->reset();
+
   connect(mProc, &QProcess::readyReadStandardOutput, this,
           [this] { drain(QProcess::StandardOutput); });
   connect(mProc, &QProcess::readyReadStandardError, this,

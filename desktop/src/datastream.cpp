@@ -51,3 +51,20 @@ void SplitParser::finish() {
     emit read(tail);
   }
 }
+
+// The buffer routinely holds a revealed secret between runs, so it is
+// overwritten before it is released rather than merely detached.
+void StdioCollector::reset() {
+  if (!mText.isEmpty()) {
+    mText.fill(u'\0');
+    mText.clear();
+    emit textChanged();
+  }
+}
+
+void SplitParser::reset() {
+  if (!mBuffer.isEmpty()) {
+    mBuffer.fill(u'\0');
+    mBuffer.clear();
+  }
+}

@@ -54,10 +54,42 @@ Item {
     Qt.callLater(function () {
       titleField.text = record ? String(record.title || "") : ""
       tagsField.text = record ? Model.asList(record.tags).join(", ") : ""
+
+      // Every field is (re)seeded imperatively, every time. The attribute
+      // delegates declare a binding from seedRecord, but a binding on a text
+      // field dies the first time someone types into it — so a form that was
+      // typed in once would show that session's values forever after: the
+      // previous record's username on a fresh "new login", one record's
+      // attributes under another record's edit. The bindings only cover the
+      // delegate's first creation; this covers every open after that.
+      var seed = record ? Model.attrMap(record) : ({})
+      for (var a = 0; a < attrRepeater.count; a++) {
+        var ai = attrRepeater.itemAt(a)
+        if (ai) ai.setText(seed[ai.fieldName] === undefined ? "" : String(seed[ai.fieldName]))
+      }
+      // Secret boxes always open empty. In edit mode blank means "keep what
+      // is stored" — and in every mode, a password typed during an earlier
+      // visit must not still be sitting in the widget now.
+      for (var i = 0; i < secretRepeater.count; i++) {
+        var si = secretRepeater.itemAt(i)
+        if (si) si.setText("")
+      }
+
       totpUri.text = ""
       totpSecret.text = ""
       titleField.focusInput()
     })
+  }
+
+  // Enter in a single-line field moves to the next one, and on the last field
+  // it saves — the same rhythm the first-run sheet already taught. Before
+  // this, Enter in the editor did nothing at all, which reads as a broken
+  // form to anyone whose hands expect Enter to mean "go on".
+  function advanceOrSave() {
+    var chain = fieldChain()
+    var at = focusIndex()
+    if (at >= 0 && at === chain.length - 1) editor.save()
+    else editor.moveFocus(1)
   }
 
   function dismiss() {
@@ -135,7 +167,15 @@ Item {
                         editor.isEdit)
 
   function save() {
-    if (editor.saving) return
+    // A previous save still in flight must be said out loud, not swallowed:
+    // setting `running = true` on an already-running process is a silent
+    // no-op, so without this the button would read SAVING… forever and the
+    // new draft would simply vanish.
+    if (saveProcess.running) {
+      editor.errorText = "the previous save is still finishing"
+      return
+    }
+    if (editor.saving) editor.saving = false   // stale flag from a dismissed sheet
     var missing = Model.draftProblems(editor.kind, titleField.text,
                                       editor.secretValues(), editor.totpInput(),
                                       editor.isEdit)
@@ -175,6 +215,12 @@ Item {
       editor.saving = false
       if (code === 0) {
         var id = String(this.stdout && this.stdout.text ? this.stdout.text : "").trim()
+        // The engine holds the record now; the widgets must not. A password
+        // left in a closed sheet is a password the next `n` would exhume.
+        for (var i = 0; i < secretRepeater.count; i++) {
+          var item = secretRepeater.itemAt(i)
+          if (item) item.setText("")
+        }
         editor.open_ = false
         editor.saved(id.length > 0 ? id : editor.recordId)
       } else {
@@ -477,6 +523,9 @@ Item {
           label: editor.saving ? "SAVING…" : (editor.isEdit ? "SAVE" : "CREATE")
           tone: Color.accent
           enabledAction: !editor.saving && editor.problems.length === 0
+          // Clickable even while dim: save() itself says "still needs a
+          // title" where a disabled button would say nothing at all.
+          tappable: !editor.saving
           onActivated: editor.save()
         }
       }
@@ -535,10 +584,78 @@ Item {
 
   // ── primitives ───────────────────────────────────────────────────────────
 
+  FieldMenu { id: fieldMenu }
+
+  // ── mouse paste ────────────────────────────────────────────────────────────
+  //
+  // Qt Quick's text controls ship with no context menu at all, which in a
+  // password manager means the one thing everyone does — paste a password in
+  // with the mouse — silently does nothing. Cut and copy stay disabled while
+  // the field is masking its contents: a reveal has a countdown and an audit
+  // trail, and a context menu must not become the quiet way around both.
+  component FieldMenuItem: MenuItem {
+    id: fmi
+    implicitHeight: editor.metric.spacing.controlHeight
+    implicitWidth: editor.metric.space(170)
+    contentItem: Text {
+      text: fmi.text
+      color: fmi.enabled ? Color.foreground : Util.alpha(Color.foreground, 0.3)
+      font.family: editor.metric.font.family
+      font.pixelSize: editor.metric.font.caption
+      verticalAlignment: Text.AlignVCenter
+      leftPadding: editor.metric.space(10)
+      renderType: Text.NativeRendering
+    }
+    background: Rectangle {
+      color: fmi.highlighted ? Util.alpha(Color.accent, 0.15) : "transparent"
+    }
+  }
+
+  component FieldMenu: Menu {
+    id: fmenu
+    property Item target: null
+    readonly property bool masked:
+      fmenu.target && fmenu.target.echoMode !== undefined
+        ? fmenu.target.echoMode !== TextInput.Normal : false
+    background: Rectangle {
+      implicitWidth: editor.metric.space(170)
+      color: Color.background
+      border.color: Util.alpha(Color.accent, 0.4)
+      border.width: Math.max(1, editor.metric.spacing.hairline)
+      radius: editor.metric.cornerRadius
+    }
+    FieldMenuItem {
+      text: "Cut"
+      enabled: fmenu.target && !fmenu.masked && fmenu.target.selectedText.length > 0
+      onTriggered: fmenu.target.cut()
+    }
+    FieldMenuItem {
+      text: "Copy"
+      enabled: fmenu.target && !fmenu.masked && fmenu.target.selectedText.length > 0
+      onTriggered: fmenu.target.copy()
+    }
+    FieldMenuItem {
+      text: "Paste"
+      enabled: fmenu.target && fmenu.target.canPaste
+      onTriggered: fmenu.target.paste()
+    }
+    FieldMenuItem {
+      text: "Select all"
+      enabled: fmenu.target && fmenu.target.length > 0
+      onTriggered: fmenu.target.selectAll()
+    }
+  }
+
   component SheetButton: Rectangle {
     property string label: ""
     property color tone: Color.foreground
     property bool enabledAction: true
+    // Whether a click is ACCEPTED, as opposed to how the button LOOKS.
+    // These were one property, and that is exactly how "I hit create and
+    // nothing happened" happens: a not-ready button swallowed the click and
+    // gave nothing back. Now a dimmed button still takes the click, and the
+    // handler answers with what is missing.
+    property bool tappable: enabledAction
     signal activated()
     implicitWidth: btnText.implicitWidth + metric.space(22)
     implicitHeight: metric.spacing.controlHeight
@@ -562,8 +679,8 @@ Item {
       id: btnMouse
       anchors.fill: parent
       hoverEnabled: true
-      cursorShape: parent.enabledAction ? Qt.PointingHandCursor : Qt.ArrowCursor
-      onClicked: if (parent.enabledAction) parent.activated()
+      cursorShape: parent.tappable ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: if (parent.tappable) parent.activated()
     }
     Behavior on color { ColorAnimation { duration: editor.motionMs } }
   }
@@ -638,6 +755,22 @@ Item {
 
     InputField {
       id: singleLine
+      // Enter means "go on": next field, or save from the last one. It calls
+      // up to the editor because which field is last is the form's knowledge,
+      // not this component's.
+      onAccepted: editor.advanceOrSave()
+      // Tab is fenced inside the sheet. Left to Qt's window-wide focus chain
+      // it walks in creation order — which, one Tab past the last field,
+      // lands the caret in the deck's search box BEHIND the modal.
+      activeFocusOnTab: false
+      Keys.onPressed: function (event) {
+        if (event.key === Qt.Key_Backtab
+            || (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
+          editor.moveFocus(-1); event.accepted = true
+        } else if (event.key === Qt.Key_Tab) {
+          editor.moveFocus(1); event.accepted = true
+        }
+      }
       font.pixelSize: editor.metric.font.body
       topPadding: editor.metric.spacing.inputPaddingY
       bottomPadding: editor.metric.spacing.inputPaddingY
@@ -650,7 +783,16 @@ Item {
       activeFocusOnPress: true
       TapHandler {
         // Cooperates with the enclosing Flickable, which a MouseArea would not.
+        acceptedButtons: Qt.LeftButton
         onTapped: singleLine.forceActiveFocus()
+      }
+      TapHandler {
+        acceptedButtons: Qt.RightButton
+        onTapped: {
+          singleLine.forceActiveFocus()
+          fieldMenu.target = singleLine
+          fieldMenu.popup()
+        }
       }
     }
 
@@ -668,10 +810,32 @@ Item {
         clip: true
         TextArea {
           id: multiLine
+          // Same fence as the single-line fields; in a form, Tab means "next
+          // field", not "insert a tab character into the note".
+          activeFocusOnTab: false
+          Keys.onPressed: function (event) {
+            if (event.key === Qt.Key_Backtab
+                || (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
+              editor.moveFocus(-1); event.accepted = true
+            } else if (event.key === Qt.Key_Tab) {
+              editor.moveFocus(1); event.accepted = true
+            }
+          }
           topPadding: editor.metric.spacing.inputPaddingY
           bottomPadding: editor.metric.spacing.inputPaddingY
           activeFocusOnPress: true
-          TapHandler { onTapped: multiLine.forceActiveFocus() }
+          TapHandler {
+            acceptedButtons: Qt.LeftButton
+            onTapped: multiLine.forceActiveFocus()
+          }
+          TapHandler {
+            acceptedButtons: Qt.RightButton
+            onTapped: {
+              multiLine.forceActiveFocus()
+              fieldMenu.target = multiLine
+              fieldMenu.popup()
+            }
+          }
           wrapMode: TextArea.WrapAnywhere
           color: Color.foreground
           font.family: metric.font.family

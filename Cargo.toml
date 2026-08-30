@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/blackbag-core", "crates/blackbag-cli"]
 
 [workspace.package]
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["sicarii <khephri.labs@proton.me>"]

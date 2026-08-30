@@ -190,7 +190,12 @@ Item {
 
     Qt.callLater(function () {
       keyCatcher.forceActiveFocus()
-      if (!root.unlocked) passField.forceActiveFocus()
+      // Only focus the passphrase box when it is actually on screen. A stale
+      // or missing status hides it — and Qt happily grants focus to an
+      // invisible field, which then eats every keystroke the deck was
+      // advertising, silently accumulating them in a hidden passphrase buffer
+      // until Enter ships the garbage to the agent.
+      if (!root.unlocked && passField.visible) passField.forceActiveFocus()
     })
   }
 
@@ -242,11 +247,28 @@ Item {
       root.status = parsed
       Qt.callLater(root.maybeOnboard)
       var nowUnlocked = !!(parsed.session && parsed.session.unlocked)
-      if (nowUnlocked && !wasUnlocked) root.refreshRecords()
+      if (nowUnlocked && !wasUnlocked) {
+        root.refreshRecords()
+        // Unlocked from outside — the CLI, or a stale status catching up. The
+        // keyboard may still be sitting on the sealed screen's (now hidden)
+        // passphrase field; hand it to the deck or every footer key is dead.
+        Qt.callLater(function () { if (root.opened) keyCatcher.forceActiveFocus() })
+      }
       if (!nowUnlocked && wasUnlocked) {
         root.records = []
         root.hygiene = null
         root.clearSecrets()
+        // The editor cannot outlive the session it was editing. Left open it
+        // sits invisibly UNDER the sealed screen — holding whatever password
+        // was mid-type, and worse, wedging Esc: the sealed screen's shortcuts
+        // are gated on the editor being closed, so an idle-lock during an
+        // edit made Esc completely dead. dismiss() also wipes its fields.
+        if (recordEditor.open_) recordEditor.dismiss()
+        // And the sealed screen must come up ready to type: the footer says
+        // "⏎ unlock", which is a lie unless the passphrase box has the caret.
+        Qt.callLater(function () {
+          if (root.opened && passField.visible) passField.forceActiveFocus()
+        })
       }
     } catch (e) {
       // Partial read during the atomic replace; keep the last good document.
@@ -302,8 +324,13 @@ Item {
   function backOut() {
     if (root.revealedValue.length > 0) { root.clearReveal(); return }
     if (root.pendingDeleteId.length > 0) { root.pendingDeleteId = ""; return }
-    if (root.unlocked && searchField.activeFocus && searchField.text.length > 0) {
-      searchField.text = ""
+    if (root.unlocked && searchField.activeFocus) {
+      // First Esc clears the query; a second hands the keyboard back to the
+      // list. It used to fall through to dismiss() when the box was already
+      // empty — so Esc-Esc from a search closed the whole window, when every
+      // instinct says it should have landed you back on the records.
+      if (searchField.text.length > 0) searchField.text = ""
+      else keyCatcher.forceActiveFocus()
       return
     }
     root.dismiss()
@@ -327,7 +354,7 @@ Item {
   }
 
   function copyField(record, field) {
-    if (!record || !field) return
+    if (!record || !field) { root.actionNote = "no record selected"; return }
     root.actionError = ""
 
     // A `totp` field holds the raw shared secret, which is binary — copying it
@@ -345,7 +372,7 @@ Item {
   }
 
   function showField(record, field) {
-    if (!record || !field) return
+    if (!record || !field) { root.actionNote = "no record selected"; return }
     if (String(field) === "totp") {
       // The live code is already on screen in the TOTP card; the stored secret
       // is binary and there is nothing useful to show.
@@ -380,12 +407,14 @@ Item {
   }
 
   function beginEdit() {
-    if (!root.unlocked || !root.selectedRecord) return
+    if (!root.unlocked) return
+    if (!root.selectedRecord) { root.actionNote = "no record selected"; return }
     recordEditor.begin("edit", String(root.selectedRecord.kind), root.selectedRecord)
   }
 
   function requestDelete() {
-    if (!root.unlocked || !root.selectedRecord) return
+    if (!root.unlocked) return
+    if (!root.selectedRecord) { root.actionNote = "no record selected"; return }
     var id = String(root.selectedRecord.id)
     if (root.pendingDeleteId === id) {
       deleteProcess.command = ["black-bag", "agent", "delete", id, "--yes"]
@@ -806,6 +835,17 @@ Item {
           return
         }
 
+        // Sealed, with keyCatcher holding the keys (the passphrase box hidden
+        // or unfocused): the footer says ⏎ is the way in, so it is — unlock,
+        // or reopen the offer to create a vault. Without this, Enter fell
+        // through to "copy the selected record" with nothing selected.
+        if (!root.unlocked
+            && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
+          root.doUnlock()
+          event.accepted = true
+          return
+        }
+
         if (event.key === Qt.Key_Slash) {
           searchField.forceActiveFocus()
           event.accepted = true
@@ -845,6 +885,68 @@ Item {
       }
 
       // ── reusable primitives ─────────────────────────────────────────────────
+
+      FieldMenu { id: fieldMenu }
+
+  // ── mouse paste ────────────────────────────────────────────────────────────
+  //
+  // Qt Quick's text controls ship with no context menu at all, which in a
+  // password manager means the one thing everyone does — paste a password in
+  // with the mouse — silently does nothing. Cut and copy stay disabled while
+  // the field is masking its contents: a reveal has a countdown and an audit
+  // trail, and a context menu must not become the quiet way around both.
+  component FieldMenuItem: MenuItem {
+    id: fmi
+    implicitHeight: root.metric.spacing.controlHeight
+    implicitWidth: root.metric.space(170)
+    contentItem: Text {
+      text: fmi.text
+      color: fmi.enabled ? Color.foreground : Util.alpha(Color.foreground, 0.3)
+      font.family: root.metric.font.family
+      font.pixelSize: root.metric.font.caption
+      verticalAlignment: Text.AlignVCenter
+      leftPadding: root.metric.space(10)
+      renderType: Text.NativeRendering
+    }
+    background: Rectangle {
+      color: fmi.highlighted ? Util.alpha(Color.accent, 0.15) : "transparent"
+    }
+  }
+
+  component FieldMenu: Menu {
+    id: fmenu
+    property Item target: null
+    readonly property bool masked:
+      fmenu.target && fmenu.target.echoMode !== undefined
+        ? fmenu.target.echoMode !== TextInput.Normal : false
+    background: Rectangle {
+      implicitWidth: root.metric.space(170)
+      color: Color.background
+      border.color: Util.alpha(Color.accent, 0.4)
+      border.width: Math.max(1, root.metric.spacing.hairline)
+      radius: root.metric.cornerRadius
+    }
+    FieldMenuItem {
+      text: "Cut"
+      enabled: fmenu.target && !fmenu.masked && fmenu.target.selectedText.length > 0
+      onTriggered: fmenu.target.cut()
+    }
+    FieldMenuItem {
+      text: "Copy"
+      enabled: fmenu.target && !fmenu.masked && fmenu.target.selectedText.length > 0
+      onTriggered: fmenu.target.copy()
+    }
+    FieldMenuItem {
+      text: "Paste"
+      enabled: fmenu.target && fmenu.target.canPaste
+      onTriggered: fmenu.target.paste()
+    }
+    FieldMenuItem {
+      text: "Select all"
+      enabled: fmenu.target && fmenu.target.length > 0
+      onTriggered: fmenu.target.selectAll()
+    }
+  }
 
       component Card: Rectangle {
         default property alias content: cardInner.data
@@ -1183,6 +1285,10 @@ Item {
                         root.filterKind = root.filterKind === modelData.kind
                           ? "" : modelData.kind
                         root.selectedIndex = 0
+                        // Changing the filter is list navigation; the list
+                        // keys must work immediately afterwards, even if the
+                        // caret was in the search box.
+                        keyCatcher.forceActiveFocus()
                       }
                     }
                   }
@@ -1352,6 +1458,14 @@ Item {
                 spacing: metric.spacing.md
                 TextField {
                   id: searchField
+          TapHandler {
+            acceptedButtons: Qt.RightButton
+            onTapped: {
+              searchField.forceActiveFocus()
+              fieldMenu.target = searchField
+              fieldMenu.popup()
+            }
+          }
                   font.pixelSize: root.metric.font.body
                   topPadding: root.metric.spacing.inputPaddingY
                   bottomPadding: root.metric.spacing.inputPaddingY
@@ -1371,7 +1485,11 @@ Item {
                   MouseArea {
                     anchors.fill: parent
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: { root.filterKind = ""; root.selectedIndex = 0 }
+                    onClicked: {
+                      root.filterKind = ""
+                      root.selectedIndex = 0
+                      keyCatcher.forceActiveFocus()
+                    }
                   }
                 }
                 Chip {
@@ -1852,6 +1970,7 @@ Item {
                             break
                           }
                         }
+                        keyCatcher.forceActiveFocus()
                       }
                     }
                   }
@@ -2109,6 +2228,14 @@ Item {
         // FIELD — sits directly on the rule.
         TextField {
           id: passField
+          TapHandler {
+            acceptedButtons: Qt.RightButton
+            onTapped: {
+              passField.forceActiveFocus()
+              fieldMenu.target = passField
+              fieldMenu.popup()
+            }
+          }
           font.pixelSize: root.metric.font.body
           topPadding: root.metric.spacing.inputPaddingY
           bottomPadding: root.metric.spacing.inputPaddingY

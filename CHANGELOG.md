@@ -3,6 +3,109 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] — 2026-08-30
+
+### Fixed — "I hit CREATE and nothing happened"
+
+Driven by a field report of exactly that, reproduced live, and each fix
+verified against a throwaway vault.
+
+- **A not-ready save button swallowed clicks silently.** CREATE/SAVE was
+  disabled while validation had complaints, and a disabled button eats the
+  click and says nothing — which reads as a broken app, not as "you left the
+  title empty". The button now takes the click even while dimmed, and answers
+  with exactly what is missing ("still needs a title"), loudly. The first-run
+  sheet's CREATE VAULT had the same defect and got the same fix.
+- **The app never showed a saved record — CREATE looked dead even when it
+  worked.** The desktop app's stdout collector accumulated across runs of the
+  same process instead of starting each run empty the way Quickshell's does.
+  The first successful save triggered a list refresh whose output landed
+  appended to the previous run's, the JSON parse threw, and the record list
+  was broken for the rest of the session — so a record could save perfectly
+  and never appear. Sinks now reset at the start of every run, and the reset
+  overwrites the old buffer before releasing it, since it routinely holds a
+  revealed secret. App-only; the plugin always used Quickshell's collectors.
+- **Enter in a field did nothing.** It now moves to the next field, and on the
+  last field it saves — the same rhythm the first-run sheet already taught.
+  When the form is not ready it says what is missing instead of silence.
+- **The form remembered the previous visit.** The attribute fields seed by
+  binding, and a binding on a text field dies the first time someone types in
+  it — so a form once used showed that session's values forever after: the
+  previous record's username on a fresh "new login", one record's attributes
+  under another's edit, and a saved password still sitting in the widget.
+  Every open now reseeds every field imperatively, secret boxes always open
+  empty, and a successful save wipes them before closing.
+- **An idle-lock during an edit wedged Esc.** The editor sat open invisibly
+  under the sealed screen — holding whatever password was mid-type — and the
+  sealed screen's own shortcuts are gated on the editor being closed, so Esc
+  went completely dead. A lock now dismisses the editor, which also wipes its
+  fields.
+- **Esc-Esc from the search box closed the whole window.** First Esc clears
+  the query; the second used to fall through to dismiss. It now hands the
+  keyboard back to the record list, which is where every instinct expects to
+  land.
+
+### Fixed — from the keyboard audit
+
+A 19-agent adversarial audit traced every advertised key to its handler and
+drove the real QML in compiled harnesses. It also caught a defect introduced
+and removed within this same cycle — a duplicate set of editor shortcuts that
+Qt would have resolved as ambiguous, deadening Esc, ^⏎ and ^G whenever the
+editor was open — before it ever shipped. What did ship:
+
+- **An invisible passphrase field could eat the whole keyboard.** Three ways
+  in: opening the deck while `status.json` was stale focused a field that was
+  not on screen; an unlock arriving from outside (the CLI, a status catch-up)
+  left focus on the now-hidden field; and the first-run sheet standing down
+  stranded focus on its own hidden input. In each, every footer key silently
+  accumulated in a hidden passphrase buffer — and Enter shipped that garbage
+  to the agent. Focus now goes only to fields that are visible, and every
+  transition hands the keyboard back to the deck.
+- **After ^L, the sealed screen's "⏎ unlock" was a lie** — the passphrase box
+  came up unfocused on the in-session lock path, so typing went nowhere until
+  you clicked it. Locking now focuses it, matching a fresh open.
+- **Enter on the sealed screen now always means "the way in"** — unlock, or
+  reopen the offer to create a vault — instead of falling through to "copy
+  the selected record" with nothing selected.
+- **Advertised verbs answer instead of going silent.** e / del / ⏎ / ⇧⏎ with
+  no record selected now say "no record selected"; before, they did nothing
+  at all — the same silent-swallow pattern as the CREATE button.
+- **Clicking a census row, hygiene entry or the filter chip now hands the
+  keyboard back to the list**, so j/k work immediately instead of typing into
+  the search box the caret happened to be in.
+- **Tab could walk out of the editor into the deck behind it.** Qt's built-in
+  window-wide focus chain moved the caret into the search box one Tab past
+  the last field. Tab is now fenced inside the sheet and follows the form's
+  own field order.
+- **A wedged save could silently eat the next draft.** Saving while a
+  previous save process was still running was a silent no-op that left the
+  button reading SAVING… forever. It now says "the previous save is still
+  finishing".
+- **The saved deck size never survived a restart** (application only): the
+  settings reader copies known keys, and `uiScale` was not one of them — so
+  ⌘+/⌘- persisted a value that was then filtered out on every launch.
+
+### Added — mouse paste
+
+- **Right-click works in every text input** — Cut, Copy, Paste, Select all —
+  in the deck, the editor and the first-run sheet, both surfaces. Qt Quick's
+  text controls ship with no context menu at all, which in a password manager
+  means the one thing everyone does — paste a password in with the mouse —
+  silently did nothing. Cut and copy stay disabled while a field is masking
+  its contents: a reveal has a countdown and an audit trail, and a context
+  menu must not become the quiet way around either.
+
+### Fixed — build system
+
+- **A same-second write-and-build could ship stale compiled QML.** When the
+  port script's write and the build landed in the same second, make read the
+  tie as "up to date" and kept the old qmlcache — so a fix could be present in
+  every source file and absent from the running program. The port script now
+  waits out the second. This cost a full debugging session to find; the
+  changelog entry is the warning shot for anyone who removes the sleep.
+
+[2.4.0]: https://github.com/AnubisQuantumCipher/blackbag/releases/tag/v2.4.0
+
 ## [2.3.0] — 2026-08-30
 
 ### Added

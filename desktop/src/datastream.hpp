@@ -29,6 +29,12 @@ public:
 
   // Called exactly once, when the stream is at EOF.
   virtual void finish() = 0;
+
+  // Called by Process at the start of every run. Quickshell's collectors —
+  // which this QML was written against — begin each run empty; without this,
+  // a reused sink prepends the previous run's output to the new one, and the
+  // second refresh of anything parses as garbage.
+  virtual void reset() = 0;
 };
 
 class StdioCollector : public DataStream {
@@ -51,6 +57,7 @@ public:
 
   void feed(const QString& chunk) override;
   void finish() override;
+  void reset() override;
 
 signals:
   void waitForEndChanged();
@@ -76,6 +83,7 @@ public:
 
   void feed(const QString& chunk) override;
   void finish() override;
+  void reset() override;
 
 signals:
   void splitMarkerChanged();

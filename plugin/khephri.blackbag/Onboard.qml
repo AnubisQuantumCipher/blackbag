@@ -126,6 +126,10 @@ Item {
     if (onboard.step !== "passphrase") return
     onboard.clear()
     onboard.open_ = false
+    // Through the same signal a Cancel takes, so the host refocuses its own
+    // surface — otherwise the keyboard stays on this sheet's hidden
+    // passphrase box and every deck key goes silently into it.
+    onboard.dismissed()
   }
 
   function generate() {
@@ -144,7 +148,21 @@ Item {
   }
 
   function createVault() {
-    if (!onboard.canCreate) return
+    if (onboard.busy) return
+    // Answer the click even when not ready. The status label already counts
+    // characters quietly; a click deserves the loud version.
+    if (!onboard.longEnough) {
+      onboard.errorText = "the passphrase needs at least "
+                        + onboard.minLength + " characters — "
+                        + (onboard.minLength - onboard.pass.length) + " more to go"
+      return
+    }
+    if (!onboard.matches) {
+      onboard.errorText = onboard.confirmPass.length === 0
+        ? "type it again in the second box, to be sure"
+        : "the two passphrases do not match"
+      return
+    }
     onboard.errorText = ""
     onboard.busy = true
     initProcess.running = true
@@ -360,6 +378,14 @@ Item {
 
       TextField {
         id: passInput
+        TapHandler {
+          acceptedButtons: Qt.RightButton
+          onTapped: {
+            passInput.forceActiveFocus()
+            fieldMenu.target = passInput
+            fieldMenu.popup()
+          }
+        }
         font.pixelSize: onboard.metric.font.body
         topPadding: onboard.metric.spacing.inputPaddingY
         bottomPadding: onboard.metric.spacing.inputPaddingY
@@ -375,6 +401,14 @@ Item {
 
       TextField {
         id: confirmInput
+        TapHandler {
+          acceptedButtons: Qt.RightButton
+          onTapped: {
+            confirmInput.forceActiveFocus()
+            fieldMenu.target = confirmInput
+            fieldMenu.popup()
+          }
+        }
         font.pixelSize: onboard.metric.font.body
         topPadding: onboard.metric.spacing.inputPaddingY
         bottomPadding: onboard.metric.spacing.inputPaddingY
@@ -527,6 +561,14 @@ Item {
 
       TextField {
         id: recoveryInput
+        TapHandler {
+          acceptedButtons: Qt.RightButton
+          onTapped: {
+            recoveryInput.forceActiveFocus()
+            fieldMenu.target = recoveryInput
+            fieldMenu.popup()
+          }
+        }
         font.pixelSize: onboard.metric.font.body
         topPadding: onboard.metric.spacing.inputPaddingY
         bottomPadding: onboard.metric.spacing.inputPaddingY
@@ -612,6 +654,7 @@ Item {
         }
         enabledAction: onboard.step === "passphrase"
           ? onboard.canCreate : !onboard.busy
+        tappable: !onboard.busy
         tone: Color.accent
         onActivated: {
           if (onboard.step === "passphrase") onboard.createVault()
@@ -623,6 +666,68 @@ Item {
   }
 
   // ── small parts ─────────────────────────────────────────────────────────────
+
+  FieldMenu { id: fieldMenu }
+
+  // ── mouse paste ────────────────────────────────────────────────────────────
+  //
+  // Qt Quick's text controls ship with no context menu at all, which in a
+  // password manager means the one thing everyone does — paste a password in
+  // with the mouse — silently does nothing. Cut and copy stay disabled while
+  // the field is masking its contents: a reveal has a countdown and an audit
+  // trail, and a context menu must not become the quiet way around both.
+  component FieldMenuItem: MenuItem {
+    id: fmi
+    implicitHeight: onboard.metric.spacing.controlHeight
+    implicitWidth: onboard.metric.space(170)
+    contentItem: Text {
+      text: fmi.text
+      color: fmi.enabled ? Color.foreground : Util.alpha(Color.foreground, 0.3)
+      font.family: onboard.metric.font.family
+      font.pixelSize: onboard.metric.font.caption
+      verticalAlignment: Text.AlignVCenter
+      leftPadding: onboard.metric.space(10)
+      renderType: Text.NativeRendering
+    }
+    background: Rectangle {
+      color: fmi.highlighted ? Util.alpha(Color.accent, 0.15) : "transparent"
+    }
+  }
+
+  component FieldMenu: Menu {
+    id: fmenu
+    property Item target: null
+    readonly property bool masked:
+      fmenu.target && fmenu.target.echoMode !== undefined
+        ? fmenu.target.echoMode !== TextInput.Normal : false
+    background: Rectangle {
+      implicitWidth: onboard.metric.space(170)
+      color: Color.background
+      border.color: Util.alpha(Color.accent, 0.4)
+      border.width: Math.max(1, onboard.metric.spacing.hairline)
+      radius: onboard.metric.cornerRadius
+    }
+    FieldMenuItem {
+      text: "Cut"
+      enabled: fmenu.target && !fmenu.masked && fmenu.target.selectedText.length > 0
+      onTriggered: fmenu.target.cut()
+    }
+    FieldMenuItem {
+      text: "Copy"
+      enabled: fmenu.target && !fmenu.masked && fmenu.target.selectedText.length > 0
+      onTriggered: fmenu.target.copy()
+    }
+    FieldMenuItem {
+      text: "Paste"
+      enabled: fmenu.target && fmenu.target.canPaste
+      onTriggered: fmenu.target.paste()
+    }
+    FieldMenuItem {
+      text: "Select all"
+      enabled: fmenu.target && fmenu.target.length > 0
+      onTriggered: fmenu.target.selectAll()
+    }
+  }
 
   component LinkText: Text {
     id: link
@@ -641,6 +746,9 @@ Item {
     id: btn
     property string label: ""
     property bool enabledAction: true
+    // Look and clickability, separated: a dimmed button still takes the
+    // click, and the handler says what is missing instead of silence.
+    property bool tappable: enabledAction
     property color tone: Color.foreground
     signal activated()
 
@@ -666,11 +774,11 @@ Item {
 
     HoverHandler {
       id: btnHover
-      enabled: btn.enabledAction
+      enabled: btn.tappable
       cursorShape: Qt.PointingHandCursor
     }
     TapHandler {
-      enabled: btn.enabledAction
+      enabled: btn.tappable
       onTapped: btn.activated()
     }
   }
