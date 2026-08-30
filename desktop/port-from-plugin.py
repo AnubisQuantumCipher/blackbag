@@ -97,6 +97,27 @@ import qs.Ui""",
   }"""
 ),
 (
+"""  function persistScale(value) {
+    scaleWriter.command = ["omarchy-shell", "shell", "setBarWidget",
+                           "khephri.blackbag", "uiScale", String(value), "{}"]
+    scaleWriter.running = true
+  }
+
+  Process {
+    id: scaleWriter
+    running: false
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function (code) {
+      if (code !== 0) root.actionError = "could not save the scale"
+    }
+  }""",
+"""  function persistScale(value) {
+    // The application owns its settings file, so this is a direct write; the
+    // watcher on that file feeds the new value straight back to Style.
+    App.setSetting("uiScale", value)
+  }"""
+),
+(
 """  PanelWindow {
     id: win
     visible: root.opened
@@ -132,8 +153,16 @@ import qs.Ui""",
 # itself, so this is the whole of its port.
 ONBOARD_EDITS = list(EDITOR_EDITS)
 
+# DeckMetrics wraps the host's Style singleton, so only the import differs.
+METRICS_EDITS = [
+(
+"""import qs.Commons""",
+"""import BlackBag"""
+),
+]
 
-def port(text, edits, name):
+
+def port(text, edits, name, rename_textfield=True):
     for before, after in edits:
         count = text.count(before)
         if count != 1:
@@ -147,6 +176,8 @@ def port(text, edits, name):
     # The shell's widget kit supplies TextField; a standalone application has
     # to bring its own, and cannot call it TextField without shadowing the Qt
     # Quick Controls type it is built from.
+    if not rename_textfield:
+        return text
     text, n = re.subn(r'(\n\s*)TextField \{', r'\1InputField {', text)
     if n == 0:
         raise SystemExit(f"port-from-plugin: {name}: no TextField to rename")
@@ -166,6 +197,9 @@ def main():
                            EDITOR_EDITS, "Editor.qml"),
         "Onboard.qml": port((PLUGIN / "Onboard.qml").read_text(),
                             ONBOARD_EDITS, "Onboard.qml"),
+        "DeckMetrics.qml": port((PLUGIN / "DeckMetrics.qml").read_text(),
+                                METRICS_EDITS, "DeckMetrics.qml",
+                                rename_textfield=False),
         # Model.js is a pure library with no host coupling at all, so it
         # crosses verbatim. That is the point: it is the part both surfaces
         # share, and the plugin's test suite tests it for both.

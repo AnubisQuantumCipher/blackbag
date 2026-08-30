@@ -94,6 +94,9 @@ character-class estimate for a phrase a person chose reliably overstates it.
 | `Ctrl+R` | refresh status and records |
 | `Esc` | back out one layer; close when there is nothing left to back out of |
 | `Ctrl+Q` / `Ctrl+W` | quit |
+| `⌘ +` / `Ctrl +` | make everything bigger |
+| `⌘ -` / `Ctrl -` | make everything smaller |
+| `⌘ 0` / `Ctrl 0` | back to the size the screen suggests |
 
 During first run: `Ctrl+G` generates a passphrase, `Ctrl+↵` commits the step,
 `Esc` abandons it.
@@ -113,6 +116,21 @@ that is what the agent is for — and locking is a deliberate act: `Ctrl+L`, the
 `LOCK NOW` chip, `black-bag agent lock`, or the launcher's "Lock the vault now"
 action.
 
+## Size
+
+The deck picks its own scale from the viewport — roughly 1.5× on a 1920×1200
+display — because the shell's own metrics are sized for a bar widget and a
+full-screen surface that inherits them is unreadable at a normal seating
+distance.
+
+`⌘ +` / `⌘ -` (or `Ctrl`, whichever your keyboard offers) changes it live, in
+0.05 steps, and remembers it. `⌘ 0` clears the override and hands the deck back
+to the viewport, so it re-fits itself if you move it to another monitor.
+
+Command is bound alongside Ctrl deliberately: on a Mac keyboard — including one
+driving this machine through a VM — Command is the key people reach for, and it
+arrives here as Meta.
+
 ## Settings
 
 `~/.config/black-bag/desktop.json`, watched, so an edit lands without a
@@ -120,6 +138,7 @@ restart.
 
 ```json
 {
+  "uiScale": 1.5,
   "revealSeconds": 10,
   "clipboardClearSec": 30,
   "staleAfterSec": 120,
@@ -134,8 +153,9 @@ restart.
 }
 ```
 
-The first four are the plugin's settings under the same names and the same
-defaults, restated in `Model.js` so the two surfaces cannot disagree about how
+`uiScale` is what `⌘ +` / `⌘ -` write; delete it, or set it to 0, to go back to
+the automatic size. The four after it are the plugin's settings under the same
+names and the same defaults, restated in `Model.js` so the two surfaces cannot disagree about how
 long a revealed secret stays on screen. The palette follows the desktop theme
 (`~/.local/state/omarchy/current/theme/colors.toml`) when there is one; the
 `theme` block overrides individual colours. `window` is written by the

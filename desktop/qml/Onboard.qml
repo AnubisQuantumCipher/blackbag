@@ -38,6 +38,11 @@ Item {
   property bool open_: false
   property int motionMs: 160
 
+  // Handed down by the deck so both sheets are the same size as the
+  // surface behind them.
+  property real uiScale: 1.0
+  readonly property QtObject metric: DeckMetrics { uiScale: onboard.uiScale }
+
   // Resolved by the host and handed down, because how you ask for $HOME is the
   // one thing that differs between the shell plugin and the application. This
   // file stays host-neutral so it is the same file in both.
@@ -108,6 +113,17 @@ Item {
     // deck is told it was created; abandoning the first step leaves nothing.
     if (hadVault) onboard.created("")
     else onboard.dismissed()
+  }
+
+  // A vault appeared that this sheet did not create — another process, or a
+  // status that was merely stale when the sheet opened. Step one is now an
+  // offer to create something that already exists, so it withdraws rather than
+  // inviting a `init` that would fail. Later steps are left alone: they belong
+  // to a vault this sheet has already made.
+  function standDown() {
+    if (onboard.step !== "passphrase") return
+    onboard.clear()
+    onboard.open_ = false
   }
 
   function generate() {
@@ -288,34 +304,34 @@ Item {
   }
 
   ColumnLayout {
-    width: Math.min(parent.width * 0.5, Style.space(560))
+    width: Math.min(parent.width * 0.5, metric.space(560))
     anchors.horizontalCenter: parent.horizontalCenter
     anchors.verticalCenter: parent.verticalCenter
-    spacing: Style.space(18)
+    spacing: metric.space(18)
 
     // ── wordmark ────────────────────────────────────────────────────────────
     Text {
       Layout.alignment: Qt.AlignHCenter
       text: "B L A C K - B A G"
       color: Util.alpha(Color.foreground, 0.85)
-      font.family: Style.font.family
-      font.pixelSize: Style.font.display
+      font.family: metric.font.family
+      font.pixelSize: metric.font.display
       font.bold: true
-      font.letterSpacing: Style.spaceReal(1)
+      font.letterSpacing: metric.spaceReal(1)
       textFormat: Text.PlainText
       renderType: Text.NativeRendering
     }
 
     Text {
       Layout.alignment: Qt.AlignHCenter
-      Layout.bottomMargin: Style.space(6)
+      Layout.bottomMargin: metric.space(6)
       text: onboard.step === "done" ? "your vault is ready"
           : (onboard.step === "recovery" ? "step 2 of 2  ·  the way back in"
                                          : "step 1 of 2  ·  no vault here yet")
       color: Util.alpha(Color.foreground, 0.4)
-      font.family: Style.font.family
-      font.pixelSize: Style.font.caption
-      font.letterSpacing: Style.spaceReal(0.8)
+      font.family: metric.font.family
+      font.pixelSize: metric.font.caption
+      font.letterSpacing: metric.spaceReal(0.8)
       textFormat: Text.PlainText
       renderType: Text.NativeRendering
     }
@@ -323,7 +339,7 @@ Item {
     // ── step 1: the master passphrase ───────────────────────────────────────
     ColumnLayout {
       Layout.fillWidth: true
-      spacing: Style.space(10)
+      spacing: metric.space(10)
       visible: onboard.step === "passphrase"
 
       Text {
@@ -333,8 +349,8 @@ Item {
             + "is lost, the recovery key on the next screen is the only way "
             + "back."
         color: Util.alpha(Color.foreground, 0.55)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
         wrapMode: Text.WrapAtWordBoundaryOrAnywhere
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
@@ -342,6 +358,11 @@ Item {
 
       InputField {
         id: passInput
+        font.pixelSize: onboard.metric.font.body
+        topPadding: onboard.metric.spacing.inputPaddingY
+        bottomPadding: onboard.metric.spacing.inputPaddingY
+        leftPadding: onboard.metric.spacing.controlPaddingX
+        rightPadding: onboard.metric.spacing.controlPaddingX
         Layout.fillWidth: true
         enabled: !onboard.busy
         password: !onboard.showPass
@@ -352,6 +373,11 @@ Item {
 
       InputField {
         id: confirmInput
+        font.pixelSize: onboard.metric.font.body
+        topPadding: onboard.metric.spacing.inputPaddingY
+        bottomPadding: onboard.metric.spacing.inputPaddingY
+        leftPadding: onboard.metric.spacing.controlPaddingX
+        rightPadding: onboard.metric.spacing.controlPaddingX
         Layout.fillWidth: true
         enabled: !onboard.busy
         password: !onboard.showPass
@@ -362,7 +388,7 @@ Item {
 
       RowLayout {
         Layout.fillWidth: true
-        spacing: Style.space(12)
+        spacing: metric.space(12)
 
         LinkText {
           text: onboard.showPass ? "hide" : "show what I typed"
@@ -386,8 +412,8 @@ Item {
                   && !onboard.matches)
             ? Color.urgent
             : (onboard.canCreate ? Color.accent : Util.alpha(Color.foreground, 0.4))
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
         }
@@ -397,30 +423,30 @@ Item {
       // file: this is the moment the secret is supposed to leave the machine.
       Rectangle {
         Layout.fillWidth: true
-        Layout.topMargin: Style.space(4)
+        Layout.topMargin: metric.space(4)
         visible: onboard.generated.length > 0
-        implicitHeight: genCol.implicitHeight + Style.space(20)
-        radius: Style.cornerRadius
+        implicitHeight: genCol.implicitHeight + metric.space(20)
+        radius: metric.cornerRadius
         color: Util.alpha(Color.accent, 0.07)
         border.color: Util.alpha(Color.accent, 0.35)
-        border.width: Math.max(1, Style.spacing.hairline)
+        border.width: Math.max(1, metric.spacing.hairline)
 
         ColumnLayout {
           id: genCol
           anchors.left: parent.left
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
-          anchors.margins: Style.space(12)
-          spacing: Style.space(6)
+          anchors.margins: metric.space(12)
+          spacing: metric.space(6)
 
           Text {
             Layout.fillWidth: true
             text: "WRITE THIS DOWN NOW"
             color: Color.accent
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            font.family: metric.font.family
+            font.pixelSize: metric.font.caption
             font.bold: true
-            font.letterSpacing: Style.spaceReal(0.8)
+            font.letterSpacing: metric.spaceReal(0.8)
             textFormat: Text.PlainText
             renderType: Text.NativeRendering
           }
@@ -431,8 +457,8 @@ Item {
             selectByMouse: true
             wrapMode: TextEdit.WrapAnywhere
             color: Color.foreground
-            font.family: Style.font.family
-            font.pixelSize: Style.font.subtitle
+            font.family: metric.font.family
+            font.pixelSize: metric.font.subtitle
             textFormat: TextEdit.PlainText
             renderType: Text.NativeRendering
           }
@@ -441,8 +467,8 @@ Item {
             visible: onboard.generatedNote.length > 0
             text: onboard.generatedNote
             color: Util.alpha(Color.foreground, 0.45)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            font.family: metric.font.family
+            font.pixelSize: metric.font.caption
             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
             textFormat: Text.PlainText
             renderType: Text.NativeRendering
@@ -458,8 +484,8 @@ Item {
             + "character-class guess at a phrase a person invented reliably "
             + "overstates it."
         color: Util.alpha(Color.foreground, 0.3)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
         wrapMode: Text.WrapAtWordBoundaryOrAnywhere
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
@@ -469,7 +495,7 @@ Item {
     // ── step 2: the recovery key ────────────────────────────────────────────
     ColumnLayout {
       Layout.fillWidth: true
-      spacing: Style.space(10)
+      spacing: metric.space(10)
       visible: onboard.step === "recovery"
 
       Text {
@@ -481,8 +507,8 @@ Item {
             + "added later to a vault you can no longer open. Make it now, "
             + "then move it to offline media."
         color: Util.alpha(Color.foreground, 0.55)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
         wrapMode: Text.WrapAtWordBoundaryOrAnywhere
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
@@ -491,14 +517,19 @@ Item {
       Text {
         text: "write it to"
         color: Util.alpha(Color.foreground, 0.45)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
       }
 
       InputField {
         id: recoveryInput
+        font.pixelSize: onboard.metric.font.body
+        topPadding: onboard.metric.spacing.inputPaddingY
+        bottomPadding: onboard.metric.spacing.inputPaddingY
+        leftPadding: onboard.metric.spacing.controlPaddingX
+        rightPadding: onboard.metric.spacing.controlPaddingX
         Layout.fillWidth: true
         enabled: !onboard.busy
         text: onboard.recoveryPath
@@ -510,7 +541,7 @@ Item {
     // ── done ────────────────────────────────────────────────────────────────
     ColumnLayout {
       Layout.fillWidth: true
-      spacing: Style.space(10)
+      spacing: metric.space(10)
       visible: onboard.step === "done"
 
       Text {
@@ -522,8 +553,8 @@ Item {
             + "holding that file can open this vault."
           : "Your vault is ready."
         color: Util.alpha(Color.foreground, 0.6)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
         wrapMode: Text.WrapAtWordBoundaryOrAnywhere
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
@@ -536,8 +567,8 @@ Item {
       visible: onboard.errorText.length > 0
       text: onboard.errorText
       color: Color.urgent
-      font.family: Style.font.family
-      font.pixelSize: Style.font.caption
+      font.family: metric.font.family
+      font.pixelSize: metric.font.caption
       wrapMode: Text.WrapAtWordBoundaryOrAnywhere
       textFormat: Text.PlainText
       renderType: Text.NativeRendering
@@ -546,8 +577,8 @@ Item {
     // ── actions ─────────────────────────────────────────────────────────────
     RowLayout {
       Layout.fillWidth: true
-      Layout.topMargin: Style.space(6)
-      spacing: Style.space(10)
+      Layout.topMargin: metric.space(6)
+      spacing: metric.space(10)
 
       Text {
         text: onboard.busy
@@ -555,8 +586,8 @@ Item {
                                            : "writing the recovery key")
           : ""
         color: Util.alpha(Color.accent, 0.7)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
       }
@@ -595,8 +626,8 @@ Item {
     id: link
     signal activated()
     color: Util.alpha(Color.accent, linkHover.hovered ? 1.0 : 0.6)
-    font.family: Style.font.family
-    font.pixelSize: Style.font.caption
+    font.family: metric.font.family
+    font.pixelSize: metric.font.caption
     font.underline: linkHover.hovered
     textFormat: Text.PlainText
     renderType: Text.NativeRendering
@@ -611,21 +642,21 @@ Item {
     property color tone: Color.foreground
     signal activated()
 
-    implicitWidth: btnText.implicitWidth + Style.space(22)
-    implicitHeight: Style.spacing.controlHeight
-    radius: Style.cornerRadius
+    implicitWidth: btnText.implicitWidth + metric.space(22)
+    implicitHeight: metric.spacing.controlHeight
+    radius: metric.cornerRadius
     color: btn.enabledAction && btnHover.hovered
       ? Util.alpha(btn.tone, 0.2) : Util.alpha(btn.tone, 0.09)
     border.color: Util.alpha(btn.tone, btn.enabledAction ? 0.5 : 0.15)
-    border.width: Math.max(1, Style.spacing.hairline)
+    border.width: Math.max(1, metric.spacing.hairline)
 
     Text {
       id: btnText
       anchors.centerIn: parent
       text: btn.label
       color: Util.alpha(btn.tone, btn.enabledAction ? 1.0 : 0.35)
-      font.family: Style.font.family
-      font.pixelSize: Style.font.caption
+      font.family: metric.font.family
+      font.pixelSize: metric.font.caption
       font.bold: true
       textFormat: Text.PlainText
       renderType: Text.NativeRendering

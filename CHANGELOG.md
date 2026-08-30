@@ -3,6 +3,45 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] — 2026-08-30
+
+### Added
+
+- **The deck has its own type scale, and you can change it.** `⌘ +` / `⌘ -`
+  (or `Ctrl`) resize the whole surface live, in 0.05 steps; `⌘ 0` clears the
+  override. It applies immediately and is remembered — in the application under
+  `uiScale` in `~/.config/black-bag/desktop.json`, in the plugin through the
+  shell's config.
+  - Command is bound alongside Ctrl deliberately: on a Mac keyboard, including
+    one driving a Linux VM, Command is the key people reach for, and it arrives
+    as Meta. Binding only Ctrl would make the obvious gesture do nothing.
+- **A sensible default size.** The deck picks a scale from the viewport —
+  about 1.5× on a 1920×1200 display — rather than inheriting the shell's, and
+  normalises against the host's own base font so the same screen produces the
+  same size in both surfaces and `uiScale: 1.4` means one thing rather than two.
+
+### Fixed
+
+- **The whole deck was sized for a bar widget.** Every surface read the shell's
+  `Style` tokens directly. Those are correct in a 24px bar and far too small on
+  a full-screen deck: the login screen was a postage stamp in the middle of a
+  large display. `DeckMetrics.qml` now mirrors `Style`'s API and multiplies it
+  by the deck's own scale, so resizing the deck does **not** resize the bar.
+  296 call sites moved across.
+- **The login column was pinned at 520px** however large the screen. Both terms
+  of its width now scale.
+- **Text inputs did not scale with the rest.** They inherit Qt Quick Controls'
+  defaults, which follow the host, so their font and padding are now set
+  explicitly from the deck's metric.
+- **The window title never said "no vault"** — it compared against `NO_VAULT`
+  while the model returns `NO VAULT`, so an empty slot read as "sealed".
+- **The first-run sheet stayed open over a vault it had not created.** If a
+  vault appears while the sheet is on step one — another process, or a status
+  that was merely stale when it opened — it now withdraws instead of offering
+  to create something that already exists.
+
+[2.3.0]: https://github.com/AnubisQuantumCipher/blackbag/releases/tag/v2.3.0
+
 ## [2.2.0] — 2026-08-30
 
 ### Added

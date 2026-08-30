@@ -29,6 +29,11 @@ Item {
   property var seedRecord: null        // the RecordView being edited, if any
   property int motionMs: 160
 
+  // Handed down by the deck so both sheets are the same size as the
+  // surface behind them.
+  property real uiScale: 1.0
+  readonly property QtObject metric: DeckMetrics { uiScale: editor.uiScale }
+
   property string errorText: ""
   property bool saving: false
 
@@ -215,31 +220,31 @@ Item {
   Rectangle {
     id: sheet
     anchors.centerIn: parent
-    width: Math.min(parent.width * 0.55, Style.space(620))
+    width: Math.min(parent.width * 0.55, metric.space(620))
     height: Math.min(parent.height * 0.86,
-                     sheetCol.implicitHeight + Style.space(36))
+                     sheetCol.implicitHeight + metric.space(36))
     // A hard floor so a kind with almost no fields still looks deliberate.
-    implicitHeight: Style.space(260)
-    radius: Style.cornerRadius
+    implicitHeight: metric.space(260)
+    radius: metric.cornerRadius
     color: Color.background
     border.color: Util.alpha(Color.accent, 0.35)
-    border.width: Math.max(1, Style.spacing.hairline)
+    border.width: Math.max(1, metric.spacing.hairline)
 
     ColumnLayout {
       id: sheetCol
       anchors.fill: parent
-      anchors.margins: Style.space(18)
-      spacing: Style.space(12)
+      anchors.margins: metric.space(18)
+      spacing: metric.space(12)
 
       // ── header ─────────────────────────────────────────────────────────
       RowLayout {
         Layout.fillWidth: true
-        spacing: Style.space(10)
+        spacing: metric.space(10)
         Text {
           text: Model.kindGlyph(editor.kind)
           color: Color.accent
-          font.family: Style.font.family
-          font.pixelSize: Style.font.heading
+          font.family: metric.font.family
+          font.pixelSize: metric.font.heading
           renderType: Text.NativeRendering
         }
         Text {
@@ -247,10 +252,10 @@ Item {
           text: (editor.isEdit ? "EDIT " : "NEW ")
               + Model.kindLabel(editor.kind).toUpperCase()
           color: Util.alpha(Color.foreground, 0.85)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.subtitle
+          font.family: metric.font.family
+          font.pixelSize: metric.font.subtitle
           font.bold: true
-          font.letterSpacing: Style.spaceReal(0.8)
+          font.letterSpacing: metric.spaceReal(0.8)
           elide: Text.ElideRight
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
@@ -259,8 +264,8 @@ Item {
           visible: editor.isEdit
           text: "keeps stored secrets unless you type over them"
           color: Util.alpha(Color.foreground, 0.35)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
         }
@@ -268,7 +273,7 @@ Item {
 
       Rectangle {
         Layout.fillWidth: true
-        height: Math.max(1, Style.spacing.hairline)
+        height: Math.max(1, metric.spacing.hairline)
         color: Util.alpha(Color.muted, 0.5)
       }
 
@@ -290,53 +295,53 @@ Item {
 
         ColumnLayout {
           id: form
-          width: scroller.width - (formBar.visible ? Style.space(12) : 0)
+          width: scroller.width - (formBar.visible ? metric.space(12) : 0)
           // A Layout inside a Flickable has no height imposed on it, so it
           // defaults to 0. Children still PAINT (Qt Quick does not clip by
           // default) but hit-testing never descends into a zero-height parent,
           // so every click falls through to the scrim behind. This one line is
           // the difference between a form you can click and one you cannot.
           height: implicitHeight
-          spacing: Style.space(10)
+          spacing: metric.space(10)
 
           // Kind picker — only when creating; changing kind mid-edit would
           // silently discard fields the new kind does not have.
           ColumnLayout {
             Layout.fillWidth: true
             visible: !editor.isEdit
-            spacing: Style.space(4)
+            spacing: metric.space(4)
             Text {
               text: "KIND"
               color: Util.alpha(Color.foreground, 0.45)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
               font.bold: true
-              font.letterSpacing: Style.spaceReal(0.8)
+              font.letterSpacing: metric.spaceReal(0.8)
               renderType: Text.NativeRendering
             }
             Flow {
               Layout.fillWidth: true
-              spacing: Style.space(6)
+              spacing: metric.space(6)
               Repeater {
                 model: Model.kindChoices()
                 delegate: Rectangle {
                   required property var modelData
                   readonly property bool active: modelData.kind === editor.kind
-                  implicitWidth: kindLabel.implicitWidth + Style.space(20)
-                  implicitHeight: Style.spacing.controlHeight
-                  radius: Style.cornerRadius
+                  implicitWidth: kindLabel.implicitWidth + metric.space(20)
+                  implicitHeight: metric.spacing.controlHeight
+                  radius: metric.cornerRadius
                   color: active ? Util.alpha(Color.accent, 0.18)
                        : (kindMouse.containsMouse ? Util.alpha(Color.foreground, 0.08)
                                                   : Util.alpha(Color.foreground, 0.04))
                   border.color: active ? Color.accent : Util.alpha(Color.foreground, 0.15)
-                  border.width: Math.max(1, Style.spacing.hairline)
+                  border.width: Math.max(1, metric.spacing.hairline)
                   Text {
                     id: kindLabel
                     anchors.centerIn: parent
                     text: modelData.glyph + "  " + modelData.label
                     color: active ? Color.accent : Util.alpha(Color.foreground, 0.75)
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
+                    font.family: metric.font.family
+                    font.pixelSize: metric.font.caption
                     font.bold: active
                     textFormat: Text.PlainText
                     renderType: Text.NativeRendering
@@ -407,7 +412,7 @@ Item {
           ColumnLayout {
             Layout.fillWidth: true
             visible: editor.template.totp === true
-            spacing: Style.space(8)
+            spacing: metric.space(8)
 
             FormField {
               id: totpUri
@@ -420,8 +425,8 @@ Item {
               Layout.fillWidth: true
               text: "or, if the site only shows you the key:"
               color: Util.alpha(Color.foreground, 0.35)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
               renderType: Text.NativeRendering
             }
             FormField {
@@ -438,13 +443,13 @@ Item {
       // ── footer ─────────────────────────────────────────────────────────
       Rectangle {
         Layout.fillWidth: true
-        height: Math.max(1, Style.spacing.hairline)
+        height: Math.max(1, metric.spacing.hairline)
         color: Util.alpha(Color.muted, 0.5)
       }
 
       RowLayout {
         Layout.fillWidth: true
-        spacing: Style.space(10)
+        spacing: metric.space(10)
 
         Text {
           Layout.fillWidth: true
@@ -456,8 +461,8 @@ Item {
           color: editor.errorText.length > 0 ? Color.urgent
                : (editor.problems.length > 0 ? Util.alpha(Color.foreground, 0.4)
                                              : Util.alpha(Color.accent, 0.7))
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
           wrapMode: Text.WrapAtWordBoundaryOrAnywhere
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
@@ -535,21 +540,21 @@ Item {
     property color tone: Color.foreground
     property bool enabledAction: true
     signal activated()
-    implicitWidth: btnText.implicitWidth + Style.space(22)
-    implicitHeight: Style.spacing.controlHeight
-    radius: Style.cornerRadius
+    implicitWidth: btnText.implicitWidth + metric.space(22)
+    implicitHeight: metric.spacing.controlHeight
+    radius: metric.cornerRadius
     color: btnMouse.containsMouse && enabledAction
       ? Util.alpha(tone, 0.2) : Util.alpha(tone, 0.09)
     border.color: Util.alpha(tone, enabledAction ? 0.5 : 0.15)
-    border.width: Math.max(1, Style.spacing.hairline)
+    border.width: Math.max(1, metric.spacing.hairline)
     opacity: enabledAction ? 1 : 0.4
     Text {
       id: btnText
       anchors.centerIn: parent
       text: parent.label
       color: parent.tone
-      font.family: Style.font.family
-      font.pixelSize: Style.font.caption
+      font.family: metric.font.family
+      font.pixelSize: metric.font.caption
       font.bold: true
       renderType: Text.NativeRendering
     }
@@ -573,7 +578,7 @@ Item {
     property string value: multiline ? multiLine.text : singleLine.text
     signal generate()
 
-    spacing: Style.space(3)
+    spacing: metric.space(3)
 
     // A click inside this component lands on the ColumnLayout, not on the
     // input it wraps — confirmed with an on-screen activeFocusItem probe — so
@@ -602,12 +607,12 @@ Item {
 
     RowLayout {
       Layout.fillWidth: true
-      spacing: Style.space(8)
+      spacing: metric.space(8)
       Text {
         text: parent.parent.label
         color: Util.alpha(Color.foreground, 0.5)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
       }
@@ -616,14 +621,14 @@ Item {
         visible: parent.parent.generatable
         text: "generate"
         color: Util.alpha(Color.accent, genMouse.containsMouse ? 1.0 : 0.6)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
         font.bold: genMouse.containsMouse
         renderType: Text.NativeRendering
         MouseArea {
           id: genMouse
           anchors.fill: parent
-          anchors.margins: -Style.space(4)
+          anchors.margins: -metric.space(4)
           hoverEnabled: true
           cursorShape: Qt.PointingHandCursor
           onClicked: parent.parent.parent.generate()
@@ -633,6 +638,11 @@ Item {
 
     InputField {
       id: singleLine
+      font.pixelSize: editor.metric.font.body
+      topPadding: editor.metric.spacing.inputPaddingY
+      bottomPadding: editor.metric.spacing.inputPaddingY
+      leftPadding: editor.metric.spacing.controlPaddingX
+      rightPadding: editor.metric.spacing.controlPaddingX
       Layout.fillWidth: true
       visible: !parent.multiline
       password: parent.secret
@@ -646,24 +656,26 @@ Item {
 
     Rectangle {
       Layout.fillWidth: true
-      Layout.preferredHeight: Style.space(90)
+      Layout.preferredHeight: metric.space(90)
       visible: parent.multiline
       color: Util.alpha(Color.foreground, 0.05)
       border.color: Util.alpha(Color.foreground, 0.15)
-      border.width: Math.max(1, Style.spacing.hairline)
-      radius: Style.cornerRadius
+      border.width: Math.max(1, metric.spacing.hairline)
+      radius: metric.cornerRadius
       ScrollView {
         anchors.fill: parent
-        anchors.margins: Style.space(6)
+        anchors.margins: metric.space(6)
         clip: true
         TextArea {
           id: multiLine
+          topPadding: editor.metric.spacing.inputPaddingY
+          bottomPadding: editor.metric.spacing.inputPaddingY
           activeFocusOnPress: true
           TapHandler { onTapped: multiLine.forceActiveFocus() }
           wrapMode: TextArea.WrapAnywhere
           color: Color.foreground
-          font.family: Style.font.family
-          font.pixelSize: Style.font.bodySmall
+          font.family: metric.font.family
+          font.pixelSize: metric.font.bodySmall
           background: null
           selectByMouse: true
         }

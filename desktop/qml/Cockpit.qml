@@ -91,6 +91,62 @@ Item {
     return Model.settingOf(root.settings, name, fallback)
   }
 
+  // ── how big the deck is ────────────────────────────────────────────────────
+  //
+  // The shell's own metrics are sized for a bar. A full-screen deck that
+  // inherits them is unreadable at a normal seating distance, so the deck
+  // scales them by a factor of its own: from the viewport by default, from the
+  // operator's setting once they have expressed a preference, and live with
+  // ctrl +/- either way.
+  readonly property real autoScale: {
+    if (win.width <= 0 || win.height <= 0) return 1.0
+    var byWidth = win.width / 1280
+    var byHeight = win.height / 800
+    var viewport = Math.max(1.0, Math.min(2.2, Math.min(byWidth, byHeight)))
+
+    // Normalised against the host's own base size. The shell's base is set by
+    // the theme and the application's default is 12, so without this the same
+    // screen produces two different-sized decks — and `uiScale: 1.4` would mean
+    // two different things depending on which surface read it. Dividing it out
+    // makes the number an absolute size rather than a multiplier of whatever
+    // the host happened to be using.
+    var hostBase = Number(Style.fontBaseSize)
+    if (!isFinite(hostBase) || hostBase <= 0) hostBase = 12
+    return viewport * (12 / hostBase)
+  }
+  readonly property real settingScale: {
+    var v = Number(setting("uiScale", 0))
+    return isFinite(v) && v > 0 ? v : 0
+  }
+  // Bound, not readonly, and deliberately so: a nudge assigns it directly and
+  // breaks the binding, which is what makes ctrl/cmd +- feel instant. Writing
+  // the value out and waiting for the settings file to be re-read would lose
+  // every keypress that landed inside the round trip — pressing three times
+  // quickly moved the scale by one step.
+  property real uiScale:
+    root.settingScale > 0 ? root.settingScale : root.autoScale
+
+  readonly property QtObject metric: DeckMetrics { uiScale: root.uiScale }
+
+  // Applied immediately and written back, so the next open starts where this
+  // one left off. Rounded to a step the eye can actually distinguish.
+  function nudgeScale(delta) {
+    var next = Math.round((root.uiScale + delta) * 20) / 20
+    next = Math.max(0.7, Math.min(3.0, next))
+    root.uiScale = next           // now
+    root.persistScale(next)       // and next time
+    root.actionNote = "scale " + next.toFixed(2)
+  }
+
+  function resetScale() {
+    root.persistScale(0)          // 0 means "back to whatever the viewport suggests"
+    // Restore the binding the nudges broke, so the deck tracks the window again.
+    root.uiScale = Qt.binding(function () {
+      return root.settingScale > 0 ? root.settingScale : root.autoScale
+    })
+    root.actionNote = "scale auto"
+  }
+
   readonly property bool motionEnabled: setting("motionEnabled", true) === true
   readonly property int motionMs: motionEnabled ? 160 : 0
   readonly property int clipboardClearSec: setting("clipboardClearSec", 30)
@@ -167,6 +223,11 @@ Item {
   // There being no vault is a first run, not an error. The deck creates one
   // rather than telling anyone to go and find a terminal.
   function maybeOnboard() {
+    // A vault that turned up on its own retires the offer to create one.
+    if (onboardSheet.open_ && root.status && root.status.vault_present === true) {
+      onboardSheet.standDown()
+      return
+    }
     if (!root.opened || root.onboardSuppressed) return
     if (onboardSheet.open_ || recordEditor.open_) return
     if (!root.status || root.status.vault_present === true) return
@@ -420,6 +481,16 @@ Item {
     onTriggered: if (!refreshProcess.running) refreshProcess.running = true
   }
 
+  // Writing the scale back is the one thing that differs between the two
+  // hosts: the plugin's settings live in the shell's config and are written
+  // through the shell, the application owns a settings file of its own.
+  // A value of 0 clears the override and returns the deck to the viewport.
+  function persistScale(value) {
+    // The application owns its settings file, so this is a direct write; the
+    // watcher on that file feeds the new value straight back to Style.
+    App.setSetting("uiScale", value)
+  }
+
   // ── processes ──────────────────────────────────────────────────────────────
 
   Process {
@@ -637,6 +708,34 @@ Item {
         context: Qt.WindowShortcut
         onActivated: root.doLock()
       }
+      // Scale, live. Ctrl+0 hands it back to the viewport.
+      //
+      // Meta is bound alongside Ctrl because on a Mac keyboard — including one
+      // driving this machine through a VM — the key people reach for is
+      // Command, and Command arrives here as Meta. Binding only Ctrl would
+      // make the obvious gesture do nothing. Both spellings of the plus key
+      // are listed: whether shift+equals reports as Plus or as Equal depends
+      // on the layout, and a zoom shortcut that works on one layout and not
+      // another is worse than none.
+      Shortcut {
+        sequences: ["Ctrl+=", "Ctrl++", "Ctrl+Plus", "Meta+=", "Meta++", "Meta+Plus"]
+        enabled: root.opened
+        context: Qt.WindowShortcut
+        onActivated: root.nudgeScale(0.1)
+      }
+      Shortcut {
+        sequences: ["Ctrl+-", "Ctrl+Minus", "Meta+-", "Meta+Minus"]
+        enabled: root.opened
+        context: Qt.WindowShortcut
+        onActivated: root.nudgeScale(-0.1)
+      }
+      Shortcut {
+        sequences: ["Ctrl+0", "Meta+0"]
+        enabled: root.opened
+        context: Qt.WindowShortcut
+        onActivated: root.resetScale()
+      }
+
       Shortcut {
         sequences: ["Ctrl+R"]
         enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_
@@ -745,26 +844,26 @@ Item {
         property color tone: Util.alpha(Color.muted, 0.45)
         property bool live: false
         Layout.fillWidth: true
-        implicitHeight: cardInner.implicitHeight + Style.spacing.md * 2
+        implicitHeight: cardInner.implicitHeight + metric.spacing.md * 2
         color: live ? Util.alpha(Color.accent, 0.05) : Util.alpha(Color.foreground, 0.03)
         border.color: live ? Util.alpha(Color.accent, 0.28) : tone
         border.width: 1
-        radius: Style.cornerRadius
+        radius: metric.cornerRadius
         ColumnLayout {
           id: cardInner
           anchors.fill: parent
-          anchors.margins: Style.spacing.md
-          spacing: Style.spacing.xs
+          anchors.margins: metric.spacing.md
+          spacing: metric.spacing.xs
         }
       }
 
       component SectionTitle: Text {
         Layout.fillWidth: true
         color: Util.alpha(Color.foreground, 0.45)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
         font.bold: true
-        font.letterSpacing: Style.space(0.8)
+        font.letterSpacing: metric.space(0.8)
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
       }
@@ -776,22 +875,22 @@ Item {
         property bool strong: false
         property int elide: Text.ElideMiddle
         Layout.fillWidth: true
-        spacing: Style.spacing.sm
+        spacing: metric.spacing.sm
         Text {
           text: parent.k
           color: Util.alpha(Color.foreground, 0.55)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
         }
         Item { Layout.fillWidth: true }
         Text {
-          Layout.maximumWidth: Style.space(210)
+          Layout.maximumWidth: metric.space(210)
           text: parent.v
           color: parent.vColor
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
           font.bold: parent.strong
           elide: parent.elide
           horizontalAlignment: Text.AlignRight
@@ -803,8 +902,8 @@ Item {
       component Chip: Rectangle {
         property string label: ""
         property color tone: Color.muted
-        implicitWidth: chipText.implicitWidth + Style.spacing.md * 2
-        implicitHeight: chipText.implicitHeight + Style.spacing.xs * 2
+        implicitWidth: chipText.implicitWidth + metric.spacing.md * 2
+        implicitHeight: chipText.implicitHeight + metric.spacing.xs * 2
         radius: height / 2
         color: Util.alpha(tone, 0.14)
         border.color: Util.alpha(tone, 0.6)
@@ -814,8 +913,8 @@ Item {
           anchors.centerIn: parent
           text: parent.label
           color: parent.tone
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
           font.bold: true
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
@@ -827,14 +926,14 @@ Item {
         // check must not render the same as a passing one.
         property var ok: null
         property color badTone: Color.urgent
-        width: Style.space(8)
+        width: metric.space(8)
         height: width
         radius: width / 2
         color: ok === true ? Color.accent : "transparent"
         border.color: ok === true ? Color.accent
                     : ok === false ? badTone
                     : Util.alpha(Color.foreground, 0.3)
-        border.width: Math.max(1, Style.spacing.hairline)
+        border.width: Math.max(1, metric.spacing.hairline)
       }
 
       component ActionButton: Rectangle {
@@ -842,9 +941,9 @@ Item {
         property color tone: Color.foreground
         property bool enabledAction: true
         signal activated()
-        implicitWidth: actionText.implicitWidth + Style.spacing.lg * 2
-        implicitHeight: Style.spacing.controlHeight
-        radius: Style.cornerRadius
+        implicitWidth: actionText.implicitWidth + metric.spacing.lg * 2
+        implicitHeight: metric.spacing.controlHeight
+        radius: metric.cornerRadius
         color: mouse.containsMouse && enabledAction
           ? Util.alpha(tone, 0.18) : Util.alpha(tone, 0.08)
         border.color: Util.alpha(tone, enabledAction ? 0.45 : 0.15)
@@ -855,8 +954,8 @@ Item {
           anchors.centerIn: parent
           text: parent.label
           color: parent.tone
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
           font.bold: true
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
@@ -879,24 +978,24 @@ Item {
       // around a password box is the thing being avoided.
       ColumnLayout {
         anchors.fill: parent
-        anchors.margins: Style.space(16)
-        spacing: Style.spacing.md
+        anchors.margins: metric.space(16)
+        spacing: metric.spacing.md
         visible: root.unlocked
 
         // ── header ────────────────────────────────────────────────────────────
         RowLayout {
           Layout.fillWidth: true
-          spacing: Style.spacing.lg
+          spacing: metric.spacing.lg
 
           ColumnLayout {
             spacing: 0
             Text {
               text: "B L A C K - B A G"
               color: root.stateTone()
-              font.family: Style.font.family
-              font.pixelSize: Style.font.display
+              font.family: metric.font.family
+              font.pixelSize: metric.font.display
               font.bold: true
-              font.letterSpacing: Style.space(1)
+              font.letterSpacing: metric.space(1)
               textFormat: Text.PlainText
               renderType: Text.NativeRendering
               Behavior on color { ColorAnimation { duration: root.motionMs } }
@@ -904,9 +1003,9 @@ Item {
             Text {
               text: "CREDENTIAL COMMAND DECK"
               color: Util.alpha(Color.foreground, 0.45)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              font.letterSpacing: Style.space(1.2)
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
+              font.letterSpacing: metric.space(1.2)
               textFormat: Text.PlainText
               renderType: Text.NativeRendering
             }
@@ -966,9 +1065,9 @@ Item {
           Layout.fillWidth: true
           Layout.fillHeight: true
 
-          readonly property real gap: Style.space(12)
-          readonly property real leftW: Style.space(250)
-          readonly property real rightW: Style.space(330)
+          readonly property real gap: metric.space(12)
+          readonly property real leftW: metric.space(250)
+          readonly property real rightW: metric.space(330)
 
           // LEFT RAIL ─────────────────────────────────────────────────────────
           Flickable {
@@ -983,8 +1082,8 @@ Item {
 
             ColumnLayout {
               id: leftCol
-              width: leftRail.width - Style.spacing.md
-              spacing: Style.spacing.md
+              width: leftRail.width - metric.spacing.md
+              spacing: metric.spacing.md
 
               Card {
                 SectionTitle { text: "VAULT" }
@@ -1036,21 +1135,21 @@ Item {
                   delegate: RowLayout {
                     required property var modelData
                     Layout.fillWidth: true
-                    spacing: Style.spacing.sm
+                    spacing: metric.spacing.sm
                     Text {
                       text: modelData.glyph
                       color: modelData.count > 0
                         ? Color.accent : Util.alpha(Color.foreground, 0.3)
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
                       renderType: Text.NativeRendering
                     }
                     Text {
                       text: modelData.kind
                       color: root.filterKind === modelData.kind
                         ? Color.accent : Util.alpha(Color.foreground, 0.7)
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
                       font.bold: root.filterKind === modelData.kind
                       textFormat: Text.PlainText
                       renderType: Text.NativeRendering
@@ -1060,8 +1159,8 @@ Item {
                       text: String(modelData.count)
                       color: modelData.count > 0
                         ? Color.foreground : Util.alpha(Color.foreground, 0.3)
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
                       font.bold: modelData.count > 0
                       renderType: Text.NativeRendering
                     }
@@ -1084,7 +1183,7 @@ Item {
                 Text {
                   visible: root.unlocked
                   Layout.fillWidth: true
-                  Layout.topMargin: Style.spacing.xs
+                  Layout.topMargin: metric.spacing.xs
                   text: {
                     var all = Model.census(agentCounts())
                     var zero = 0
@@ -1092,8 +1191,8 @@ Item {
                     return all.length + " kinds tracked · " + zero + " with no records"
                   }
                   color: Util.alpha(Color.foreground, 0.3)
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
                   textFormat: Text.PlainText
                   renderType: Text.NativeRendering
                 }
@@ -1103,8 +1202,8 @@ Item {
                   Layout.fillWidth: true
                   text: "record counts are only known while unlocked"
                   color: Util.alpha(Color.foreground, 0.35)
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
                   wrapMode: Text.WordWrap
                   renderType: Text.NativeRendering
                 }
@@ -1123,13 +1222,13 @@ Item {
                     spacing: 0
                     RowLayout {
                       Layout.fillWidth: true
-                      spacing: Style.spacing.sm
+                      spacing: metric.spacing.sm
                       Dot { ok: modelData.external === true ? true : null }
                       Text {
                         text: modelData.label
                         color: Color.foreground
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         font.bold: true
                         textFormat: Text.PlainText
                         renderType: Text.NativeRendering
@@ -1139,18 +1238,18 @@ Item {
                         text: modelData.external ? "OFFLINE KEY" : "PASSPHRASE"
                         color: modelData.external
                           ? Color.accent : Util.alpha(Color.foreground, 0.55)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         renderType: Text.NativeRendering
                       }
                     }
                     Text {
                       Layout.fillWidth: true
-                      Layout.leftMargin: Style.space(13)
+                      Layout.leftMargin: metric.space(13)
                       text: modelData.note
                       color: Util.alpha(Color.foreground, 0.35)
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
                       wrapMode: Text.WordWrap
                       renderType: Text.NativeRendering
                     }
@@ -1162,8 +1261,8 @@ Item {
                   Layout.fillWidth: true
                   text: "no recipients reported"
                   color: Util.alpha(Color.foreground, 0.35)
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
                   renderType: Text.NativeRendering
                 }
               }
@@ -1178,7 +1277,7 @@ Item {
                     spacing: 0
                     RowLayout {
                       Layout.fillWidth: true
-                      spacing: Style.spacing.sm
+                      spacing: metric.spacing.sm
                       Dot {
                         ok: modelData.ok
                         badTone: root.severityTone(modelData.severity)
@@ -1186,8 +1285,8 @@ Item {
                       Text {
                         text: modelData.label
                         color: Util.alpha(Color.foreground, 0.7)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         textFormat: Text.PlainText
                         renderType: Text.NativeRendering
                       }
@@ -1199,8 +1298,8 @@ Item {
                           : modelData.ok
                             ? Util.alpha(Color.foreground, 0.55)
                             : root.severityTone(modelData.severity)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         font.bold: modelData.ok === false && modelData.severity === "alert"
                         textFormat: Text.PlainText
                         renderType: Text.NativeRendering
@@ -1210,12 +1309,12 @@ Item {
                     // being elided mid-word off the end of the value.
                     Text {
                       Layout.fillWidth: true
-                      Layout.leftMargin: Style.space(8) + Style.spacing.sm
+                      Layout.leftMargin: metric.space(8) + metric.spacing.sm
                       visible: String(modelData.detail || "").length > 0
                       text: modelData.detail
                       color: Util.alpha(Color.foreground, 0.35)
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
                       wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                       textFormat: Text.PlainText
                       renderType: Text.NativeRendering
@@ -1238,14 +1337,19 @@ Item {
             // Unlocked: search + record table.
             ColumnLayout {
               anchors.fill: parent
-              spacing: Style.spacing.md
+              spacing: metric.spacing.md
               visible: root.unlocked
 
               RowLayout {
                 Layout.fillWidth: true
-                spacing: Style.spacing.md
+                spacing: metric.spacing.md
                 InputField {
                   id: searchField
+                  font.pixelSize: root.metric.font.body
+                  topPadding: root.metric.spacing.inputPaddingY
+                  bottomPadding: root.metric.spacing.inputPaddingY
+                  leftPadding: root.metric.spacing.controlPaddingX
+                  rightPadding: root.metric.spacing.controlPaddingX
                   Layout.fillWidth: true
                   placeholderText: "/  search titles, tags, usernames — never secrets"
                   onTextChanged: {
@@ -1275,13 +1379,13 @@ Item {
                 color: Util.alpha(Color.foreground, 0.03)
                 border.color: Util.alpha(Color.foreground, 0.10)
                 border.width: 1
-                radius: Style.cornerRadius
+                radius: metric.cornerRadius
                 clip: true
 
                 ListView {
                   id: recordList
                   anchors.fill: parent
-                  anchors.margins: Style.spacing.xs
+                  anchors.margins: metric.spacing.xs
                   clip: true
                   pixelAligned: true
                   boundsBehavior: Flickable.StopAtBounds
@@ -1296,46 +1400,46 @@ Item {
                     width: recordList.width
                     // Two stacked lines (title + subtitle) plus breathing room;
                     // at 34 the subtitle was squeezed to zero height.
-                    height: Style.space(42)
+                    height: metric.space(42)
                     color: index === root.selectedIndex
                       ? Util.alpha(Color.accent, 0.12)
                       : (rowMouse.containsMouse
                          ? Util.alpha(Color.foreground, 0.06) : "transparent")
-                    radius: Style.cornerRadius
+                    radius: metric.cornerRadius
 
                     Rectangle {
                       visible: index === root.selectedIndex
                       anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
-                      width: Style.space(3)
+                      width: metric.space(3)
                       color: Color.accent
                       radius: width / 2
                     }
 
                     RowLayout {
                       anchors.fill: parent
-                      anchors.leftMargin: Style.spacing.md
-                      anchors.rightMargin: Style.spacing.md
-                      spacing: Style.spacing.md
+                      anchors.leftMargin: metric.spacing.md
+                      anchors.rightMargin: metric.spacing.md
+                      spacing: metric.spacing.md
 
                       Text {
                         text: Model.kindGlyph(modelData.kind)
                         color: index === root.selectedIndex
                           ? Color.accent : Util.alpha(Color.foreground, 0.6)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.body
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.body
                         renderType: Text.NativeRendering
                       }
 
                       ColumnLayout {
                         Layout.fillWidth: true
                         Layout.alignment: Qt.AlignVCenter
-                        spacing: Style.space(1)
+                        spacing: metric.space(1)
                         Text {
                           Layout.fillWidth: true
                           text: Model.recordLabel(modelData)
                           color: Color.foreground
-                          font.family: Style.font.family
-                          font.pixelSize: Style.font.bodySmall
+                          font.family: metric.font.family
+                          font.pixelSize: metric.font.bodySmall
                           font.bold: index === root.selectedIndex
                           elide: Text.ElideRight
                           textFormat: Text.PlainText
@@ -1346,8 +1450,8 @@ Item {
                           visible: text.length > 0
                           text: Model.recordSubtitle(modelData)
                           color: Util.alpha(Color.foreground, 0.45)
-                          font.family: Style.font.family
-                          font.pixelSize: Style.font.caption
+                          font.family: metric.font.family
+                          font.pixelSize: metric.font.caption
                           elide: Text.ElideRight
                           textFormat: Text.PlainText
                           renderType: Text.NativeRendering
@@ -1355,22 +1459,22 @@ Item {
                       }
 
                       Text {
-                        Layout.preferredWidth: Style.space(14)
+                        Layout.preferredWidth: metric.space(14)
                         opacity: modelData.has_totp ? 1 : 0
                         text: "⧗"
                         color: Color.accent
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         renderType: Text.NativeRendering
                       }
 
                       Text {
-                        Layout.preferredWidth: Style.space(64)
+                        Layout.preferredWidth: metric.space(64)
                         horizontalAlignment: Text.AlignRight
                         text: Model.fmtAgo(modelData.updated_at, root.nowMs)
                         color: Util.alpha(Color.foreground, 0.35)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         textFormat: Text.PlainText
                         renderType: Text.NativeRendering
                       }
@@ -1403,8 +1507,8 @@ Item {
                        ? "no records in this vault"
                        : "nothing matches this filter")
                   color: Util.alpha(Color.foreground, 0.35)
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
                   renderType: Text.NativeRendering
                 }
               }
@@ -1424,8 +1528,8 @@ Item {
 
             ColumnLayout {
               id: rightCol
-              width: rightRail.width - Style.spacing.md
-              spacing: Style.spacing.md
+              width: rightRail.width - metric.spacing.md
+              spacing: metric.spacing.md
 
               // Inspector
               Card {
@@ -1443,8 +1547,8 @@ Item {
                   visible: root.selectedRecord !== null
                   text: root.selectedRecord ? Model.recordLabel(root.selectedRecord) : ""
                   color: Color.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.subtitle
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.subtitle
                   font.bold: true
                   wrapMode: Text.WordWrap
                   textFormat: Text.PlainText
@@ -1456,8 +1560,8 @@ Item {
                   visible: root.selectedRecord === null
                   text: "no record selected"
                   color: Util.alpha(Color.foreground, 0.35)
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
                   renderType: Text.NativeRendering
                 }
 
@@ -1493,16 +1597,16 @@ Item {
                   delegate: ColumnLayout {
                     required property var modelData
                     Layout.fillWidth: true
-                    spacing: Style.spacing.xs
+                    spacing: metric.spacing.xs
 
                     RowLayout {
                       Layout.fillWidth: true
-                      spacing: Style.spacing.sm
+                      spacing: metric.spacing.sm
                       Text {
                         text: "◆ " + modelData.name
                         color: Color.foreground
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         font.bold: true
                         renderType: Text.NativeRendering
                       }
@@ -1510,15 +1614,15 @@ Item {
                       Text {
                         text: modelData.handle + " · " + Model.fmtBytes(modelData.bytes)
                         color: Util.alpha(Color.foreground, 0.4)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         renderType: Text.NativeRendering
                       }
                     }
 
                     RowLayout {
                       Layout.fillWidth: true
-                      spacing: Style.spacing.sm
+                      spacing: metric.spacing.sm
                       ActionButton {
                         label: "COPY"
                         tone: Color.accent
@@ -1539,23 +1643,23 @@ Item {
                                && root.revealedField === modelData.name
                                && root.selectedRecord
                                && root.revealedFor === String(root.selectedRecord.id)
-                      implicitHeight: revealCol.implicitHeight + Style.spacing.md
+                      implicitHeight: revealCol.implicitHeight + metric.spacing.md
                       color: Util.alpha(Color.urgent, 0.08)
                       border.color: Util.alpha(Color.urgent, 0.4)
                       border.width: 1
-                      radius: Style.cornerRadius
+                      radius: metric.cornerRadius
 
                       ColumnLayout {
                         id: revealCol
                         anchors.fill: parent
-                        anchors.margins: Style.spacing.sm
-                        spacing: Style.spacing.xs
+                        anchors.margins: metric.spacing.sm
+                        spacing: metric.spacing.xs
                         Text {
                           Layout.fillWidth: true
                           text: root.revealedValue
                           color: Color.foreground
-                          font.family: Style.font.family
-                          font.pixelSize: Style.font.bodySmall
+                          font.family: metric.font.family
+                          font.pixelSize: metric.font.bodySmall
                           wrapMode: Text.WrapAnywhere
                           textFormat: Text.PlainText
                           renderType: Text.NativeRendering
@@ -1564,8 +1668,8 @@ Item {
                           Layout.fillWidth: true
                           text: "on screen for " + root.revealSecondsLeft + "s · Esc hides"
                           color: Util.alpha(Color.urgent, 0.8)
-                          font.family: Style.font.family
-                          font.pixelSize: Style.font.caption
+                          font.family: metric.font.family
+                          font.pixelSize: metric.font.caption
                           renderType: Text.NativeRendering
                         }
                       }
@@ -1577,20 +1681,20 @@ Item {
                 Rectangle {
                   Layout.fillWidth: true
                   visible: root.selectedRecord && root.selectedRecord.has_totp
-                  implicitHeight: Style.space(64)
+                  implicitHeight: metric.space(64)
                   color: Util.alpha(Color.accent, 0.06)
                   border.color: Util.alpha(Color.accent, 0.3)
                   border.width: 1
-                  radius: Style.cornerRadius
+                  radius: metric.cornerRadius
 
                   RowLayout {
                     anchors.fill: parent
-                    anchors.margins: Style.spacing.md
-                    spacing: Style.spacing.lg
+                    anchors.margins: metric.spacing.md
+                    spacing: metric.spacing.lg
 
                     Canvas {
                       id: totpArc
-                      width: Style.space(40)
+                      width: metric.space(40)
                       height: width
                       Layout.alignment: Qt.AlignVCenter
 
@@ -1628,10 +1732,10 @@ Item {
                       Text {
                         text: root.liveTotp ? root.liveTotp.code : "······"
                         color: root.liveTotp ? Color.foreground : Util.alpha(Color.foreground, 0.3)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.display
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.display
                         font.bold: true
-                        font.letterSpacing: Style.space(2)
+                        font.letterSpacing: metric.space(2)
                         renderType: Text.NativeRendering
                       }
                       Text {
@@ -1643,8 +1747,8 @@ Item {
                           return remaining + "s · step " + root.liveTotp.step + "s"
                         }
                         color: Util.alpha(Color.foreground, 0.5)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         renderType: Text.NativeRendering
                       }
                     }
@@ -1676,8 +1780,8 @@ Item {
                   text: "every rule passed on " + (root.hygiene ? root.hygiene.scanned : 0)
                       + " record(s)"
                   color: Color.accent
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
                   textFormat: Text.PlainText
                   renderType: Text.NativeRendering
                 }
@@ -1691,20 +1795,20 @@ Item {
 
                     RowLayout {
                       Layout.fillWidth: true
-                      spacing: Style.spacing.sm
+                      spacing: metric.spacing.sm
                       Text {
                         text: Model.kindGlyph(modelData.kind)
                         color: Util.alpha(Color.foreground, 0.5)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         renderType: Text.NativeRendering
                       }
                       Text {
                         Layout.fillWidth: true
                         text: Model.orDash(modelData.title)
                         color: Util.alpha(Color.foreground, 0.8)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         font.bold: true
                         elide: Text.ElideRight
                         textFormat: Text.PlainText
@@ -1717,11 +1821,11 @@ Item {
                       delegate: Text {
                         required property var modelData
                         Layout.fillWidth: true
-                        Layout.leftMargin: Style.space(14)
+                        Layout.leftMargin: metric.space(14)
                         text: Model.hygieneLine(modelData)
                         color: root.severityTone(Model.hygieneSeverity(modelData))
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                         textFormat: Text.PlainText
                         renderType: Text.NativeRendering
@@ -1748,11 +1852,11 @@ Item {
 
                 Text {
                   Layout.fillWidth: true
-                  Layout.topMargin: Style.spacing.xs
+                  Layout.topMargin: metric.spacing.xs
                   text: "computed on this machine · nothing is sent anywhere"
                   color: Util.alpha(Color.foreground, 0.3)
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
                   textFormat: Text.PlainText
                   renderType: Text.NativeRendering
                 }
@@ -1772,12 +1876,12 @@ Item {
                     spacing: 0
                     RowLayout {
                       Layout.fillWidth: true
-                      spacing: Style.spacing.sm
+                      spacing: metric.spacing.sm
                       Text {
                         text: Model.severityMark(modelData.severity)
                         color: root.severityTone(modelData.severity)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         font.bold: true
                         renderType: Text.NativeRendering
                       }
@@ -1785,8 +1889,8 @@ Item {
                         Layout.fillWidth: true
                         text: modelData.title
                         color: root.severityTone(modelData.severity)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                        font.family: metric.font.family
+                        font.pixelSize: metric.font.caption
                         font.bold: modelData.severity === "alert"
                         wrapMode: Text.WordWrap
                         textFormat: Text.PlainText
@@ -1795,12 +1899,12 @@ Item {
                     }
                     Text {
                       Layout.fillWidth: true
-                      Layout.leftMargin: Style.space(14)
+                      Layout.leftMargin: metric.space(14)
                       visible: String(modelData.detail).length > 0
                       text: modelData.detail
                       color: Util.alpha(Color.foreground, 0.4)
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
                       wrapMode: Text.WordWrap
                       textFormat: Text.PlainText
                       renderType: Text.NativeRendering
@@ -1824,8 +1928,8 @@ Item {
                 }
                 RowLayout {
                   Layout.fillWidth: true
-                  Layout.topMargin: Style.spacing.xs
-                  spacing: Style.spacing.sm
+                  Layout.topMargin: metric.spacing.xs
+                  spacing: metric.spacing.sm
                   ActionButton {
                     label: "LOCK NOW"
                     tone: Color.urgent
@@ -1856,7 +1960,7 @@ Item {
         // ── footer ────────────────────────────────────────────────────────────
         RowLayout {
           Layout.fillWidth: true
-          spacing: Style.spacing.lg
+          spacing: metric.spacing.lg
 
           Text {
             text: {
@@ -1870,8 +1974,8 @@ Item {
               return bits.join(" · ")
             }
             color: Util.alpha(Color.foreground, 0.5)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            font.family: metric.font.family
+            font.pixelSize: metric.font.caption
             renderType: Text.NativeRendering
           }
 
@@ -1879,8 +1983,8 @@ Item {
             visible: root.actionNote.length > 0 && root.actionError.length === 0
             text: root.actionNote
             color: Color.accent
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            font.family: metric.font.family
+            font.pixelSize: metric.font.caption
             renderType: Text.NativeRendering
           }
 
@@ -1889,8 +1993,8 @@ Item {
             Layout.fillWidth: true
             text: root.actionError
             color: Color.urgent
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            font.family: metric.font.family
+            font.pixelSize: metric.font.caption
             elide: Text.ElideRight
             renderType: Text.NativeRendering
           }
@@ -1902,8 +2006,8 @@ Item {
               ? "n new · e edit · del remove · / search · ↑↓ move · ⏎ copy · ⇧⏎ show · ^L lock · esc close"
               : "⏎ unlock · esc close"
             color: Util.alpha(Color.foreground, 0.4)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            font.family: metric.font.family
+            font.pixelSize: metric.font.caption
             renderType: Text.NativeRendering
           }
         }
@@ -1914,6 +2018,7 @@ Item {
       Editor {
         id: recordEditor
         motionMs: root.motionMs
+        uiScale: root.uiScale
         onSaved: function (id) {
           root.actionNote = "saved"
           root.refreshRecords()
@@ -1944,7 +2049,10 @@ Item {
         readonly property bool alerting: verdict.severity === "alert"
         readonly property bool blocked: verdict.blockInput === true
         readonly property real anchorY: Math.round(height * 0.52)
-        readonly property real colW: Math.min(width * 0.44, Style.space(520))
+        // Both terms scale now: the fraction keeps it from spanning a wide
+        // display, and the cap grows with the deck's own metric instead of
+        // pinning the login screen to a fixed 520px however large the screen.
+        readonly property real colW: Math.min(width * 0.5, metric.space(560))
         readonly property color hazardTone: alerting ? Color.urgent : Color.accent
 
         function witnessTone() {
@@ -1959,7 +2067,7 @@ Item {
           y: sealed.anchorY
           x: Math.round((parent.width - sealed.colW) / 2)
           width: sealed.colW
-          height: Math.max(1, Style.spacing.hairline)
+          height: Math.max(1, metric.spacing.hairline)
           // The rule follows the verdict, not just the focus. A green line under
           // a red warning would be the screen contradicting itself.
           color: {
@@ -1994,10 +2102,15 @@ Item {
         // FIELD — sits directly on the rule.
         InputField {
           id: passField
+          font.pixelSize: root.metric.font.body
+          topPadding: root.metric.spacing.inputPaddingY
+          bottomPadding: root.metric.spacing.inputPaddingY
+          leftPadding: root.metric.spacing.controlPaddingX
+          rightPadding: root.metric.spacing.controlPaddingX
           width: sealed.colW
           x: rule.x
           anchors.bottom: rule.top
-          anchors.bottomMargin: Style.space(6)
+          anchors.bottomMargin: metric.space(6)
           visible: sealed.verdict.hasVault
           enabled: !root.unlocking && !sealed.blocked
           password: true
@@ -2011,14 +2124,14 @@ Item {
           id: sealedMark
           anchors.horizontalCenter: parent.horizontalCenter
           anchors.bottom: passField.visible ? passField.top : rule.top
-          anchors.bottomMargin: Style.space(40)
+          anchors.bottomMargin: metric.space(40)
           text: "B L A C K - B A G"
           color: sealed.alerting ? Color.urgent
                : (sealed.verdict.stale ? root.fg(0.4) : Util.alpha(Color.foreground, 0.85))
-          font.family: Style.font.family
-          font.pixelSize: Style.font.display
+          font.family: metric.font.family
+          font.pixelSize: metric.font.display
           font.bold: true
-          font.letterSpacing: Style.spaceReal(1)
+          font.letterSpacing: metric.spaceReal(1)
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
           Behavior on color { ColorAnimation { duration: root.motionMs } }
@@ -2027,21 +2140,21 @@ Item {
         // HAZARD — grows upward from the wordmark. Absent when there is nothing
         // to say, which is the entire source of its authority.
         ColumnLayout {
-          width: Math.min(parent.width * 0.7, Style.space(760))
+          width: Math.min(parent.width * 0.7, metric.space(760))
           anchors.horizontalCenter: parent.horizontalCenter
           anchors.bottom: sealedMark.top
-          anchors.bottomMargin: Style.space(32)
-          spacing: Style.space(6)
+          anchors.bottomMargin: metric.space(32)
+          spacing: metric.space(6)
           visible: sealed.verdict.headline.length > 0
 
           Text {
             Layout.fillWidth: true
             text: (sealed.alerting ? "!!  " : "") + sealed.verdict.headline
             color: sealed.hazardTone
-            font.family: Style.font.family
-            font.pixelSize: Style.font.heading
+            font.family: metric.font.family
+            font.pixelSize: metric.font.heading
             font.bold: true
-            font.letterSpacing: Style.spaceReal(0.6)
+            font.letterSpacing: metric.spaceReal(0.6)
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
             textFormat: Text.PlainText
@@ -2052,8 +2165,8 @@ Item {
             visible: sealed.verdict.detail.length > 0
             text: sealed.verdict.detail
             color: Util.alpha(sealed.hazardTone, 0.7)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            font.family: metric.font.family
+            font.pixelSize: metric.font.caption
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
             textFormat: Text.PlainText
@@ -2070,19 +2183,19 @@ Item {
           width: sealed.colW
           x: rule.x
           anchors.top: rule.bottom
-          anchors.topMargin: Style.space(14)
-          spacing: Style.space(4)
+          anchors.topMargin: metric.space(14)
+          spacing: metric.space(4)
 
           RowLayout {
             Layout.fillWidth: true
-            spacing: Style.space(12)
+            spacing: metric.space(12)
             Text {
               text: sealed.verdict.identity
               color: sealed.verdict.hasVault
                 ? Util.alpha(Color.foreground, 0.6) : Util.alpha(Color.foreground, 0.25)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              font.letterSpacing: Style.spaceReal(0.4)
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
+              font.letterSpacing: metric.spaceReal(0.4)
               textFormat: Text.PlainText
               renderType: Text.NativeRendering
             }
@@ -2090,16 +2203,16 @@ Item {
               visible: sealed.verdict.witness.length > 0
               text: "·"
               color: Util.alpha(Color.foreground, 0.25)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
               renderType: Text.NativeRendering
             }
             Text {
               visible: sealed.verdict.witness.length > 0
               text: sealed.verdict.witness
               color: sealed.witnessTone()
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
               font.bold: sealed.verdict.witnessTone === "bad"
               textFormat: Text.PlainText
               renderType: Text.NativeRendering
@@ -2109,8 +2222,8 @@ Item {
               visible: sealed.verdict.stale
               text: "status " + sealed.verdict.staleFor
               color: Util.alpha(Color.foreground, 0.3)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
               textFormat: Text.PlainText
               renderType: Text.NativeRendering
             }
@@ -2123,8 +2236,8 @@ Item {
             text: root.unlocking ? "deriving key…"
                 : (root.actionError.length > 0 ? root.actionError : "")
             color: root.unlocking ? Util.alpha(Color.accent, 0.8) : Color.urgent
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            font.family: metric.font.family
+            font.pixelSize: metric.font.caption
             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
             textFormat: Text.PlainText
             renderType: Text.NativeRendering
@@ -2134,17 +2247,20 @@ Item {
         Text {
           anchors.horizontalCenter: parent.horizontalCenter
           anchors.bottom: parent.bottom
-          anchors.bottomMargin: Style.space(28)
+          anchors.bottomMargin: metric.space(28)
           text: {
             if (!root.status || root.status.vault_present !== true)
-              return "⏎ create a vault  ·  esc close"
+              return "⏎ create a vault  ·  esc close  ·  ⌘/ctrl +− size"
             if (!sealed.verdict.hasVault) return "esc close"
             if (sealed.blocked) return "detach the debugger to continue  ·  esc close"
-            return "⏎ " + sealed.verdict.verb + "  ·  esc close"
+            // Advertised here because this is the screen people meet first,
+            // and a surface that is the wrong size is only fixable by someone
+            // who knows it can be resized.
+            return "⏎ " + sealed.verdict.verb + "  ·  esc close  ·  ⌘/ctrl +− size"
           }
           color: Util.alpha(Color.foreground, 0.35)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
         }
@@ -2154,6 +2270,7 @@ Item {
     Onboard {
       id: onboardSheet
       motionMs: root.motionMs
+      uiScale: root.uiScale
 
       // A vault now exists. The passphrase comes back only because `init`
       // has just proved it opens this file — asking for it a second time

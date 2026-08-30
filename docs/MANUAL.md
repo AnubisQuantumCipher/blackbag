@@ -260,6 +260,25 @@ black-bag agent totp <uuid> --to clipboard  # via the agent
 black-bag agent totp <uuid>                 # prints JSON: code, ttl, step
 ```
 
+### Size
+
+The deck sizes itself from the screen. If it is still not right:
+
+| | |
+|---|---|
+| `⌘ +` / `Ctrl +` | bigger |
+| `⌘ -` / `Ctrl -` | smaller |
+| `⌘ 0` / `Ctrl 0` | back to automatic |
+
+It applies immediately and is remembered. In the application the value lives in
+`~/.config/black-bag/desktop.json` as `uiScale`; in the plugin it is written to
+the shell's config for `khephri.blackbag`. Either way, `⌘ 0` clears it.
+
+The deck deliberately does **not** use the shell's own type scale directly:
+that is sized for a 24px bar, and a full-screen surface that inherits it is a
+postage stamp in the middle of a large display. Changing the deck's size does
+not change the bar's.
+
 ### Keyboard map
 
 Deck, with the record list focused:

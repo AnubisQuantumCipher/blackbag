@@ -31,7 +31,7 @@ ApplicationWindow {
     if (state === "UNLOCKED") return "Black-Bag — unlocked"
     if (state === "ROLLBACK") return "Black-Bag — ROLLBACK SUSPECTED"
     if (state === "UNREADABLE") return "Black-Bag — vault unreadable"
-    if (state === "NO_VAULT") return "Black-Bag — no vault"
+    if (state === "NO VAULT") return "Black-Bag — no vault"
     if (deck.stale) return "Black-Bag — status stale"
     return "Black-Bag — sealed"
   }
