@@ -3,6 +3,22 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] — 2026-08-30
+
+### Fixed (concurrency)
+
+- **A long-lived agent could silently discard a CLI write.** The agent held its
+  own unlocked copy while `black-bag add` wrote the file directly; the agent's
+  next save incremented from its stale epoch and overwrote the other record.
+  Both ended at the same epoch, so the rollback witness saw nothing wrong — it
+  was silent credential loss. `Vault::save` now refuses to write over a version
+  the handle has not seen, and the agent re-reads before serving any request, so
+  a record added in a terminal shows up in the deck without a restart. If
+  another process re-keys the vault the agent's session drops rather than
+  holding a key that no longer opens it.
+
+[2.0.1]: https://github.com/AnubisQuantumCipher/blackbag/releases/tag/v2.0.1
+
 ## [2.0.0] — 2026-08-30
 
 First release of the rebuilt engine and the Omarchy surfaces. This is a
@@ -105,18 +121,6 @@ the reasoning.
   cockpit raised a spurious `CORE_DUMPS` finding against a process that had
   disabled them.
 - **Escape was a dead key on the sealed screen** — see above.
-
-### Fixed (concurrency)
-
-- **A long-lived agent could silently discard a CLI write.** The agent held its
-  own unlocked copy while `black-bag add` wrote the file directly; the agent's
-  next save incremented from its stale epoch and overwrote the other record.
-  Both ended at the same epoch, so the rollback witness saw nothing wrong — it
-  was silent credential loss. `Vault::save` now refuses to write over a version
-  the handle has not seen, and the agent re-reads before serving any request, so
-  a record added in a terminal shows up in the deck without a restart. If
-  another process re-keys the vault the agent's session drops rather than
-  holding a key that no longer opens it.
 
 ### Security
 

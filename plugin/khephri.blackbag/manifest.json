@@ -2,12 +2,22 @@
   "schemaVersion": 1,
   "id": "khephri.blackbag",
   "name": "BLACK-BAG",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "author": "Khephri Labs",
   "license": "MIT OR Apache-2.0",
   "description": "Credential command deck. Argon2id + XChaCha20-Poly1305 vault with hybrid X25519/ML-KEM-1024 recovery recipients, an authenticated header, and an anti-rollback epoch. Secrets are page-locked and never reach the status file.",
-  "tags": ["security", "credentials", "vault", "post-quantum", "totp"],
-  "kinds": ["bar-widget", "overlay", "service"],
+  "tags": [
+    "security",
+    "credentials",
+    "vault",
+    "post-quantum",
+    "totp"
+  ],
+  "kinds": [
+    "bar-widget",
+    "overlay",
+    "service"
+  ],
   "keepLoaded": true,
   "entryPoints": {
     "barWidget": "Panel.qml",
