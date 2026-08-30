@@ -1209,13 +1209,14 @@ from the vault *are* locked — `Secret`'s guard is `#[serde(skip)]`, so
 for the same reason and its failure is silent to the caller. Secrets are
 zeroized on drop either way.
 
-**12.9 — The CLI and a running agent hold separate copies.**
-`vault::open_lock` takes a real `flock(LOCK_EX)` for the duration of a critical
-section, so two processes cannot interleave a single write. It does not
-reconcile *state*: a running agent keeps its own unlocked copy in memory, so a
-direct `black-bag add` is invisible to that agent until it restarts, and if both
-write across the same window the later save wins. Use one path or the other for
-a given session.
+**12.9 — Concurrency is detected, not merged.** `vault::open_lock` takes a real
+`flock(LOCK_EX)` for a critical section, `Vault::save` refuses to write over a
+version the handle has not seen, and the agent calls `Vault::refresh` before
+serving any request — so a CLI write and a cockpit write no longer silently
+discard one another. What the system does *not* do is merge divergent record
+sets: it detects the conflict and re-reads. Because every mutation is saved
+immediately, there is never unsaved work to lose by re-reading, but a design
+that batched edits in memory could not rely on that.
 
 **12.10 — Padding hides size only to block granularity.** The payload is padded
 to 4096 bytes. A vault with a thousand records is visibly larger than one with

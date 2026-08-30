@@ -670,6 +670,26 @@ impl Agent {
 
     fn opened(&mut self) -> Result<&mut OpenVault> {
         self.expire_if_idle()?;
+
+        // Pick up anything the CLI wrote while we were holding the vault. Every
+        // mutation here saves immediately, so there is never unsaved work to
+        // lose by re-reading — and without this the next save would silently
+        // overwrite the other writer's records.
+        let rekeyed = match self.open.as_mut() {
+            Some(open) => match open.vault.refresh() {
+                Ok(_) => false,
+                // The data key no longer opens the file: somebody re-keyed it.
+                // Holding a stale key would be worse than making them unlock.
+                Err(_) => true,
+            },
+            None => false,
+        };
+        if rekeyed {
+            self.open = None;
+            self.publish()?;
+            bail!("the vault was re-keyed by another process; unlock again");
+        }
+
         self.touch();
         self.open.as_mut().ok_or_else(|| anyhow!("vault is locked"))
     }

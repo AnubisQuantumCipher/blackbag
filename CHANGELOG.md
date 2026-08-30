@@ -106,6 +106,18 @@ the reasoning.
   disabled them.
 - **Escape was a dead key on the sealed screen** — see above.
 
+### Fixed (concurrency)
+
+- **A long-lived agent could silently discard a CLI write.** The agent held its
+  own unlocked copy while `black-bag add` wrote the file directly; the agent's
+  next save incremented from its stale epoch and overwrote the other record.
+  Both ended at the same epoch, so the rollback witness saw nothing wrong — it
+  was silent credential loss. `Vault::save` now refuses to write over a version
+  the handle has not seen, and the agent re-reads before serving any request, so
+  a record added in a terminal shows up in the deck without a restart. If
+  another process re-keys the vault the agent's session drops rather than
+  holding a key that no longer opens it.
+
 ### Security
 
 - `status.json` contains no record titles, tags, counts, or secret values. A

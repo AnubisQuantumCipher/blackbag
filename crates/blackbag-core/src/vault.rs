@@ -216,6 +216,29 @@ pub struct Vault {
     pub unlocked_by: UnlockMethod,
     /// Set when the stored epoch was behind the witness — a possible rollback.
     pub rollback_suspected: bool,
+    /// Identity of the file as this handle last saw it. Used to notice that
+    /// somebody else wrote the vault while we were holding it.
+    seen: FileStamp,
+}
+
+/// A cheap fingerprint of the file on disk, so the common "nothing changed"
+/// case costs a `stat` rather than a full read and decrypt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FileStamp {
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Self {
+        match fs::metadata(path) {
+            Ok(meta) => Self {
+                len: meta.len(),
+                mtime: meta.modified().ok(),
+            },
+            Err(_) => Self::default(),
+        }
+    }
 }
 
 /// Hand-written, never derived: a derived impl would forward through
@@ -343,6 +366,7 @@ impl Vault {
         let rollback_suspected = Witness::check(path, file.header.vault_id, file.header.epoch)?;
 
         Ok(Self {
+            seen: FileStamp::of(path),
             path: path.to_path_buf(),
             file,
             payload,
@@ -354,15 +378,60 @@ impl Vault {
     }
 
     /// Persist, bumping the epoch and re-MACing the header.
+    ///
+    /// Refuses to write over a version this handle has not seen. Without that
+    /// check, a CLI write and a long-lived agent would race with the later
+    /// saver silently discarding the other's records — and because both end at
+    /// the same epoch, the rollback witness would not notice either.
     pub fn save(&mut self) -> Result<()> {
+        if self.changed_on_disk() {
+            bail!(
+                "the vault changed on disk since this handle read it; \
+                 refresh before saving so the other writer's records are not lost"
+            );
+        }
         self.file.header.epoch = self.file.header.epoch.saturating_add(1);
         self.file.header.updated_at = Utc::now();
         self.file.payload = seal_payload(self.dek.as_ref(), &self.payload)?;
         self.file.header.mac =
             crypto::header_mac(self.dek.as_ref(), &self.file.header.mac_input(&self.file.payload));
         write_vault_file(&self.path, &self.file)?;
+        self.seen = FileStamp::of(&self.path);
         Witness::record(&self.path, self.file.header.vault_id, self.file.header.epoch)?;
         Ok(())
+    }
+
+    /// Whether the file differs from the version this handle last read or wrote.
+    pub fn changed_on_disk(&self) -> bool {
+        FileStamp::of(&self.path) != self.seen
+    }
+
+    /// Re-read the vault using the data key already held.
+    ///
+    /// Returns `false` when nothing changed. Errors when the file can no longer
+    /// be opened with our key — which means it was re-keyed elsewhere, and the
+    /// only honest response is to drop the session and ask for a fresh unlock.
+    ///
+    /// Safe to call at any point because every mutation is saved immediately,
+    /// so a handle never holds unsaved work to lose.
+    pub fn refresh(&mut self) -> Result<bool> {
+        if !self.changed_on_disk() {
+            return Ok(false);
+        }
+
+        let file = read_vault_file(&self.path)?;
+        let expected = crypto::header_mac(self.dek.as_ref(), &file.header.mac_input(&file.payload));
+        if !crypto::mac_matches(&expected, &file.header.mac) {
+            bail!("the vault was re-keyed by another process; unlock again");
+        }
+
+        let payload = open_payload(self.dek.as_ref(), &file.payload)?;
+        self.rollback_suspected =
+            Witness::check(&self.path, file.header.vault_id, file.header.epoch)?;
+        self.file = file;
+        self.payload = payload;
+        self.seen = FileStamp::of(&self.path);
+        Ok(true)
     }
 
     /// Mint a fresh DEK and re-encrypt everything under it, re-wrapping for
@@ -1007,6 +1076,83 @@ mod tests {
             "a secret read from disk must hold a page lock"
         );
         drop(vault);
+    }
+
+    #[test]
+    fn a_handle_will_not_overwrite_a_write_it_never_saw() {
+        // The data-loss case this closes: a long-lived agent holds the vault
+        // while the CLI writes to the file. Before this check the agent's next
+        // save discarded the CLI's records, and because both ended at the same
+        // epoch the rollback witness saw nothing wrong.
+        let (_d, path) = temp_vault();
+        Vault::init(&path, PASS, MEM).unwrap();
+
+        let mut held = Vault::unlock(&path, PASS).unwrap();
+
+        let mut other = Vault::unlock(&path, PASS).unwrap();
+        let mut theirs = Record::new(Kind::Note, Some("written elsewhere".into()));
+        theirs.set_field("body", Secret::from_str("keep me"));
+        other.add_record(theirs).unwrap();
+        other.save().unwrap();
+        drop(other);
+
+        assert!(held.changed_on_disk());
+        let mut mine = Record::new(Kind::Note, Some("mine".into()));
+        mine.set_field("body", Secret::from_str("also keep me"));
+        held.add_record(mine).unwrap();
+        assert!(
+            held.save().is_err(),
+            "saving over an unseen write must be refused, not silently win"
+        );
+    }
+
+    #[test]
+    fn refresh_picks_up_another_writers_records() {
+        let (_d, path) = temp_vault();
+        Vault::init(&path, PASS, MEM).unwrap();
+
+        let mut held = Vault::unlock(&path, PASS).unwrap();
+        assert_eq!(held.records().len(), 0);
+        assert!(!held.refresh().unwrap(), "an untouched file reports no change");
+
+        let mut other = Vault::unlock(&path, PASS).unwrap();
+        let mut theirs = Record::new(Kind::Note, Some("written elsewhere".into()));
+        theirs.set_field("body", Secret::from_str("keep me"));
+        other.add_record(theirs).unwrap();
+        other.save().unwrap();
+        drop(other);
+
+        assert!(held.refresh().unwrap(), "a changed file reports a reload");
+        assert_eq!(held.records().len(), 1);
+        assert_eq!(held.records()[0].title.as_deref(), Some("written elsewhere"));
+        assert!(
+            held.records()[0].field("body").unwrap().is_locked(),
+            "records pulled in by a refresh must be page-locked too"
+        );
+
+        // And the handle can now save again, on top of what it just read.
+        let mut mine = Record::new(Kind::Note, Some("mine".into()));
+        mine.set_field("body", Secret::from_str("also keep me"));
+        held.add_record(mine).unwrap();
+        held.save().unwrap();
+        drop(held);
+
+        let reopened = Vault::unlock(&path, PASS).unwrap();
+        assert_eq!(reopened.records().len(), 2, "both writers' records survive");
+    }
+
+    #[test]
+    fn refresh_refuses_after_someone_else_rekeys() {
+        let (_d, path) = temp_vault();
+        Vault::init(&path, PASS, MEM).unwrap();
+        let mut held = Vault::unlock(&path, PASS).unwrap();
+
+        let mut other = Vault::unlock(&path, PASS).unwrap();
+        other.rekey(Some(b"a different passphrase"), None).unwrap();
+        drop(other);
+
+        // Our data key no longer opens the file; holding it would be a lie.
+        assert!(held.refresh().is_err());
     }
 
     #[test]

@@ -729,13 +729,19 @@ world-readable: an argv passphrase is a passphrase published to every process
 on the machine. Passphrases come from the terminal, or from stdin when there
 is no terminal, and there is no exception anywhere in the CLI.
 
-**The CLI and the agent hold separate copies.** `black-bag add`, `remove` and
+**You can use the CLI and the cockpit together.** `black-bag add`, `remove` and
 `rekey` open the vault file directly, while a running agent keeps its own
-unlocked copy in memory. A direct CLI write is therefore not visible to
-`black-bag agent list` until the agent is restarted, and the two can diverge if
-you use both at once. Prefer one or the other for a given session: the cockpit
-and `black-bag agent add/edit/delete` go through the agent; everything else
-goes straight to the file.
+unlocked copy in memory — so the agent checks the file before serving any
+request and re-reads it if another writer got there first. A record you add in
+a terminal appears in the deck without restarting anything, and neither side
+overwrites the other.
+
+Two consequences worth knowing. If another process re-keys the vault, the
+agent's data key no longer opens it, so the session drops and you are asked to
+unlock again — that is deliberate, since the alternative is holding a key that
+is quietly wrong. And if a write lands between the moment a handle reads and
+the moment it saves, the save is refused rather than allowed to win; the agent
+handles this for you by refreshing first.
 
 **Revealed secrets default to `/dev/tty`**, which the shell cannot redirect,
 so `black-bag get X --reveal password > notes.txt` writes the metadata and not
