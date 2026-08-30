@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Name=Black-Bag
+GenericName=Credential Vault
+Comment=Open the Black-Bag credential command deck
+# Summons the Quickshell overlay rather than spawning a window of its own —
+# the cockpit lives inside the running shell, so there is no second process
+# holding vault state.
+Exec=omarchy-shell shell summon khephri.blackbag {}
+Icon=security-high
+Terminal=false
+Categories=System;Security;
+Keywords=password;vault;credentials;totp;secret;otp;
+StartupNotify=false
+Actions=lock;doctor;
+X-Omarchy-Plugin=khephri.blackbag
+
+[Desktop Action lock]
+Name=Lock the vault now
+Exec=black-bag agent lock
+
+[Desktop Action doctor]
+Name=Show vault and host posture
+Exec=alacritty -e sh -c "black-bag doctor; read -p 'press enter'"

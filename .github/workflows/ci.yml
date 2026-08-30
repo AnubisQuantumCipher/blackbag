@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  engine:
+    name: engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The project's standard is zero warnings, so a warning fails the build
+      # rather than scrolling past in a log nobody reads.
+      - name: No warnings
+        run: |
+          touch crates/blackbag-core/src/lib.rs
+          count=$(cargo build --release --workspace 2>&1 | grep -c '^warning' || true)
+          echo "warnings: $count"
+          test "$count" -eq 0
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        continue-on-error: true
+
+  surfaces:
+    name: plugin logic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Model.js assertions
+        run: plugin/khephri.blackbag/tests/run.sh

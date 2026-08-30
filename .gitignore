@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Working notes from the build: transcripts of tooling internals, not a
+# deliverable, and not something to publish.
+/docs/recon/
+
+# Never commit key material or a vault, even a test one.
+*.key
+*.cbor
+*.qsig
+recovery*.json

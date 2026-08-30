@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = ["crates/blackbag-core", "crates/blackbag-cli"]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["sicarii <khephri.labs@proton.me>"]
+rust-version = "1.82"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+blake3 = "1"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+# Stable release only — a pre-release crypto crate is not an option on the
+# mandatory build path. `getrandom` gives us the no-argument keygen/encapsulate
+# forms so no RNG object ever has to cross the rand_core 0.6/0.10 boundary
+# between this and x25519-dalek below.
+ml-kem = { version = "0.3.2", features = ["zeroize", "getrandom"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["std"] }
+ciborium = { version = "0.2", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+rpassword = "7"
+directories = "5"
+fd-lock = "4"
+tempfile = "3"
+totp-rs = { version = "5", features = ["serde_support"] }
+base32 = "0.5"
+base64 = "0.22"
+hex = "0.4"
+sharks = "0.5"
+libc = "0.2"
+rand = "0.8"
+rand_core = "0.6"
+is-terminal = "0.4"
+
+# Release profile notes:
+#   panic = "unwind" is DELIBERATE and security-relevant. black-bagg 0.4.x used
+#   panic = "abort", which converts any panic into SIGABRT with no unwinding — so
+#   Zeroizing/Drop destructors never run and, with core dumps enabled, the DEK and
+#   decrypted records land in a core file. We unwind so secrets are scrubbed, and
+#   separately disable core dumps at startup (see blackbag_core::harden).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"

@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "id": "khephri.blackbag",
+  "name": "BLACK-BAG",
+  "version": "2.0.0",
+  "author": "Khephri Labs",
+  "license": "MIT OR Apache-2.0",
+  "description": "Credential command deck. Argon2id + XChaCha20-Poly1305 vault with hybrid X25519/ML-KEM-1024 recovery recipients, an authenticated header, and an anti-rollback epoch. Secrets are page-locked and never reach the status file.",
+  "tags": ["security", "credentials", "vault", "post-quantum", "totp"],
+  "kinds": ["bar-widget", "overlay", "service"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "overlay": "Cockpit.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "BLACK-BAG",
+    "description": "Lock state, session countdown, and posture at a glance; click for the full-screen credential deck.",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pollIntervalSec": 5,
+      "staleAfterSec": 120,
+      "clipboardClearSec": 30,
+      "revealSeconds": 10,
+      "motionEnabled": true
+    },
+    "schema": [
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "label": "Status poll interval (seconds)",
+        "min": 2,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "How often status.json is re-read while the shell is running."
+      },
+      {
+        "key": "staleAfterSec",
+        "type": "integer",
+        "label": "Treat status as stale after (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 120,
+        "description": "Older than this and the widget desaturates rather than asserting a state it cannot vouch for."
+      },
+      {
+        "key": "clipboardClearSec",
+        "type": "integer",
+        "label": "Clear clipboard after (seconds)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 30,
+        "description": "How long a copied secret stays on the Wayland clipboard before it is wiped."
+      },
+      {
+        "key": "revealSeconds",
+        "type": "integer",
+        "label": "On-screen reveal timeout (seconds)",
+        "min": 3,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "How long a secret stays visible when you explicitly choose SHOW."
+      },
+      {
+        "key": "motionEnabled",
+        "type": "boolean",
+        "label": "Cockpit motion",
+        "defaultValue": true,
+        "description": "Fades and countdown sweeps. Off makes every state change snap instantly."
+      }
+    ]
+  }
+}

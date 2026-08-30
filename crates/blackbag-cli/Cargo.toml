@@ -1,0 +1,38 @@
+[package]
+name = "blackbag-cli"
+description = "Black-Bag command line: hardened credential storage for Omarchy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "black-bag"
+path = "src/main.rs"
+
+[dependencies]
+blackbag-core = { path = "../blackbag-core" }
+anyhow.workspace = true
+clap.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+base32.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+is-terminal.workspace = true
+fd-lock.workspace = true
+libc.workspace = true
+
+# Needed only by the v1 (black-bagg 0.4.x) migration reader.
+argon2.workspace = true
+chacha20poly1305.workspace = true
+ciborium.workspace = true
+ml-kem.workspace = true
+serde_bytes.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
