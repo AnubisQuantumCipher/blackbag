@@ -3,6 +3,30 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] — 2026-08-30
+
+### Added — deleting a record is now a first-class act
+
+Deleting was keyboard-only, and worse, its confirmation step was invisible:
+the first `del` changed nothing on screen, so the safety asked its question in
+silence and the whole flow read as a dead key.
+
+- **The two-step confirm is drawn.** The first `del` — or the first click —
+  arms it visibly: the DELETE button flips to `SURE? CLICK AGAIN` and an
+  urgent banner names the record: *delete "Email Two"? — no undo and no trash
+  — del or the button confirms · esc backs out.* Key and click arm and
+  confirm the same state, so whichever hand started it, either can finish it.
+- **The inspector has EDIT and DELETE buttons.** A lifecycle you can only
+  drive from the keyboard is half a lifecycle.
+- **Right-click on a record row opens a menu**: copy the primary field, show
+  it on the countdown, copy the 2FA code (when there is one), edit, delete.
+  Every entry is a verb the keyboard already had; the menu is how the mouse
+  gets them.
+- Selecting a different record, pressing Esc, or locking disarms a pending
+  delete; nothing is ever deleted by a single input.
+
+[2.4.1]: https://github.com/AnubisQuantumCipher/blackbag/releases/tag/v2.4.1
+
 ## [2.4.0] — 2026-08-30
 
 ### Fixed — "I hit CREATE and nothing happened"

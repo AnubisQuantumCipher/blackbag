@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(blackbag-desktop
-  VERSION 2.4.0
+  VERSION 2.4.1
   DESCRIPTION "Credential command deck for the black-bag engine"
   LANGUAGES CXX)
 

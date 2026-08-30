@@ -64,6 +64,12 @@ Item {
   // A pending delete, held until it is confirmed a second time. Deleting a
   // credential is not undoable and there is no trash.
   property string pendingDeleteId: ""
+  // True while the delete of the SELECTED record is armed and waiting for its
+  // second confirmation. Drawn, not just stored: the first del used to change
+  // nothing on screen, which made the confirmation step read as a dead key.
+  readonly property bool deleteArmed:
+    root.pendingDeleteId.length > 0 && root.selectedRecord !== null
+    && root.pendingDeleteId === String(root.selectedRecord.id)
 
   // First run offers to create a vault, once per visit. Set when the sheet is
   // dismissed AND when it completes: the status file is republished
@@ -881,6 +887,44 @@ Item {
 
       FieldMenu { id: fieldMenu }
 
+      // Right-click on a record row. Every entry is a verb the keyboard
+      // already has; the menu is how the mouse gets them.
+      Menu {
+        id: recordMenu
+        property var record: null
+        background: Rectangle {
+          implicitWidth: root.metric.space(190)
+          color: Color.background
+          border.color: Util.alpha(Color.accent, 0.4)
+          border.width: Math.max(1, root.metric.spacing.hairline)
+          radius: root.metric.cornerRadius
+        }
+        FieldMenuItem {
+          text: recordMenu.record
+            ? "Copy " + String(root.primaryField(recordMenu.record)) : "Copy"
+          onTriggered: root.copyField(recordMenu.record,
+                                      root.primaryField(recordMenu.record))
+        }
+        FieldMenuItem {
+          text: "Show for " + root.revealSeconds + "s"
+          onTriggered: root.showField(recordMenu.record,
+                                      root.primaryField(recordMenu.record))
+        }
+        FieldMenuItem {
+          text: "Copy 2FA code"
+          enabled: recordMenu.record ? recordMenu.record.has_totp === true : false
+          onTriggered: root.copyField(recordMenu.record, "totp")
+        }
+        FieldMenuItem {
+          text: "Edit"
+          onTriggered: root.beginEdit()
+        }
+        FieldMenuItem {
+          text: "Delete…"
+          onTriggered: root.requestDelete()   // arms; the inspector asks to be sure
+        }
+      }
+
   // ── mouse paste ────────────────────────────────────────────────────────────
   //
   // Qt Quick's text controls ship with no context menu at all, which in a
@@ -1613,6 +1657,19 @@ Item {
                       }
                       onDoubleClicked: root.copyField(modelData, root.primaryField(modelData))
                     }
+                    TapHandler {
+                      acceptedButtons: Qt.RightButton
+                      onTapped: {
+                        // Same housekeeping as a left click: the menu acts on
+                        // the selected record, so selection comes first.
+                        root.selectedIndex = index
+                        root.pendingDeleteId = ""
+                        root.clearReveal()
+                        keyCatcher.forceActiveFocus()
+                        recordMenu.record = modelData
+                        recordMenu.popup()
+                      }
+                    }
                   }
                 }
 
@@ -1671,6 +1728,69 @@ Item {
                   wrapMode: Text.WordWrap
                   textFormat: Text.PlainText
                   renderType: Text.NativeRendering
+                }
+
+                // Record-level actions, reachable by mouse. Everything here
+                // has a key too (e, del) — but a lifecycle you can only drive
+                // from the keyboard is half a lifecycle.
+                RowLayout {
+                  Layout.fillWidth: true
+                  visible: root.selectedRecord !== null
+                  spacing: metric.spacing.sm
+                  ActionButton {
+                    label: "EDIT"
+                    tone: Util.alpha(Color.foreground, 0.7)
+                    onActivated: root.beginEdit()
+                  }
+                  ActionButton {
+                    label: root.deleteArmed ? "SURE? CLICK AGAIN" : "DELETE"
+                    tone: Color.urgent
+                    onActivated: root.requestDelete()
+                  }
+                  Item { Layout.fillWidth: true }
+                }
+
+                // The armed confirmation, in the open. Both halves of the
+                // two-step delete — key and click — arm and confirm the same
+                // state, so whichever hand started it, either can finish it.
+                Rectangle {
+                  Layout.fillWidth: true
+                  visible: root.deleteArmed
+                  implicitHeight: armCol.implicitHeight + metric.spacing.md
+                  color: Util.alpha(Color.urgent, 0.08)
+                  border.color: Util.alpha(Color.urgent, 0.5)
+                  border.width: 1
+                  radius: metric.cornerRadius
+                  ColumnLayout {
+                    id: armCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.margins: metric.spacing.sm
+                    spacing: metric.spacing.xxs
+                    Text {
+                      Layout.fillWidth: true
+                      text: "delete \"" + (root.selectedRecord
+                              ? String(root.selectedRecord.title) : "") + "\"?"
+                      color: Color.urgent
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.bodySmall
+                      font.bold: true
+                      wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                      textFormat: Text.PlainText
+                      renderType: Text.NativeRendering
+                    }
+                    Text {
+                      Layout.fillWidth: true
+                      text: "no undo and no trash — del or the button confirms · esc backs out"
+                      color: Util.alpha(Color.foreground, 0.55)
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
+                      wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                      textFormat: Text.PlainText
+                      renderType: Text.NativeRendering
+                    }
+                  }
                 }
 
                 Text {
