@@ -3,6 +3,50 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] — 2026-08-30
+
+### Added
+
+- **First-run vault creation in the deck.** Creating a vault was the one thing
+  both surfaces handed back to a terminal, which made the terminal a required
+  part of a graphical password manager. It is not any more: with no vault
+  present the deck offers to make one — set a master passphrase, mint the
+  offline recovery key, land in the deck. `Onboard.qml`, shared by the plugin
+  and the application like the rest of the surface.
+  - The passphrase reaches `black-bag init` on **stdin**, twice, and the pipe
+    closes behind it. As everywhere else in this project, it never appears in
+    an argument vector.
+  - A **generated** passphrase is shown in plain text, deliberately. This is
+    the one moment where the secret has to leave the machine and land on paper,
+    and a creation screen that masks the thing you are meant to write down is a
+    creation screen that guarantees a lost vault.
+  - No invented strength meter. The generator's own entropy verdict is carried
+    through verbatim, and a **typed** passphrase gets no score at all — the
+    engine rates only what it generated, and says so.
+  - Step two is the recovery recipient, because it cannot be added later to a
+    vault you can no longer open. Skipping is possible and says what it costs.
+- `Ctrl+G` generates and `Ctrl+↵` commits, the same chords the record editor
+  already uses for the same jobs.
+
+### Fixed
+
+- **The `NO VAULT` screen told you to go and run `black-bag init`.** It now
+  offers to do it, and `↵` on an empty slot starts the flow.
+- **The generator's entropy verdict was read from the wrong stream.** The value
+  goes to stdout so `black-bag gen passphrase | ...` pipes the passphrase and
+  nothing else; the verdict goes to stderr. The sheet read line two of stdout
+  and so displayed nothing.
+- **The sheet reopened on top of the vault it had just created.** `status.json`
+  is republished asynchronously, so for a moment after creation the deck still
+  holds a status saying there is no vault. Unlocking after creation now goes
+  through a `beginUnlock()` that skips the no-vault branch, and the offer is
+  suppressed for the rest of the visit.
+- **A failed record list kept asserting itself after a successful one.** The
+  footer went on showing "could not read the record list" over a record list
+  that was plainly on screen. A list that succeeds now clears it.
+
+[2.2.0]: https://github.com/AnubisQuantumCipher/blackbag/releases/tag/v2.2.0
+
 ## [2.1.0] — 2026-08-30
 
 ### Added

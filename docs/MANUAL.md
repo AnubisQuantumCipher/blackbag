@@ -128,6 +128,26 @@ exists so that the deck, and repeated CLI use, do not.
 
 ## 3. First run
 
+### From the deck (no terminal needed)
+
+Open the deck with nothing at the vault path and it offers to create one.
+`↵` on the empty slot, or the sheet appears on its own.
+
+1. **Set a master passphrase.** Type one, or press `Ctrl+G` to have the engine
+   generate one. A generated passphrase is shown in **plain text** on purpose —
+   this is the moment to write it down, and it is the last time it is displayed.
+   The engine's own entropy verdict is shown beside it. A passphrase you typed
+   gets no score, because the engine rates only what it generated.
+2. **Mint the recovery key.** This cannot be added later to a vault you can no
+   longer open, so it is step two and not an afterthought. Move the file to
+   offline media.
+3. **Open the deck.** It unlocks with the passphrase you just proved.
+
+`Ctrl+↵` commits either step; `Esc` abandons. Nothing is written until you
+commit, and the passphrase crosses to the engine on stdin.
+
+### From the terminal
+
 ```bash
 black-bag init
 ```

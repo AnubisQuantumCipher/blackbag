@@ -63,11 +63,19 @@ Item {
   // credential is not undoable and there is no trash.
   property string pendingDeleteId: ""
 
+  // First run offers to create a vault, once per visit. Set when the sheet is
+  // dismissed AND when it completes: the status file is republished
+  // asynchronously, so for a moment after a vault is created the deck still
+  // holds a status saying there is none, and without this the sheet reopens on
+  // top of the vault it has just finished making.
+  property bool onboardSuppressed: false
+
   property string totpPendingId: ""
   property string showPendingId: ""
   property string showPendingField: ""
 
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || "/tmp"
+  readonly property string homeDir: Quickshell.env("HOME") || ""
   readonly property string statusPath: runtimeDir + "/black-bag/status.json"
 
   // The shell does not inject `settings` into overlays, and `serviceFor()` does
@@ -116,6 +124,7 @@ Item {
     root.opened = true
     root.actionError = ""
     root.actionNote = ""
+    root.onboardSuppressed = false
     if (payload.kind) root.filterKind = String(payload.kind)
 
     statusFile.reload()
@@ -153,12 +162,24 @@ Item {
     passField.text = ""
   }
 
+  // There being no vault is a first run, not an error. The deck creates one
+  // rather than telling anyone to go and find a terminal.
+  function maybeOnboard() {
+    if (!root.opened || root.onboardSuppressed) return
+    if (onboardSheet.open_ || recordEditor.open_) return
+    if (!root.status || root.status.vault_present === true) return
+    if (root.status.error) return   // unreadable is a hazard, not an empty slot
+    onboardSheet.homeDir = root.homeDir
+    onboardSheet.begin()
+  }
+
   function applyStatus(raw) {
     try {
       var parsed = JSON.parse(String(raw || ""))
       if (parsed.schema_version !== 1) return
       var wasUnlocked = root.unlocked
       root.status = parsed
+      Qt.callLater(root.maybeOnboard)
       var nowUnlocked = !!(parsed.session && parsed.session.unlocked)
       if (nowUnlocked && !wasUnlocked) root.refreshRecords()
       if (!nowUnlocked && wasUnlocked) {
@@ -188,7 +209,13 @@ Item {
 
   // ── actions ────────────────────────────────────────────────────────────────
 
-  function doUnlock() {
+  // The unlock itself. The caller has already established that there is a vault
+  // to unlock — or has just created one, which is the case the split exists
+  // for: status.json is republished asynchronously, so for a moment after
+  // creation the deck is still holding a status that says there is no vault,
+  // and routing that through doUnlock() would re-offer to create the vault
+  // that was just made.
+  function beginUnlock() {
     if (root.unlocking) return
     if (root.passphrase.length === 0) {
       root.actionError = "passphrase required"
@@ -197,6 +224,16 @@ Item {
     root.actionError = ""
     root.unlocking = true
     unlockProcess.running = true
+  }
+
+  function doUnlock() {
+    // Nothing to unlock yet: Enter on an empty slot is the offer to create one.
+    if (root.status && root.status.vault_present !== true && !root.status.error) {
+      root.onboardSuppressed = false
+      root.maybeOnboard()
+      return
+    }
+    root.beginUnlock()
   }
 
   // Esc does the smallest useful thing first, so it is never a dead key and
@@ -441,6 +478,11 @@ Item {
         try {
           var parsed = JSON.parse(String(this.text || "[]"))
           root.records = Array.isArray(parsed) ? parsed : []
+          // A list that succeeded clears a list that failed. Without this the
+          // footer keeps asserting "could not read the record list" over a
+          // record list that is plainly on screen — a stale alarm, which is
+          // the one thing this surface must never show.
+          root.actionError = ""
           if (root.selectedIndex >= root.visibleRecords.length) root.selectedIndex = 0
           if (root.selectedRecord && root.selectedRecord.has_totp)
             root.fetchTotp(root.selectedRecord)
@@ -583,19 +625,19 @@ Item {
       // while you are typing into a field.
       Shortcut {
         sequences: ["Esc"]
-        enabled: root.opened && !recordEditor.open_
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_
         context: Qt.WindowShortcut
         onActivated: root.backOut()
       }
       Shortcut {
         sequences: ["Ctrl+L"]
-        enabled: root.opened && !recordEditor.open_ && root.unlocked
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && root.unlocked
         context: Qt.WindowShortcut
         onActivated: root.doLock()
       }
       Shortcut {
         sequences: ["Ctrl+R"]
-        enabled: root.opened && !recordEditor.open_
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_
         context: Qt.WindowShortcut
         onActivated: {
           refreshProcess.running = true
@@ -604,6 +646,16 @@ Item {
       }
 
       Keys.onPressed: function (event) {
+        // The first-run sheet owns the keyboard while it is up. Esc abandons
+        // it; everything else belongs to its own fields.
+        if (onboardSheet.open_) {
+          if (event.key === Qt.Key_Escape) {
+            onboardSheet.abandon()
+            event.accepted = true
+          }
+          return
+        }
+
         // The editor owns the keyboard while it is open.
         if (recordEditor.open_) {
           if (event.key === Qt.Key_Escape) {
@@ -1868,6 +1920,7 @@ Item {
         }
         onCancelled: Qt.callLater(function () { keyCatcher.forceActiveFocus() })
       }
+
     }
 
       // ── the sealed vault ──────────────────────────────────────────────────
@@ -2081,6 +2134,8 @@ Item {
           anchors.bottom: parent.bottom
           anchors.bottomMargin: Style.space(28)
           text: {
+            if (!root.status || root.status.vault_present !== true)
+              return "⏎ create a vault  ·  esc close"
             if (!sealed.verdict.hasVault) return "esc close"
             if (sealed.blocked) return "detach the debugger to continue  ·  esc close"
             return "⏎ " + sealed.verdict.verb + "  ·  esc close"
@@ -2092,6 +2147,31 @@ Item {
           renderType: Text.NativeRendering
         }
       }
+
+    // ── first run ─────────────────────────────────────────────────────────
+    Onboard {
+      id: onboardSheet
+      motionMs: root.motionMs
+
+      // A vault now exists. The passphrase comes back only because `init`
+      // has just proved it opens this file — asking for it a second time
+      // one second later would be ceremony, not security. It is used once
+      // and dropped.
+      onCreated: function (passphrase) {
+        root.onboardSuppressed = true
+        refreshProcess.running = true
+        if (passphrase.length > 0) {
+          root.passphrase = passphrase
+          root.beginUnlock()
+        } else {
+          Qt.callLater(function () { passField.forceActiveFocus() })
+        }
+      }
+      onDismissed: {
+        root.onboardSuppressed = true
+        Qt.callLater(function () { keyCatcher.forceActiveFocus() })
+      }
+    }
 
   }
 

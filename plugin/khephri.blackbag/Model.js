@@ -359,7 +359,7 @@ function unlockVerdict(status, nowMs, staleAfterSec) {
   if (status.vault_present !== true) {
     v.severity = HAZARD_NONE
     v.headline = "NO VAULT AT THIS PATH"
-    v.detail = "create one with:  black-bag init"
+    v.detail = "nothing here yet — the deck can create one"
     v.hasVault = false      // and therefore: no passphrase field at all
     return v
   }

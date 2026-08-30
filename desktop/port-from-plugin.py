@@ -57,8 +57,10 @@ import qs.Ui""",
   property bool opened: true"""
 ),
 (
-"""  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || "/tmp\"""",
-"""  readonly property string runtimeDir: App.env("XDG_RUNTIME_DIR") || "/tmp\""""
+"""  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || "/tmp"
+  readonly property string homeDir: Quickshell.env("HOME") || \"\"""",
+"""  readonly property string runtimeDir: App.env("XDG_RUNTIME_DIR") || "/tmp"
+  readonly property string homeDir: App.env("HOME") || \"\""""
 ),
 (
 """  // The shell does not inject `settings` into overlays, and `serviceFor()` does
@@ -125,6 +127,11 @@ import qs.Ui""",
 ),
 ]
 
+# The first-run sheet is deliberately host-neutral apart from its imports: it is
+# handed $HOME by whichever surface owns it rather than asking the environment
+# itself, so this is the whole of its port.
+ONBOARD_EDITS = list(EDITOR_EDITS)
+
 
 def port(text, edits, name):
     for before, after in edits:
@@ -157,6 +164,8 @@ def main():
                             COCKPIT_EDITS, "Cockpit.qml"),
         "Editor.qml": port((PLUGIN / "Editor.qml").read_text(),
                            EDITOR_EDITS, "Editor.qml"),
+        "Onboard.qml": port((PLUGIN / "Onboard.qml").read_text(),
+                            ONBOARD_EDITS, "Onboard.qml"),
         # Model.js is a pure library with no host coupling at all, so it
         # crosses verbatim. That is the point: it is the part both surfaces
         # share, and the plugin's test suite tests it for both.

@@ -66,6 +66,16 @@ Then start the unlock agent, so the deck and the CLI share one unlocked vault:
 systemctl --user enable --now black-bag-agent
 ```
 
+## First run
+
+With no vault at the path, the deck offers to create one — passphrase, then the
+offline recovery key, then it opens. There is no step that requires a terminal.
+
+A generated passphrase is shown in plain text so you can write it down, and the
+engine's entropy verdict is shown with it. A passphrase you typed gets no
+score: the engine rates only what it generated, and inventing a
+character-class estimate for a phrase a person chose reliably overstates it.
+
 ## Keys
 
 | | |
@@ -84,6 +94,9 @@ systemctl --user enable --now black-bag-agent
 | `Ctrl+R` | refresh status and records |
 | `Esc` | back out one layer; close when there is nothing left to back out of |
 | `Ctrl+Q` / `Ctrl+W` | quit |
+
+During first run: `Ctrl+G` generates a passphrase, `Ctrl+↵` commits the step,
+`Esc` abandons it.
 
 In the editor: `⌃⏎` saves, `⌃G` generates into the focused field, `Tab` and
 `⇧Tab` move between fields, `Esc` abandons the sheet.
