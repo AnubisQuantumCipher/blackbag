@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- BLACK-BAG. A closed case with a shackle: the vault sealed, which is the
+     state the program spends most of its life in and the state it would rather
+     be wrong about in the safe direction. Monochrome on purpose -- the icon
+     never claims a posture, because an icon cannot be re-read when the posture
+     changes. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="case" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3136"/>
+      <stop offset="1" stop-color="#14181b"/>
+    </linearGradient>
+  </defs>
+
+  <!-- shackle -->
+  <path d="M22 26 V19 a10 10 0 0 1 20 0 V26"
+        fill="none" stroke="#8d969c" stroke-width="4.5" stroke-linecap="round"/>
+
+  <!-- case -->
+  <rect x="11" y="26" width="42" height="30" rx="5"
+        fill="url(#case)" stroke="#8d969c" stroke-width="2.5"/>
+
+  <!-- seam: the case is a bag that closes, not a box -->
+  <path d="M11 35 H53" stroke="#8d969c" stroke-width="1.6" opacity="0.55"/>
+
+  <!-- keyway -->
+  <circle cx="32" cy="43" r="4" fill="none" stroke="#cacccc" stroke-width="2.5"/>
+  <path d="M32 47 V51" stroke="#cacccc" stroke-width="2.5" stroke-linecap="round"/>
+</svg>

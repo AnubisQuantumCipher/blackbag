@@ -39,8 +39,9 @@ There is no formal verification here. This is ordinary Rust with tests.
 | Rust | 1.82 or newer, with `cargo` |
 | OS | Linux. The engine uses `mlock`, `prctl`, `/proc` and `SO_PEERCRED` and is not portable off it |
 | `wl-clipboard` | for `--to clipboard` and for COPY in the deck. Without `wl-copy` on `PATH`, copying fails with a clear error |
-| Omarchy shell | Quickshell with `omarchy-shell`, for the bar widget and the deck. The CLI works without it |
-| `python3` | used by the plugin installer to edit `shell.json` |
+| Omarchy shell | Quickshell with `omarchy-shell`, for the bar widget and the in-shell deck. Only the plugin needs it |
+| Qt 6.5+, CMake 3.21+ | only for the standalone desktop application. Core, Gui, Qml, Quick, QuickControls2, Network, Svg |
+| `python3` | used by the plugin installer to edit `shell.json`, and by the desktop port check |
 | `libnotify` | optional; the plugin service uses `notify-send` for the rollback warning |
 
 ### Build and install the engine
@@ -72,6 +73,36 @@ The installer is idempotent and does five things:
 4. Installs `~/.local/share/applications/black-bag.desktop`.
 5. Publishes a first `status.json`, rescans the shell's plugins and reloads
    Hyprland.
+
+### Install the standalone desktop application
+
+Optional, and independent of the plugin. Use it if you are not on the Omarchy
+shell, or if you would rather have a window you can put on a workspace than an
+overlay you summon.
+
+```bash
+desktop/install.sh
+```
+
+It checks that the engine is on `PATH`, verifies the shared QML is in step with
+the plugin's, builds with CMake, and installs under `~/.local`: the
+`blackbag-desktop` binary, a `dev.blackbag.Deck` desktop entry with "Lock the
+vault now" and "Show vault and host posture" actions, a scalable icon and
+AppStream metadata. `PREFIX=/usr/local desktop/install.sh` installs elsewhere.
+
+It is the same deck as the plugin's, with three differences that follow from
+being a window rather than an overlay:
+
+- Its settings live in `~/.config/black-bag/desktop.json` rather than in the
+  shell's config. The four deck settings keep the same names and the same
+  defaults; see [`desktop/README.md`](../desktop/README.md).
+- `Esc` at the outermost layer closes the window, and `Ctrl+Q` or `Ctrl+W`
+  quits. Closing does **not** lock — the agent holds the session, and locking
+  stays a deliberate act.
+- A second launch raises the running window instead of opening a second one.
+
+Like the plugin, it holds no key material and performs no cryptography: it
+drives `black-bag` as a child process and renders what the engine reports.
 
 ### The agent unit
 

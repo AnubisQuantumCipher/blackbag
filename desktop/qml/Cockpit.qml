@@ -1,6 +1,9 @@
 // BLACK-BAG — credential command deck.
 //
-// Full-screen cockpit over the live vault. Three rules shape everything here:
+// The deck itself, identical in the standalone application and in the Omarchy
+// plugin: the plugin wraps this in a layer-shell overlay, the application
+// wraps it in a window, and neither changes what is on screen. Three rules
+// shape everything here:
 //
 //   1. This file never stores a secret. Record metadata (titles, usernames,
 //      tags, secret-field *handles*) comes from the agent; secret bytes are
@@ -14,19 +17,18 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
-import Quickshell
-import Quickshell.Io
-import Quickshell.Wayland
-import qs.Commons
-import qs.Ui
+import BlackBag
 import "Model.js" as Model
 
 Item {
   id: root
 
-  property var shell: ({})
-  property var manifest: ({})
-  property bool opened: false
+  // Raised when the operator asks to leave -- the ✕ chip, or Esc with nothing
+  // left to back out of. The deck does not close its own window: what a
+  // dismissal means belongs to whatever is hosting it.
+  signal closeRequested()
+
+  property bool opened: true
 
   // ── live state ─────────────────────────────────────────────────────────────
   property var status: null
@@ -67,16 +69,15 @@ Item {
   property string showPendingId: ""
   property string showPendingField: ""
 
-  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || "/tmp"
+  readonly property string runtimeDir: App.env("XDG_RUNTIME_DIR") || "/tmp"
   readonly property string statusPath: runtimeDir + "/black-bag/status.json"
 
-  // The shell does not inject `settings` into overlays, and `serviceFor()` does
-  // not reach our own service from here either — the overlay observes
-  // `service === null`. `shell.shellConfig` is what is actually reachable, so
-  // the manifest schema is resolved off that. See Model.resolvePluginSettings.
-  readonly property var settings:
-    Model.resolvePluginSettings(shell ? shell.shellConfig : null,
-                                manifest, "khephri.blackbag")
+  // In the plugin these come from the shell's config, resolved against the
+  // manifest schema. A standalone application owns its own settings file, so
+  // they come from ~/.config/black-bag/desktop.json instead, defaulted to the
+  // same values the manifest declares — the two surfaces must not disagree
+  // about how long a revealed secret stays on screen.
+  readonly property var settings: Model.desktopSettings(App.settings)
 
   function setting(name, fallback) {
     return Model.settingOf(root.settings, name, fallback)
@@ -129,17 +130,18 @@ Item {
     })
   }
 
-  // Host-initiated end of dismissal. Must not call back into shell.hide().
+  // Host-initiated end of dismissal. Must not raise closeRequested again.
   function close() {
     root.opened = false
     root.clearSecrets()
   }
 
-  // User-initiated. Routes out through the host so its bookkeeping stays right.
+  // User-initiated. Everything sensitive goes first, then the host is told —
+  // in that order, so a host that declines to close still leaves nothing
+  // behind.
   function dismiss() {
     root.clearSecrets()
-    if (shell && typeof shell.hide === "function") shell.hide("khephri.blackbag")
-    else root.close()
+    root.closeRequested()
   }
 
   // Everything sensitive this file can be holding, dropped at once.
@@ -556,15 +558,15 @@ Item {
 
   // ── window ─────────────────────────────────────────────────────────────────
 
-  PanelWindow {
+  // In the plugin this is a layer-shell overlay that takes exclusive keyboard
+  // focus. Here it is simply the window's content: the application already has
+  // the keyboard when it is focused, and taking it exclusively from a normal
+  // window would be a compositor-level grab no password manager has any
+  // business asserting.
+  Rectangle {
     id: win
-    visible: root.opened
-    anchors { top: true; bottom: true; left: true; right: true }
+    anchors.fill: parent
     color: Color.background
-    exclusionMode: ExclusionMode.Ignore
-    WlrLayershell.namespace: "blackbag-cockpit"
-    WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
 
     Item {
       id: keyCatcher
@@ -1190,7 +1192,7 @@ Item {
               RowLayout {
                 Layout.fillWidth: true
                 spacing: Style.spacing.md
-                TextField {
+                InputField {
                   id: searchField
                   Layout.fillWidth: true
                   placeholderText: "/  search titles, tags, usernames — never secrets"
@@ -1937,7 +1939,7 @@ Item {
         }
 
         // FIELD — sits directly on the rule.
-        TextField {
+        InputField {
           id: passField
           width: sealed.colW
           x: rule.x

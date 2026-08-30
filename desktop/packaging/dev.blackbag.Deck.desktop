@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Black-Bag
+GenericName=Password Manager
+Comment=Credential command deck — unlock, browse, copy, TOTP
+Exec=blackbag-desktop
+Icon=dev.blackbag.Deck
+Terminal=false
+Categories=System;Security;
+Keywords=password;credential;vault;secret;totp;2fa;otp;passphrase;
+StartupNotify=true
+StartupWMClass=blackbag-desktop
+SingleMainWindow=true
+X-GNOME-UsesNotifications=false
+Actions=lock;doctor;
+
+# Locking is worth reaching without opening anything: it is the one action you
+# want when you are walking away from the machine, and it does not need a
+# window to be useful.
+[Desktop Action lock]
+Name=Lock the vault now
+Exec=black-bag agent lock
+
+[Desktop Action doctor]
+Name=Show vault and host posture
+Exec=alacritty -e sh -c "black-bag doctor; read -p 'press enter'"

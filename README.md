@@ -5,8 +5,15 @@ Credential storage for Omarchy, with a full-screen command deck.
 ![The unlocked deck](docs/screenshots/deck.png)
 
 This is a Linux-only rebuild of the engine behind the [`black-bagg`][crate]
-crate, plus a Quickshell plugin (`khephri.blackbag`) that gives it a bar widget
-and a mission-control cockpit.
+crate, plus two surfaces over it: a Quickshell plugin (`khephri.blackbag`) that
+gives Omarchy a bar widget and an in-shell cockpit, and a standalone desktop
+application (`blackbag-desktop`) that puts the same deck in a window on any
+Wayland or X11 desktop.
+
+The deck is one implementation. `Cockpit.qml`, `Editor.qml` and `Model.js`
+belong to it, not to either host; the application's copies are generated from
+the plugin's by `desktop/port-from-plugin.py`, and CI fails if they disagree. A
+fix lands in both or it lands in neither.
 
 It exists because reading the published crate closely turned up nine findings,
 several of them load-bearing. They are written up in **[`docs/AUDIT.md`][audit]**
@@ -115,13 +122,33 @@ cd ~/Projects/blackbag
 cargo build --release
 install -Dm755 target/release/black-bag ~/.local/bin/black-bag
 
-# the Omarchy surfaces
+# the Omarchy plugin: bar widget + in-shell cockpit
 cp -r plugin/khephri.blackbag ~/.config/omarchy/plugins/
 ~/.config/omarchy/plugins/khephri.blackbag/install.sh
+
+# the standalone desktop application (needs Qt 6.5+ and CMake 3.21+)
+desktop/install.sh
 ```
 
-The installer adds the bar widget, binds `SUPER+SHIFT+K`, writes a hardened
-systemd user unit for the unlock agent, and rescans the shell.
+The plugin installer adds the bar widget, binds `SUPER+SHIFT+K`, writes a
+hardened systemd user unit for the unlock agent, and rescans the shell. The
+desktop installer builds with CMake and installs the binary, a desktop entry,
+a scalable icon and AppStream metadata under `~/.local` — no root, no system
+directories.
+
+Both are optional and neither needs the other. The engine is a complete
+password manager on its own; the agent is what lets all three share one
+unlocked vault.
+
+### The desktop application
+
+![The deck as a standalone window](docs/screenshots/desktop-deck.png)
+
+Same deck, same rules, its own window and its own settings file. It is a
+renderer and a process driver: it holds no key material, performs no
+cryptography, and never opens the vault file — it drives `black-bag` as a child
+process so plaintext stays out of a long-lived GUI's address space. See
+**[`desktop/README.md`](desktop/README.md)**.
 
 ---
 

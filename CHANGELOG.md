@@ -3,6 +3,52 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-08-30
+
+### Added
+
+- **A standalone desktop application**, `blackbag-desktop`, in `desktop/`. The
+  same deck in an ordinary window rather than a Quickshell overlay, for
+  desktops that are not running the Omarchy shell. Qt 6 / QML, built with
+  CMake, installed under `~/.local` with a desktop entry, a scalable icon and
+  AppStream metadata. It drives the engine as a child process exactly as the
+  plugin does: no key material, no cryptography, and it never opens the vault
+  file.
+- **`desktop/port-from-plugin.py`**, which generates the application's
+  `Cockpit.qml`, `Editor.qml` and `Model.js` from the plugin's. The deck is one
+  implementation with two hosts, and the transformations a host is allowed to
+  make are now an explicit, checkable list rather than a hand-maintained copy.
+  CI runs it with `--check`.
+- **CI coverage for the new surface**: a `desktop` job that builds the
+  application warning-free on a clean tree and validates its desktop entry, and
+  a step in the existing `plugin logic` job that fails if the shared QML has
+  drifted from the plugin's.
+
+### Note on versions
+
+The engine is **unchanged** in this release — 2.1.0 adds a surface, not a
+behaviour. The version is bumped across the workspace, the plugin manifest and
+the application so that one number identifies the release, but nothing in
+`crates/` differs from 2.0.1.
+
+### Fixed
+
+- **Two `MouseArea`s inside layouts.** The census rows and the hygiene rows each
+  declared an `anchors.fill: parent` `MouseArea` as a direct child of a layout,
+  which Qt reports as undefined behaviour: the `MouseArea` is given a layout
+  cell of its own *and* anchored across the row it is sitting inside, quietly
+  widening every affected row by an empty column. Replaced with `HoverHandler`
+  and `TapHandler`, which are not items and take no cell. The plugin had the
+  same defect; the standalone build is simply where Qt's warning was visible.
+
+### Changed
+
+- The plugin's launcher entry is now named **Black-Bag Overlay**. The standalone
+  application ships an entry also called Black-Bag, and two launcher rows with
+  the same name and the same icon is a coin flip rather than a choice.
+
+[2.1.0]: https://github.com/AnubisQuantumCipher/blackbag/releases/tag/v2.1.0
+
 ## [2.0.1] — 2026-08-30
 
 ### Fixed (concurrency)

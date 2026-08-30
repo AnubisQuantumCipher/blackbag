@@ -1,8 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=Black-Bag
-GenericName=Credential Vault
-Comment=Open the Black-Bag credential command deck
+# Named for the surface, not the product. The standalone application ships a
+# dev.blackbag.Deck entry that is also called Black-Bag, and two launcher rows
+# with the same name and the same icon is a coin flip rather than a choice.
+Name=Black-Bag Overlay
+GenericName=Credential Vault (in-shell)
+Comment=Open the credential command deck inside the running Omarchy shell
 # Summons the Quickshell overlay rather than spawning a window of its own —
 # the cockpit lives inside the running shell, so there is no second process
 # holding vault state.

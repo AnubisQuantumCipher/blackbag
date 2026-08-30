@@ -52,3 +52,44 @@ jobs:
           node-version: '22'
       - name: Model.js assertions
         run: plugin/khephri.blackbag/tests/run.sh
+
+      # Cockpit.qml, Editor.qml and Model.js are one surface with two hosts.
+      # This is what stops a fix landing in the plugin and never reaching the
+      # application, which is the drift this repository has already been bitten
+      # by once.
+      - name: Desktop QML is in step with the plugin
+        run: python3 desktop/port-from-plugin.py --check
+
+  desktop:
+    name: desktop application
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Qt 6
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ \
+            qt6-base-dev qt6-declarative-dev libqt6svg6-dev \
+            qml6-module-qtquick-controls qml6-module-qtquick-layouts \
+            desktop-file-utils
+
+      - name: Configure
+        run: cmake -S desktop -B desktop/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build desktop/build
+
+      # Same standard as the engine: a warning is a failure, not a line in a
+      # log nobody reads.
+      - name: No warnings
+        run: |
+          rm -rf desktop/build
+          cmake -S desktop -B desktop/build -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
+          count=$(cmake --build desktop/build 2>&1 | grep -ci 'warning' || true)
+          echo "warnings: $count"
+          test "$count" -eq 0
+
+      - name: Desktop entry is spec-clean
+        run: desktop-file-validate desktop/packaging/dev.blackbag.Deck.desktop

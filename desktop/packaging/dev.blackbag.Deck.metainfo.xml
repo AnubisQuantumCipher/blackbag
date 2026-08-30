@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.blackbag.Deck</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+
+  <developer id="dev.blackbag">
+    <name>Khephri Labs</name>
+  </developer>
+
+  <name>Black-Bag</name>
+  <summary>Credential command deck</summary>
+
+  <description>
+    <p>
+      Black-Bag is a password manager for a single local vault, sealed with
+      Argon2id and XChaCha20-Poly1305 and recoverable through hybrid
+      post-quantum recipients (X25519 combined with ML-KEM-1024).
+    </p>
+    <p>
+      This application is the deck: it renders the vault and drives the
+      black-bag engine as a child process. It holds no key material, derives no
+      key, and performs no cryptography of its own. A passphrase crosses to the
+      engine on standard input and never in an argument vector. Record metadata
+      is shown freely; secret bytes are fetched only when you explicitly copy or
+      reveal one, and a reveal clears itself on a visible countdown.
+    </p>
+    <p>
+      Every posture on screen is the engine's own report, carried through
+      verbatim. When the engine cannot vouch for something the deck draws it as
+      unknown rather than filling in a pass, and a status older than the stale
+      threshold desaturates instead of asserting a state it cannot stand
+      behind.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">dev.blackbag.Deck.desktop</launchable>
+
+  <url type="homepage">https://github.com/khephri-labs/blackbag</url>
+  <url type="bugtracker">https://github.com/khephri-labs/blackbag/issues</url>
+  <url type="help">https://github.com/khephri-labs/blackbag/blob/main/docs/MANUAL.md</url>
+
+  <provides>
+    <binary>blackbag-desktop</binary>
+  </provides>
+
+  <categories>
+    <category>System</category>
+    <category>Security</category>
+  </categories>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="2.1.0" date="2026-08-30">
+      <description>
+        <p>First release of the standalone deck.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -11,3 +11,6 @@ Cargo.lock.orig
 *.cbor
 *.qsig
 recovery*.json
+
+# CMake build tree for the desktop application.
+/desktop/build/
