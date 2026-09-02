@@ -1107,12 +1107,34 @@ fn cmd_doctor(
         println!("recipient  {} [{}]", recipient.label, recipient.kind);
     }
     println!(
-        "session    {}",
+        "session    {}{}",
         if status.session.unlocked {
             "unlocked"
         } else {
             "locked"
+        },
+        status
+            .session
+            .last_lock_reason
+            .as_deref()
+            .map(|r| format!(" (last lock: {r})"))
+            .unwrap_or_default()
+    );
+    println!(
+        "ceiling    {}",
+        if status.session.max_session_secs == 0 {
+            "off".to_string()
+        } else {
+            format!("{} s after unlock", status.session.max_session_secs)
         }
+    );
+    println!(
+        "sleep      {}",
+        status
+            .session
+            .sleep_watch
+            .as_deref()
+            .unwrap_or("no agent reachable; suspend and session lock are not watched")
     );
     println!(
         "mlock      {} (limit {} KiB, {} bytes locked now)",

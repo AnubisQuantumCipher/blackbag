@@ -15,8 +15,15 @@ change that quietly widens a claim is a regression even if the code is correct.
    There is a test that asserts this; it is not decoration.
 3. **Absence renders as absence.** "Not measured" must never look like
    "measured and fine". Unknown is drawn as UNKNOWN.
-4. **No network calls.** Not for breach checks, not for telemetry, not for
-   update checks. "Nothing is sent anywhere" is a load-bearing property.
+4. **The agent never touches the network, and nothing goes online unasked.**
+   The agent's unit forbids every address family but `AF_UNIX`, and that is
+   not to be loosened. The one sanctioned network act in the whole program is
+   the breach check: opt-in per run (`--online`, or the deck's two-step
+   button), five-character hash prefixes only, fetched by `curl` from the
+   CLI, matched inside the agent. No telemetry, no update checks, no favicon
+   fetching — ever. A change that adds a second network path needs a
+   whitepaper section stating exactly what leaves the machine before it
+   needs code.
 5. **Comments state constraints the code cannot show.** Not what the next line
    does, not why a change was made, not who made it.
 
