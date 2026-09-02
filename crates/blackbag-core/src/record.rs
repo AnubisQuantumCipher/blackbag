@@ -4,9 +4,9 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
-use crate::memlock;
+use crate::secmem::SecretBuf;
 
 /// Per-field caps, restored from black-bagg 0.2.x. Enforced on the way in *and*
 /// on the way out, so a hostile vault file cannot blow memory during decode.
@@ -17,23 +17,25 @@ pub const MAX_TAGS_PER_RECORD: usize = 64;
 pub const MAX_TAG_LEN: usize = 128;
 pub const MAX_TITLE_LEN: usize = 256;
 
-/// A secret byte string: page-locked while it lives, wiped when it dies.
+/// A secret byte string, carved out of the locked arena and wiped when it dies.
 ///
-/// The lock guard holds its own (ptr, len) so the unlock still happens after
-/// the buffer is zeroized — the exact ordering that silently failed in 0.4.10.
+/// Storage is a [`SecretBuf`], so the bytes live in pages that this process
+/// mapped and locked itself and that no ordinary allocation shares. The
+/// previous design locked each `Vec` separately and lost the lock whenever a
+/// neighbouring secret on the same page was dropped — see `secmem.rs`.
+///
+/// Serialised as a map with one `data` entry, exactly as the `Vec<u8>` design
+/// was, so vault format v2 is unchanged.
 #[derive(Serialize, Deserialize)]
 pub struct Secret {
-    #[serde(with = "serde_bytes")]
-    data: Vec<u8>,
-    #[serde(skip)]
-    lock: Option<memlock::Lock>,
+    data: SecretBuf,
 }
 
 impl Secret {
     pub fn new(bytes: &[u8]) -> Self {
-        let data = bytes.to_vec();
-        let lock = memlock::Lock::new(&data);
-        Self { data, lock }
+        Self {
+            data: SecretBuf::new(bytes),
+        }
     }
 
     pub fn from_str(s: &str) -> Self {
@@ -41,7 +43,7 @@ impl Secret {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.data
+        self.data.as_slice()
     }
 
     pub fn len(&self) -> usize {
@@ -52,27 +54,15 @@ impl Secret {
         self.data.is_empty()
     }
 
-    /// Interpret as UTF-8. Callers must treat the result as secret too.
-    pub fn expose_str(&self) -> Result<String> {
-        Ok(String::from_utf8(self.data.clone())?)
+    /// Interpret as UTF-8, into a string that is wiped when it is dropped.
+    pub fn expose_str(&self) -> Result<Zeroizing<String>> {
+        Ok(self.data.to_zeroizing_string()?)
     }
 
-    /// Re-acquire the page lock after deserialisation.
-    ///
-    /// The guard is `#[serde(skip)]`, so a `Secret` that came off disk holds no
-    /// lock until this is called.
-    pub fn relock(&mut self) {
-        if self.lock.is_none() {
-            self.lock = memlock::Lock::new(&self.data);
-        }
-    }
-
-    /// Whether this secret currently holds a page lock.
-    ///
-    /// Exposed so tests can assert on the object rather than on the
-    /// process-global byte counter, which other tests perturb in parallel.
+    /// Whether the arena slab holding this secret is page-locked. False when
+    /// the kernel refused the lock, which `doctor` also reports.
     pub fn is_locked(&self) -> bool {
-        self.lock.is_some()
+        self.data.is_locked()
     }
 
     /// A stable, non-reversible 8-hex-character handle, safe to show in a UI
@@ -81,25 +71,23 @@ impl Secret {
     pub fn handle(&self, domain: &str) -> String {
         let mut hasher = blake3::Hasher::new_derive_key("black-bag::v2::secret-handle");
         hasher.update(domain.as_bytes());
-        hasher.update(&self.data);
+        hasher.update(self.data.as_slice());
         hex::encode(&hasher.finalize().as_bytes()[..4])
     }
 }
 
 impl Clone for Secret {
     fn clone(&self) -> Self {
-        Self::new(&self.data)
+        Self {
+            data: self.data.clone(),
+        }
     }
 }
 
 impl PartialEq for Secret {
     /// Constant-time. Derived equality on secrets is a timing oracle.
     fn eq(&self, other: &Self) -> bool {
-        use subtle::ConstantTimeEq;
-        if self.data.len() != other.data.len() {
-            return false;
-        }
-        self.data.ct_eq(&other.data).unwrap_u8() == 1
+        self.data == other.data
     }
 }
 
@@ -109,16 +97,6 @@ impl std::fmt::Debug for Secret {
     /// Never print secret bytes, not even under `{:?}` in a panic message.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Secret({} bytes, redacted)", self.data.len())
-    }
-}
-
-impl Drop for Secret {
-    fn drop(&mut self) {
-        self.data.zeroize();
-        // `lock` drops after this and unlocks the range it captured at
-        // construction, which is still the correct address: Vec::zeroize
-        // clears the length but does not free or move the allocation.
-        drop(self.lock.take());
     }
 }
 
@@ -288,16 +266,6 @@ impl Record {
             fields: Vec::new(),
             totp: None,
             notes: None,
-        }
-    }
-
-    /// Re-acquire page locks for every secret this record carries.
-    pub fn relock(&mut self) {
-        for field in self.fields.iter_mut() {
-            field.secret.relock();
-        }
-        if let Some(notes) = self.notes.as_mut() {
-            notes.relock();
         }
     }
 

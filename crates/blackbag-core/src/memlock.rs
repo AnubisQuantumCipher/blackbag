@@ -67,14 +67,15 @@ impl Drop for Lock {
     }
 }
 
-/// Bytes this process currently holds locked via [`Lock`].
+/// Bytes this process currently holds locked, through [`Lock`] guards and
+/// through the secret arena's slabs together.
 pub fn locked_bytes() -> usize {
-    LOCKED_BYTES.load(Ordering::Relaxed)
+    LOCKED_BYTES.load(Ordering::Relaxed) + crate::secmem::locked_bytes()
 }
 
-/// Number of lock attempts the kernel refused.
+/// Number of lock attempts the kernel refused, guards and slabs together.
 pub fn failed_locks() -> usize {
-    FAILED_LOCKS.load(Ordering::Relaxed)
+    FAILED_LOCKS.load(Ordering::Relaxed) + crate::secmem::failed_locks()
 }
 
 /// The process memlock ceiling in bytes, and whether it is unlimited.

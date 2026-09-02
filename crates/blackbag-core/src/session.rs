@@ -94,8 +94,8 @@ pub fn socket_path() -> Result<PathBuf> {
 pub enum Request {
     /// Liveness plus lock state.
     Status,
-    /// Unlock with the master passphrase.
-    Unlock { passphrase: String },
+    /// Unlock with the master passphrase. Wiped with the request.
+    Unlock { passphrase: Zeroizing<String> },
     /// Forget the DEK immediately.
     Lock,
     /// Non-secret metadata for every record.
@@ -139,7 +139,8 @@ pub enum Response {
     // sequence, and fails at runtime rather than at compile time.
     Records { records: Vec<RecordView> },
     Detail(RecordView),
-    Secret { value: String },
+    /// The one reply that carries secret bytes. Wiped with the reply.
+    Secret { value: Zeroizing<String> },
     Totp { code: String, ttl_secs: u64, step: u64 },
     Saved { id: String },
     Hygiene(crate::hygiene::VaultReport),
@@ -166,21 +167,23 @@ pub struct RecordDraft {
     pub attributes: Vec<(String, String)>,
     /// Named secret fields. An empty value on Update means "leave this one
     /// alone", so a UI can edit a title without re-typing the password.
+    /// Values are wiped when the draft is dropped.
     #[serde(default)]
-    pub secrets: Vec<(String, String)>,
+    pub secrets: Vec<(String, Zeroizing<String>)>,
     #[serde(default)]
     pub totp: Option<TotpDraft>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TotpDraft {
-    /// A bare base32 shared secret.
+    /// A bare base32 shared secret. Wiped with the draft.
     #[serde(default)]
-    pub secret_base32: Option<String>,
+    pub secret_base32: Option<Zeroizing<String>>,
     /// A full `otpauth://totp/...` URI, which also supplies issuer, account,
     /// digits, period and algorithm. Takes precedence over the fields below.
+    /// Carries the secret, so it is wiped with the draft too.
     #[serde(default)]
-    pub otpauth_uri: Option<String>,
+    pub otpauth_uri: Option<Zeroizing<String>>,
     #[serde(default)]
     pub issuer: Option<String>,
     #[serde(default)]
@@ -716,7 +719,6 @@ impl Agent {
             Request::Status => Ok(Response::Status(self.status_snapshot())),
 
             Request::Unlock { passphrase } => {
-                let passphrase = Zeroizing::new(passphrase);
                 let vault = Vault::unlock(&self.vault_path, passphrase.as_bytes())?;
                 let method = vault.unlocked_by;
                 let now = Instant::now();
@@ -1163,7 +1165,7 @@ mod tests {
             },
             Response::Detail(view),
             Response::Secret {
-                value: "s".into(),
+                value: Zeroizing::new("s".into()),
             },
             Response::Totp {
                 code: "123456".into(),
@@ -1260,7 +1262,7 @@ mod tests {
             title: Some("GitHub".into()),
             tags: vec!["dev".into()],
             attributes: vec![("username".into(), "octocat".into())],
-            secrets: vec![("password".into(), "hunter2".into())],
+            secrets: vec![("password".into(), Zeroizing::new("hunter2".into()))],
             totp: None,
         }
     }
@@ -1271,7 +1273,7 @@ mod tests {
         assert_eq!(record.kind, Kind::Login);
         assert_eq!(record.title.as_deref(), Some("GitHub"));
         assert_eq!(record.attribute("username"), Some("octocat"));
-        assert_eq!(record.field("password").unwrap().expose_str().unwrap(), "hunter2");
+        assert_eq!(record.field("password").unwrap().expose_str().unwrap().as_str(), "hunter2");
     }
 
     #[test]
@@ -1295,13 +1297,13 @@ mod tests {
         // current password.
         let mut record = login_draft().into_record().unwrap();
         let mut draft = login_draft();
-        draft.secrets = vec![("password".into(), String::new())];
+        draft.secrets = vec![("password".into(), Zeroizing::new(String::new()))];
         draft.title = Some("renamed".into());
         draft.apply_to(&mut record).unwrap();
 
         assert_eq!(record.title.as_deref(), Some("renamed"));
         assert_eq!(
-            record.field("password").unwrap().expose_str().unwrap(),
+            record.field("password").unwrap().expose_str().unwrap().as_str(),
             "hunter2",
             "a blank field in the form must not wipe the secret"
         );
@@ -1327,7 +1329,7 @@ mod tests {
             kind: "totp".into(),
             title: Some("GitHub 2FA".into()),
             totp: Some(TotpDraft {
-                secret_base32: Some(B32.into()),
+                secret_base32: Some(Zeroizing::new(B32.into())),
                 issuer: Some("GitHub".into()),
                 ..TotpDraft::default()
             }),
@@ -1344,7 +1346,7 @@ mod tests {
         let draft = RecordDraft {
             kind: "totp".into(),
             totp: Some(TotpDraft {
-                otpauth_uri: Some(format!("otpauth://totp/GitHub:octocat?secret={B32}&digits=8")),
+                otpauth_uri: Some(Zeroizing::new(format!("otpauth://totp/GitHub:octocat?secret={B32}&digits=8"))),
                 ..TotpDraft::default()
             }),
             ..RecordDraft::default()
@@ -1360,7 +1362,7 @@ mod tests {
         let draft = RecordDraft {
             kind: "totp".into(),
             totp: Some(TotpDraft {
-                secret_base32: Some(B32.into()),
+                secret_base32: Some(Zeroizing::new(B32.into())),
                 ..TotpDraft::default()
             }),
             ..RecordDraft::default()
@@ -1404,7 +1406,7 @@ mod tests {
     #[test]
     fn a_nameless_secret_field_is_refused() {
         let mut draft = login_draft();
-        draft.secrets = vec![("  ".into(), "x".into())];
+        draft.secrets = vec![("  ".into(), Zeroizing::new("x".into()))];
         assert!(draft.into_record().is_err());
     }
 
@@ -1473,7 +1475,7 @@ mod tests {
         let reply = ask_at(
             &sock,
             &Request::Unlock {
-                passphrase: "agent test passphrase".into(),
+                passphrase: Zeroizing::new("agent test passphrase".into()),
             },
         )
         .unwrap();
@@ -1521,7 +1523,7 @@ mod tests {
         let reply = ask_at(
             &sock,
             &Request::Unlock {
-                passphrase: "agent test passphrase".into(),
+                passphrase: Zeroizing::new("agent test passphrase".into()),
             },
         )
         .unwrap();

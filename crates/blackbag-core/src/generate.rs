@@ -20,10 +20,10 @@ use anyhow::{bail, Result};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-use crate::memlock;
 use crate::record::Secret;
+use crate::secmem::SecretBuf;
 
 /// Longest password we will mint. Well below `MAX_FIELD_BYTES`; the cap exists
 /// so a mistyped length cannot ask for a gigabyte of locked memory.
@@ -133,30 +133,18 @@ pub const WORDS: [&str; 512] = [
 // Scratch buffers
 // ---------------------------------------------------------------------------
 
-/// A page-locked working buffer, wiped *before* its lock is released.
-///
-/// The ordering is the one [`crate::record::Secret`] documents and 0.4.10 got
-/// wrong: zeroize first, unlock second. Letting the guard drop first would
-/// leave a window, however brief, in which the plaintext is both present and
-/// swappable. The buffer is allocated at its final length and only ever indexed
-/// into, never pushed to, so it cannot reallocate and strand a copy.
+/// A working buffer in the locked arena, wiped when it is dropped. Allocated
+/// at its final length and only ever indexed into, never pushed to, so it
+/// cannot grow and strand a copy.
 struct Scratch {
-    buf: Vec<u8>,
-    lock: Option<memlock::Lock>,
+    buf: SecretBuf,
 }
 
 impl Scratch {
     fn new(len: usize) -> Self {
-        let buf = vec![0u8; len];
-        let lock = memlock::Lock::new(&buf);
-        Self { buf, lock }
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        self.buf.zeroize();
-        drop(self.lock.take());
+        Self {
+            buf: SecretBuf::zeroed(len),
+        }
     }
 }
 
@@ -749,7 +737,7 @@ mod tests {
     }
 
     fn expose(secret: &Secret) -> String {
-        secret.expose_str().expect("generated secrets are UTF-8")
+        secret.expose_str().expect("generated secrets are UTF-8").to_string()
     }
 
     // -- the wordlist itself -------------------------------------------------

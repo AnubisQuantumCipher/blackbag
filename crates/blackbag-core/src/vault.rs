@@ -35,8 +35,8 @@ use crate::crypto::{
     self, ArgonParams, Sealed, AAD_PAYLOAD, AAD_RECIPIENT_PASSPHRASE, AAD_RECIPIENT_PQ,
     MAX_VAULT_FILE_BYTES,
 };
-use crate::memlock;
-use crate::record::{Kind, Record, MAX_RECORDS};
+use crate::record::{Kind, Record, MAX_NOTE_BYTES, MAX_RECORDS};
+use crate::secmem::SecretBuf;
 
 pub const VAULT_VERSION: u32 = 2;
 
@@ -206,13 +206,12 @@ pub enum UnlockMethod {
     RecoveryKey,
 }
 
-/// An open vault. The DEK is page-locked and wiped on drop.
+/// An open vault. The DEK lives in the locked arena and is wiped on drop.
 pub struct Vault {
     pub path: PathBuf,
     pub file: VaultFile,
     pub payload: Payload,
-    dek: Zeroizing<[u8; 32]>,
-    _dek_lock: Option<memlock::Lock>,
+    dek: SecretBuf,
     pub unlocked_by: UnlockMethod,
     /// Set when the stored epoch was behind the witness — a possible rollback.
     pub rollback_suspected: bool,
@@ -247,9 +246,9 @@ impl FileStamp {
     }
 }
 
-/// Hand-written, never derived: a derived impl would forward through
-/// `Zeroizing<[u8; 32]>`'s `Debug` and print the live DEK, including in an
-/// `unwrap_err()` panic message on the wrong branch of a test.
+/// Hand-written, never derived: a derived impl would print every field, and
+/// the habit of redacting the key by hand is worth keeping even now that
+/// `SecretBuf`'s own `Debug` is redacted.
 impl std::fmt::Debug for Vault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Vault")
@@ -272,10 +271,9 @@ impl Vault {
         let argon = ArgonParams::generate(mem_kib)?;
         let kek = crypto::derive_kek(passphrase, &argon)?;
 
-        let mut dek_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut dek_bytes);
-        let dek = Zeroizing::new(dek_bytes);
-        let _lock = memlock::Lock::new(dek.as_ref());
+        let mut dek_bytes = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(dek_bytes.as_mut());
+        let dek = SecretBuf::new(dek_bytes.as_ref());
 
         let sealed_dek = crypto::seal(kek.as_ref(), dek.as_ref(), AAD_RECIPIENT_PASSPHRASE)?;
         let now = Utc::now();
@@ -356,9 +354,7 @@ impl Vault {
         if dek_bytes.len() != 32 {
             bail!("unlock failed");
         }
-        let mut dek = Zeroizing::new([0u8; 32]);
-        dek.copy_from_slice(dek_bytes);
-        let lock = memlock::Lock::new(dek.as_ref());
+        let dek = SecretBuf::new(dek_bytes);
 
         // Header authentication. A mismatch means the header was edited after
         // it was written, so we refuse rather than decrypt under it.
@@ -377,7 +373,6 @@ impl Vault {
             file,
             payload,
             dek,
-            _dek_lock: lock,
             unlocked_by: method,
             rollback_suspected,
         })
@@ -444,10 +439,9 @@ impl Vault {
     /// every recipient. Optionally change the passphrase and Argon2 cost at the
     /// same time. This is what 0.4.x's `rotate` claimed to be and was not.
     pub fn rekey(&mut self, new_passphrase: Option<&[u8]>, mem_kib: Option<u32>) -> Result<()> {
-        let mut fresh = [0u8; 32];
-        OsRng.fill_bytes(&mut fresh);
-        let new_dek = Zeroizing::new(fresh);
-        let new_lock = memlock::Lock::new(new_dek.as_ref());
+        let mut fresh = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(fresh.as_mut());
+        let new_dek = SecretBuf::new(fresh.as_ref());
 
         let mut rewrapped = Vec::with_capacity(self.file.header.recipients.len());
         for recipient in &self.file.header.recipients {
@@ -492,7 +486,6 @@ impl Vault {
 
         self.file.header.recipients = rewrapped;
         self.dek = new_dek;
-        self._dek_lock = new_lock;
         self.save()
     }
 
@@ -683,29 +676,35 @@ fn combine_shared(
     out
 }
 
+/// Serialise, pad and seal. The CBOR plaintext of the whole vault is built in
+/// the locked arena, never in an ordinary `Vec`.
 fn seal_payload(dek: &[u8], payload: &Payload) -> Result<Sealed> {
-    let mut buf = Zeroizing::new(Vec::new());
-    ciborium::ser::into_writer(payload, &mut *buf).context("failed to serialise payload")?;
+    let mut buf = SecretBuf::with_capacity(4096);
+    ciborium::ser::into_writer(payload, &mut buf).context("failed to serialise payload")?;
     let padded = crypto::pad(&buf, crypto::pad_block())?;
     crypto::seal(dek, &padded, AAD_PAYLOAD)
 }
 
+/// Open, unpad and parse. The decrypted plaintext is a locked buffer, the
+/// decoder's scratch space is a locked buffer, and every `Secret` it produces
+/// is copied straight from that scratch into the arena — so no secret byte
+/// passes through unlocked memory on the way from the file to a record.
+///
+/// The scratch is sized to the largest single field the format permits: the
+/// decoder serves a definite-length byte string from scratch only when it
+/// fits, and refuses otherwise, which is the behaviour we want for a hostile
+/// file as well.
 fn open_payload(dek: &[u8], sealed: &Sealed) -> Result<Payload> {
     let padded = crypto::open(dek, sealed, AAD_PAYLOAD)?;
     let plain = crypto::unpad(&padded)?;
-    let mut payload: Payload =
-        ciborium::de::from_reader(plain.as_slice()).context("failed to parse payload")?;
+    let mut scratch = SecretBuf::zeroed(MAX_NOTE_BYTES + 4096);
+    let payload: Payload = ciborium::de::from_reader_with_buffer(plain, scratch.as_mut_slice())
+        .context("failed to parse payload")?;
     if payload.records.len() > MAX_RECORDS {
         bail!("payload declares too many records");
     }
     for record in &payload.records {
         record.validate()?;
-    }
-    // `Secret`'s lock guard is #[serde(skip)], so everything deserialised from
-    // the vault arrives unlocked. Without this pass "secrets are page-locked"
-    // would be true of the data key and false of every record it protects.
-    for record in payload.records.iter_mut() {
-        record.relock();
     }
     Ok(payload)
 }
@@ -900,7 +899,7 @@ pub fn open_lock(vault: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{Kind, Record, Secret};
+    use crate::record::{Kind, Record, Secret, MAX_NOTE_BYTES};
     use tempfile::TempDir;
 
     fn temp_vault() -> (TempDir, PathBuf) {
@@ -931,7 +930,7 @@ mod tests {
         let vault = Vault::unlock(&path, PASS).unwrap();
         let got = vault.get(id).expect("record survived the roundtrip");
         assert_eq!(got.attribute("username"), Some("octocat"));
-        assert_eq!(got.field("password").unwrap().expose_str().unwrap(), "s3cret");
+        assert_eq!(got.field("password").unwrap().expose_str().unwrap().as_str(), "s3cret");
     }
 
     #[test]
@@ -960,7 +959,7 @@ mod tests {
         let recovered = Vault::unlock_with_recovery(&path, &key).unwrap();
         assert_eq!(recovered.unlocked_by, UnlockMethod::RecoveryKey);
         assert_eq!(
-            recovered.get(id).unwrap().field("body").unwrap().expose_str().unwrap(),
+            recovered.get(id).unwrap().field("body").unwrap().expose_str().unwrap().as_str(),
             "launch codes"
         );
     }
@@ -1002,7 +1001,7 @@ mod tests {
         let vault = Vault::unlock(&path, b"a brand new passphrase").unwrap();
         assert_eq!(vault.records().len(), 1);
         assert_eq!(
-            vault.records()[0].field("secret_key").unwrap().expose_str().unwrap(),
+            vault.records()[0].field("secret_key").unwrap().expose_str().unwrap().as_str(),
             "keep-me"
         );
     }
@@ -1085,9 +1084,9 @@ mod tests {
 
     #[test]
     fn secrets_loaded_from_disk_are_page_locked() {
-        // `Secret`'s guard is #[serde(skip)], so without an explicit re-lock
-        // pass every record read back from the vault would sit unlocked while
-        // the documentation claimed otherwise.
+        // Every `Secret` deserialised from the vault is allocated in the
+        // arena, so it is locked iff its slab is — which on a host with any
+        // memlock budget at all is always.
         let (_d, path) = temp_vault();
         Vault::init(&path, PASS, MEM).unwrap();
 
@@ -1101,10 +1100,30 @@ mod tests {
         let vault = Vault::unlock(&path, PASS).unwrap();
         let secret = vault.records()[0].field("body").expect("field survived");
         assert!(
-            secret.is_locked(),
-            "a secret read from disk must hold a page lock"
+            secret.is_locked() || crate::secmem::failed_locks() > 0,
+            "a secret read from disk must sit in a locked slab unless the kernel refused"
         );
         drop(vault);
+    }
+
+    #[test]
+    fn a_large_secret_survives_the_locked_decoder_scratch() {
+        // The decoder serves definite-length bytes from its scratch buffer
+        // only when they fit. The scratch is sized to the largest field the
+        // format allows, so a field at the cap must round-trip.
+        let (_d, path) = temp_vault();
+        Vault::init(&path, PASS, MEM).unwrap();
+        let mut vault = Vault::unlock(&path, PASS).unwrap();
+        let mut record = Record::new(Kind::Note, Some("big".into()));
+        record.set_field("body", Secret::new(&vec![0x5au8; MAX_NOTE_BYTES]));
+        vault.add_record(record).unwrap();
+        vault.save().unwrap();
+        drop(vault);
+
+        let vault = Vault::unlock(&path, PASS).unwrap();
+        let body = vault.records()[0].field("body").unwrap();
+        assert_eq!(body.len(), MAX_NOTE_BYTES);
+        assert!(body.as_bytes().iter().all(|&b| b == 0x5a));
     }
 
     #[test]

@@ -18,7 +18,7 @@ blake3 = "1"
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1", features = ["derive", "serde"] }
 # Stable release only — a pre-release crypto crate is not an option on the
 # mandatory build path. `getrandom` gives us the no-argument keygen/encapsulate
 # forms so no RNG object ever has to cross the rand_core 0.6/0.10 boundary

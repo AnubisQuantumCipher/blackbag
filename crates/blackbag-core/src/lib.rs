@@ -11,6 +11,7 @@ pub mod harden;
 pub mod hygiene;
 pub mod memlock;
 pub mod record;
+pub mod secmem;
 pub mod session;
 pub mod sleepwatch;
 pub mod status;

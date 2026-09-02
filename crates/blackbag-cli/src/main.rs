@@ -705,9 +705,7 @@ fn cmd_agent(
         }
         AgentCommand::Unlock => {
             let passphrase = tty::read_passphrase("Master passphrase: ")?;
-            match session::ask(&Request::Unlock {
-                passphrase: passphrase.to_string(),
-            })? {
+            match session::ask(&Request::Unlock { passphrase })? {
                 Response::Status(status) => {
                     println!("{}", serde_json::to_string_pretty(&status)?);
                     Ok(())
@@ -779,9 +777,8 @@ fn cmd_agent(
             };
             match session::ask(&request)? {
                 Response::Secret { value } => {
-                    // `value` is wrapped so it is wiped when this scope ends,
-                    // however the emit path returns.
-                    let value = Zeroizing::new(value);
+                    // `value` arrives wrapped, so it is wiped when this scope
+                    // ends however the emit path returns.
                     tty::emit_secret(&value, &field, sink, clear_after)?;
                     Ok(())
                 }
@@ -798,7 +795,6 @@ fn cmd_agent(
             match session::ask(&request)? {
                 Response::Secret { value } => {
                     use std::io::Write;
-                    let value = Zeroizing::new(value);
                     let mut out = std::io::stdout();
                     out.write_all(value.as_bytes())?;
                     out.write_all(b"\n")?;
@@ -963,6 +959,12 @@ fn cmd_doctor(
         status.host.memlock_limit_bytes / 1024,
         memlock::locked_bytes()
     );
+    println!(
+        "arena      {} KiB locked, {} KiB unlocked, {} lock(s) refused",
+        status.host.arena_locked_bytes / 1024,
+        status.host.arena_unlocked_bytes / 1024,
+        status.host.arena_failed_locks
+    );
     println!("coredump   pattern={}", status.host.core_pattern);
     println!(
         "           disabled for this process: {}",
@@ -1050,7 +1052,7 @@ fn cmd_gen(cmd: GenCommand) -> Result<()> {
         GenCommand::Pin { digits } => (generate::pin(digits)?, generate::strength_of_pin(digits)),
     };
 
-    let value = Zeroizing::new(secret.expose_str()?);
+    let value = secret.expose_str()?;
     let mut out = std::io::stdout();
     out.write_all(value.as_bytes())?;
     out.write_all(b"\n")?;

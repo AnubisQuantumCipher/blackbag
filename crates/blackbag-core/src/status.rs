@@ -44,6 +44,15 @@ pub struct HostPosture {
     pub mlock_working: bool,
     pub mlock_error: Option<String>,
     pub traced: bool,
+    /// Bytes of secret arena currently mapped in locked slabs.
+    #[serde(default)]
+    pub arena_locked_bytes: u64,
+    /// Bytes of secret arena the kernel refused to lock. Non-zero means some
+    /// secrets in this process are swappable, and the deck says so.
+    #[serde(default)]
+    pub arena_unlocked_bytes: u64,
+    #[serde(default)]
+    pub arena_failed_locks: u64,
 }
 
 impl HostPosture {
@@ -63,6 +72,9 @@ impl HostPosture {
             mlock_working: working,
             mlock_error: error,
             traced: harden::tracer_pid().is_some(),
+            arena_locked_bytes: crate::secmem::locked_bytes() as u64,
+            arena_unlocked_bytes: crate::secmem::unlocked_bytes() as u64,
+            arena_failed_locks: crate::secmem::failed_locks() as u64,
         }
     }
 
@@ -103,6 +115,16 @@ impl HostPosture {
                 "TRACED",
                 "A debugger is attached to this process",
                 "detach it before unlocking",
+            ));
+        }
+        if self.arena_unlocked_bytes > 0 {
+            out.push(Finding::warn(
+                "ARENA_UNLOCKED",
+                "Some secrets are in memory the kernel refused to lock",
+                &format!(
+                    "{} KiB unlocked; raise RLIMIT_MEMLOCK or store fewer large secrets",
+                    self.arena_unlocked_bytes / 1024
+                ),
             ));
         }
         if !self.memlock_unlimited && self.memlock_limit_bytes < 64 * 1024 * 1024 {

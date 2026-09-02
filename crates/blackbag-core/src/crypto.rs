@@ -1,14 +1,15 @@
 //! Primitives: Argon2id KDF, XChaCha20-Poly1305 AEAD, header MAC, padding.
 
 use anyhow::{anyhow, bail, Result};
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
+use chacha20poly1305::{Key, Tag, XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use zeroize::Zeroizing;
+
+use crate::secmem::SecretBuf;
 
 /// Associated-data labels. Every AEAD use is bound to exactly one purpose so a
 /// blob can never be replayed into a different slot.
@@ -84,8 +85,8 @@ pub fn recommended_lanes() -> u32 {
     cpus.clamp(MIN_LANES, 8)
 }
 
-/// Derive the 32-byte key-encryption key from a passphrase.
-pub fn derive_kek(passphrase: &[u8], params: &ArgonParams) -> Result<Zeroizing<[u8; 32]>> {
+/// Derive the 32-byte key-encryption key from a passphrase, into locked memory.
+pub fn derive_kek(passphrase: &[u8], params: &ArgonParams) -> Result<SecretBuf> {
     use argon2::{Algorithm, Argon2, Params, Version};
 
     let cfg = Params::new(
@@ -96,9 +97,9 @@ pub fn derive_kek(passphrase: &[u8], params: &ArgonParams) -> Result<Zeroizing<[
     )
     .map_err(|e| anyhow!("invalid Argon2 parameters: {e}"))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, cfg);
-    let mut out = Zeroizing::new([0u8; 32]);
+    let mut out = SecretBuf::zeroed(32);
     argon
-        .hash_password_into(passphrase, &params.salt, out.as_mut())
+        .hash_password_into(passphrase, &params.salt, out.as_mut_slice())
         .map_err(|e| anyhow!("argon2 derivation failed: {e}"))?;
     Ok(out)
 }
@@ -131,26 +132,31 @@ pub fn seal(key: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Sealed> {
     Ok(Sealed { nonce, ciphertext })
 }
 
-/// Decrypt under `key`, requiring the same `aad`.
+/// Decrypt under `key`, requiring the same `aad`. The plaintext is produced in
+/// place inside a locked buffer; no unlocked copy exists at any point.
 ///
 /// The error is deliberately uninformative: 0.2.x sanitised these and the 0.4.x
 /// rewrite did not. A caller must not be able to distinguish "wrong passphrase"
 /// from "tampered blob" by the message text.
-pub fn open(key: &[u8], sealed: &Sealed, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+pub fn open(key: &[u8], sealed: &Sealed, aad: &[u8]) -> Result<SecretBuf> {
     if key.len() != 32 {
         bail!("AEAD key must be 32 bytes");
     }
+    if sealed.ciphertext.len() < 16 {
+        bail!("decryption failed");
+    }
+    let (body, tag) = sealed.ciphertext.split_at(sealed.ciphertext.len() - 16);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
-    let plaintext = cipher
-        .decrypt(
+    let mut buf = SecretBuf::new(body);
+    cipher
+        .decrypt_in_place_detached(
             XNonce::from_slice(&sealed.nonce),
-            Payload {
-                msg: &sealed.ciphertext,
-                aad,
-            },
+            aad,
+            buf.as_mut_slice(),
+            Tag::from_slice(tag),
         )
         .map_err(|_| anyhow!("decryption failed"))?;
-    Ok(Zeroizing::new(plaintext))
+    Ok(buf)
 }
 
 /// Header MAC keyed from the KEK, restored from 0.2.x. Authenticates the parts
@@ -176,11 +182,11 @@ pub fn mac_matches(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// Pad to a multiple of `block` so the file size stops leaking how much is
 /// stored. Framing is a 4-byte big-endian length followed by the data, then
 /// random filler. Restored from 0.2.x's `BLACK_BAG_PAD_BLOCK`.
-pub fn pad(data: &[u8], block: usize) -> Result<Zeroizing<Vec<u8>>> {
+pub fn pad(data: &[u8], block: usize) -> Result<SecretBuf> {
     if data.len() > MAX_PAYLOAD_PLAINTEXT_BYTES {
         bail!("payload too large");
     }
-    let mut out = Vec::with_capacity(data.len() + 4 + block);
+    let mut out = SecretBuf::with_capacity(data.len() + 4 + block);
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(data);
     if block > 1 {
@@ -189,11 +195,11 @@ pub fn pad(data: &[u8], block: usize) -> Result<Zeroizing<Vec<u8>>> {
         OsRng.fill_bytes(&mut filler);
         out.extend_from_slice(&filler);
     }
-    Ok(Zeroizing::new(out))
+    Ok(out)
 }
 
-/// Reverse [`pad`].
-pub fn unpad(data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+/// Reverse [`pad`]: a view into the framed data, no copy.
+pub fn unpad(data: &[u8]) -> Result<&[u8]> {
     if data.len() < 4 {
         bail!("padded payload truncated");
     }
@@ -201,7 +207,7 @@ pub fn unpad(data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if len > MAX_PAYLOAD_PLAINTEXT_BYTES || 4 + len > data.len() {
         bail!("padded payload length out of range");
     }
-    Ok(Zeroizing::new(data[4..4 + len].to_vec()))
+    Ok(&data[4..4 + len])
 }
 
 /// Default padding block, overridable per-vault via `BLACK_BAG_PAD_BLOCK`.
@@ -246,7 +252,8 @@ mod tests {
             let data = vec![0xabu8; len];
             let padded = pad(&data, 4096).unwrap();
             assert_eq!(padded.len() % 4096, 0, "len {len} not padded to a block");
-            assert_eq!(unpad(&padded).unwrap().as_slice(), data.as_slice());
+            assert_eq!(unpad(&padded).unwrap(), data.as_slice());
+            assert!(padded.is_locked() || crate::secmem::failed_locks() > 0);
         }
     }
 
