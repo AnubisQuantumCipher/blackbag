@@ -3,6 +3,133 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] — 2026-09-02
+
+The release that came out of treating the product as a target. Every item
+below was found by running the thing and watching, and each fix carries a
+test that fails on the old behaviour.
+
+### Fixed — the clipboard never cleared, and Omarchy was recording it
+
+- **The 30-second clear was a fiction.** `--to clipboard` spawned `wl-copy`
+  and a thread that would kill it after the timeout; the command returned a
+  few milliseconds later and took the thread with it. The value stayed on
+  the clipboard until something else was copied. Both surfaces made the
+  same promise through the same command.
+- **Every copied secret landed in Omarchy's clipboard history**, a
+  plaintext file in `~/.local/state`. The shell's capture script skips
+  offers that carry the `x-kde-passwordManagerHint` MIME type — as cliphist,
+  KDE and GNOME do — and `wl-copy --type text/plain` offered no such hint.
+- The clipboard is now served by a detached helper spawned from this binary
+  (`clip-serve`, hidden from help), speaking the data-control protocol
+  through `wl-clipboard-rs`. It offers the hint alongside the text, runs
+  with core dumps off and its memory locked, clears on time **only if the
+  selection is still ours** — a value you copied later is never wiped — and
+  the caller does not say "copied" until the compositor has been seen
+  offering the value.
+
+### Changed — every resting secret is ciphertext in memory
+
+- Page-locking was the predecessor's answer and it had a hole: `mlock` is
+  page-granular and not reference-counted, so two short secrets sharing a
+  page each locked it, and dropping the first unlocked the page under the
+  second. Now every secret this process holds — each record field, the
+  vault's data key — rests sealed under a 32-byte per-process session key.
+- **The key lives in `memfd_secret` memory**, which the kernel removes from
+  its own direct map: never swapped, never dumped, never in a hibernation
+  image, unreadable through `/proc/<pid>/mem` even for root. Where the
+  kernel does not offer it, one locked page holds the key and `doctor`
+  says so. Set `BLACK_BAG_NO_SECRETMEM=1` to opt out (secret memory blocks
+  hibernation system-wide while held).
+- Plaintext exists only while a field is in use, in a small locked arena of
+  slabs the engine maps itself, and is wiped when the use ends. The
+  decrypted payload, the serialised payload and the decoder's scratch live
+  there too, so no secret byte crosses unlocked memory between the file and
+  a record. What must never reach disk shrank from the whole vault to 32
+  bytes, and the 8 MiB memlock budget no longer bounds a vault's size.
+- A test reads `/proc/self/mem` across every writable mapping and asserts a
+  resting secret's plaintext is found nowhere. The vault format is
+  unchanged; a v2 file written by 2.4.1 opens as before.
+
+### Added — the vault seals when the machine does
+
+- **Suspend and screen lock lock the vault.** The agent subscribes to
+  logind's `PrepareForSleep` and `Session.Lock` signals through a
+  hand-written minimal D-Bus client (SASL EXTERNAL, `Hello`, two
+  `AddMatch` calls, a bounds-checked parser that drops what it cannot read),
+  and the Omarchy plugin additionally watches the shell's own lock service,
+  which never touches logind. The reason for the last lock is reported —
+  *locked before suspend*, *locked with the screen* — in the deck.
+- **A hard session ceiling.** Idle expiry alone let a session that was
+  touched every few minutes stay open for days. `agent serve --max-secs`
+  (default 12 h, 0 to disable) ends the session regardless of activity; the
+  deck shows when.
+- **A silent peer can no longer stall the agent.** One connection that sent
+  nothing used to hold every other client — and idle expiry — hostage. Each
+  peer now gets three seconds to send its line and take its reply.
+- The agent holds the vault's advisory lock across every mutation, the same
+  lock the CLI takes, and the file stamp includes the inode so a padded
+  write of identical length is never mistaken for no change.
+
+### Added — breach checking, on request, with the hash kept at home
+
+- `black-bag agent breach --online` and the deck's CHECK BREACHES button
+  (armed and confirmed like a delete) check password fields against Pwned
+  Passwords by k-anonymity. The agent hands out five-character SHA-1
+  prefixes; `curl` fetches the buckets with padding; the agent matches
+  against the full hash it never disclosed, and folds exposures into the
+  hygiene report for the rest of the session. The agent itself has no
+  network access at all (`RestrictAddressFamilies=AF_UNIX`).
+
+### Added — import and export
+
+- `black-bag import --format bitwarden|keepassxc|firefox|chrome|csv --from
+  FILE` (with `--dry-run`), parsed by hand and mapped kind by kind; skipped
+  rows are reported by reason, never by value.
+- `black-bag export --to FILE --format json|keepassxc --plaintext-ok`,
+  0600, never overwrites, and tells you to shred it afterwards. Our own
+  KeePassXC CSV round-trips every kind.
+
+### Changed — the deck, after an adversarial review
+
+- Dismissing the deck now empties both sheets and the record list; a
+  host-initiated close used to leave a half-typed master passphrase in the
+  first-run sheet.
+- "locked" is announced only when the agent confirmed the lock.
+- A reveal or 2FA code that arrives for a record no longer selected is
+  dropped rather than rendered under the new name; a second copy, reveal or
+  fetch while one is in flight is refused out loud instead of silently.
+- Settings are clamped: a file cannot pin a secret on screen forever or set
+  a clear delay of zero.
+- The first-run sheet has a two-minute watchdog and can always be left;
+  skipping the recovery key takes two presses.
+- Multi-line secrets are covered until revealed; Copy is disabled for any
+  masked field; generated passwords are shown for the reveal window and
+  then masked again; every secret box has a show/hide toggle.
+- The hygiene card has an *unavailable* state, orders findings worst-first,
+  and a finding for a filtered-out record clears the filter to reach it.
+- The SESSION card shows the ceiling, the last lock reason and whether
+  suspend and screen lock are watched; HOST POSTURE shows where the session
+  key lives.
+- Buttons take focus, a focus ring, Space and Enter, and carry names for
+  assistive technology. Footer notes expire. The status file is polled
+  every 15 s instead of 5 (it is watched anyway).
+
+### Changed — the agent's sandbox
+
+- `RestrictAddressFamilies=AF_UNIX`, an empty capability set,
+  `SystemCallFilter=@system-service memfd_secret` with `@privileged`
+  denied, private devices, no IPC, `UMask=0077`. Validated as a transient
+  unit before it replaced the installed one.
+
+### Fixed — tests wrote into the operator's state
+
+- Every test that created a vault used to record its epoch in the real
+  `~/.local/state/black-bag/witness.json`, and a test agent overwrote the
+  live `status.json`. Both now go to a private directory.
+
+[2.5.0]: https://github.com/AnubisQuantumCipher/blackbag/releases/tag/v2.5.0
+
 ## [2.4.1] — 2026-08-30
 
 ### Added — deleting a record is now a first-class act

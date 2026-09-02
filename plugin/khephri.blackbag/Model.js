@@ -229,6 +229,17 @@ function fmtCountdown(secs) {
   return Math.floor(m / 60) + "h " + (m % 60) + "m"
 }
 
+// Thousands-grouped integer. Qt's JS `toLocaleString` renders large numbers
+// in scientific notation, which turned "52,372,427 breaches" into 5.2e+07.
+function fmtInt(n) {
+  var v = Math.round(Number(n) || 0)
+  var neg = v < 0
+  var s = String(Math.abs(v))
+  var out = ""
+  while (s.length > 3) { out = "," + s.slice(-3) + out; s = s.slice(0, -3) }
+  return (neg ? "-" : "") + s + out
+}
+
 function fmtBytes(n) {
   var v = Number(n) || 0
   if (v < 1024) return v + " B"
@@ -748,7 +759,7 @@ function hygieneLine(issue) {
   if (kind === "duplicate_title")
     return "shares a title with " + asList(b.others).length + " other record(s)"
   if (kind === "exposed")
-    return String(b.field) + " seen in " + Number(b.breaches || 0).toLocaleString() + " known breaches"
+    return String(b.field) + " seen in " + fmtInt(b.breaches) + " known breaches"
   if (kind.length === 0) return "unrecognised finding"
   return kind.replace(/_/g, " ")
 }

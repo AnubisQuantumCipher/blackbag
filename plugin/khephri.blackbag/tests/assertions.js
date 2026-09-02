@@ -100,6 +100,11 @@ eq(lockReasonLabel(""), "", "no reason")
   eq(exposedCount(report), 1, "exposed count")
   eq(hygieneSeverity({ exposed: { field: "password", breaches: 3 } }), "alert", "exposed is an alert")
   eq(hygieneLine({ exposed: { field: "password", breaches: 3 } }), "password seen in 3 known breaches", "exposed line")
+  eq(hygieneLine({ exposed: { field: "password", breaches: 52372427 } }), "password seen in 52,372,427 known breaches", "exposed line groups thousands")
+  eq(fmtInt(0), "0", "fmtInt zero")
+  eq(fmtInt(999), "999", "fmtInt small")
+  eq(fmtInt(1000), "1,000", "fmtInt thousand")
+  eq(fmtInt("1234567"), "1,234,567", "fmtInt string input")
   eq(sortHygiene(null), [], "no report sorts to nothing")
 }
 

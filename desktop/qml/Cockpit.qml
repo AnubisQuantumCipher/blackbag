@@ -2410,7 +2410,7 @@ Item {
                     Text {
                       Layout.fillWidth: true
                       visible: String(modelData.detail || "").length > 0
-                      text: modelData.detail
+                      text: String(modelData.detail || "")
                       color: Util.alpha(Color.foreground, 0.55)
                       font.family: metric.font.family
                       font.pixelSize: metric.font.caption
@@ -2737,13 +2737,15 @@ Item {
             }
           }
 
-          // One slot, three states — the idiom Omarchy's own lock screen uses.
+          // One slot, four states — the idiom Omarchy's own lock screen uses.
+          // The note is how "locked before suspend" reaches the sealed screen.
           Text {
             Layout.fillWidth: true
             visible: text.length > 0
             text: root.unlocking ? "deriving key…"
-                : (root.actionError.length > 0 ? root.actionError : "")
-            color: root.unlocking ? Util.alpha(Color.accent, 0.8) : Color.urgent
+                : (root.actionError.length > 0 ? root.actionError : root.actionNote)
+            color: root.unlocking ? Util.alpha(Color.accent, 0.8)
+                 : (root.actionError.length > 0 ? Color.urgent : Util.alpha(Color.foreground, 0.6))
             font.family: metric.font.family
             font.pixelSize: metric.font.caption
             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
