@@ -74,6 +74,50 @@ anywhere.
 
 ---
 
+## What 2.5.0 changed, and how each item was found
+
+Every one of these came from running the product against itself rather than
+reading it. The full account, with the test that pins each, is in
+[`CHANGELOG.md`](CHANGELOG.md).
+
+**Every resting secret is ciphertext in memory.** Each record field and the
+vault's data key rest sealed under a 32-byte per-process session key. The key
+lives in `memfd_secret` memory — removed from the kernel's own direct map,
+never swapped, never dumped, never in a hibernation image — with a locked page
+as the fallback, and the deck says which you got. Plaintext exists only while a
+field is in use, in a locked arena, and is wiped when the use ends. A test reads
+`/proc/self/mem` across every writable mapping and asserts a resting secret is
+found nowhere. Page-locking every secret was the old design; it had a hole
+(`mlock` is page-granular and not reference-counted, so a neighbour's drop
+unlocked your page), and it fought an 8 MiB budget the new design does not need.
+
+**The clipboard tells the truth.** The old `wl-copy` path never cleared — the
+thread that was going to kill it died with the command — and it offered no
+sensitive hint, so Omarchy's own clipboard history recorded every password in a
+plaintext file. Copies are now served by a detached, memory-locked helper that
+offers `x-kde-passwordManagerHint` beside the text, clears on time only if the
+selection is still ours, and does not say "copied" until the compositor has been
+seen offering the value.
+
+**The vault seals with the machine.** Suspend and `loginctl lock-session` lock
+it through a hand-written minimal D-Bus subscription to logind; Omarchy's own
+screen lock locks it through the shell's lock service. A hard session ceiling
+(12 h by default) ends an unlock however busy it was. A silent socket connection
+can no longer stall the agent.
+
+**Breach checks that keep the hash at home.** `agent breach --online`, or the
+deck's two-step CHECK BREACHES, sends five-character SHA-1 prefixes to Pwned
+Passwords by k-anonymity, fetches the buckets with `curl`, and matches inside
+the agent — which has no network access at all. Exposures fold into the hygiene
+report until lock.
+
+**Import and export.** Bitwarden, KeePassXC, Firefox, Chrome and any CSV in;
+JSON or KeePassXC CSV out, plaintext by declaration and 0600 by construction.
+
+![The breach check, done](docs/screenshots/breach.png)
+
+---
+
 ## What is different from `black-bagg` 0.4.10
 
 **Post-quantum protection that actually protects something.** 0.4.x generated an
@@ -162,8 +206,12 @@ black-bag add login --title GitHub --attr username=octocat
 black-bag list
 black-bag get <uuid> --reveal password --to clipboard
 
-black-bag doctor                     # vault + host posture
+black-bag doctor                     # vault + host posture, including where the session key lives
 black-bag rekey --change-passphrase
+
+black-bag agent breach --online      # k-anonymity check against Pwned Passwords
+black-bag import --from bitwarden.json --format bitwarden --dry-run
+black-bag export --to out.csv --format keepassxc --plaintext-ok
 ```
 
 Coming from `black-bagg`:
@@ -201,8 +249,9 @@ with several numbers and addresses, secure notes, and recovery kits.
 
 ## Credential hygiene
 
-Computed entirely on this machine. There is no network call in this crate and
-adding one would defeat the point.
+Computed on this machine, with one declared exception: the breach check, which
+runs only when you ask, sends only five-character hash prefixes, and runs from
+the CLI through `curl` — the agent process cannot open a network socket.
 
 The interesting one is **reuse detection**. Every secret field carries a
 non-reversible 8-character BLAKE3 handle, domain-separated by field name, so two
@@ -233,17 +282,21 @@ Honest limits, all of which are in the module docs:
 
 - **Left rail** — vault state, format, epoch against the witness, a twelve-kind
   census, recipients (marked by whether their private key is held offline), and
-  host posture: mlock, core dumps, swap, memlock budget, tracer.
+  host posture: mlock, core dumps, swap, memlock budget, tracer, and where the
+  session key lives.
 - **Centre** — the unlock panel when sealed; a searchable record table when open.
   Search covers titles, tags, and usernames, and by construction cannot reach
   secrets.
-- **Right rail** — inspector for the selected record, findings worst-first, and
-  session controls. TOTP codes come with a countdown arc that turns red in the
-  last five seconds.
+- **Right rail** — inspector for the selected record, hygiene worst-first with
+  the two-step breach check, findings, and the session: idle timeout, the hour
+  the session ends regardless, why it last locked, and whether suspend and the
+  screen lock are being watched. TOTP codes come with a countdown arc that turns
+  red in the last five seconds.
 
 Keys: `n` new · `e` edit · `Del` remove · `/` search · `↑↓` move · `⏎` copy ·
-`⇧⏎` show · `^L` lock · `Esc` close. In the editor: `Tab` moves · `^G` generates
-· `^⏎` saves · `Esc` cancels.
+`⇧⏎` show · `^B` breaches · `^L` lock · `Esc` close. In the editor: `Tab` moves
+· `^G` generates · `^⏎` saves · `Esc` cancels. Every button takes `Tab` focus
+and answers `Space` or `Enter`.
 
 ### Where secrets are, and are not
 
@@ -252,8 +305,8 @@ Keys: `n` new · `e` edit · `Del` remove · `/` search · `↑↓` move · `⏎
 | `status.json` in `$XDG_RUNTIME_DIR` | **Never.** No titles, tags, counts, or values — only posture, parameters, recipient labels, and lock state. There is a test that asserts this. |
 | Bar widget | Never. Reads only `status.json`. |
 | Cockpit | Only during an explicit `SHOW`, on a visible countdown, then cleared. `COPY` goes straight to the clipboard and never renders. |
-| Agent | Holds the data key in page-locked memory while unlocked, behind a `0600` socket in a `0700` directory, with `SO_PEERCRED` checked on every connection. |
-| Clipboard | For the configured interval (30 s default), then wiped. |
+| Agent | Holds the data key and every record sealed under a session key that lives in `memfd_secret` memory, behind a `0600` socket in a `0700` directory, with `SO_PEERCRED` checked and a 3-second budget on every connection. |
+| Clipboard | For the configured interval (30 s default), offered with the sensitive hint so clipboard managers skip it, then cleared — unless something else has been copied since, which is left alone. |
 
 The record *metadata* the cockpit shows arrives over the agent socket and lives
 in the shell's memory, never on disk. Secret fields are shown as a name, a size,
@@ -266,8 +319,16 @@ a password without either being displayed.
 
 - **The witness is a tripwire.** It catches restored backups, sync conflicts, and
   snapshot rollbacks. It does not stop an attacker who can write both files.
-- **`mlock` is best-effort.** This box allows 8 MiB (2048 pages). Failures are
-  reported in `doctor` and the cockpit rather than swallowed.
+- **The session key's home is reported, not assumed.** `memfd_secret` where the
+  kernel offers it, a locked page otherwise, and "unlocked" — loudly — if even
+  that failed. Secret memory blocks hibernation system-wide while it is held;
+  `BLACK_BAG_NO_SECRETMEM=1` opts out.
+- **The breach check is the one thing that goes online.** It sends
+  five-character hash prefixes and nothing else, and only when asked. Nothing
+  else in this program opens a network socket, and the agent's unit forbids it.
+- **The sleep watcher takes no inhibitor lock.** The vault locks as soon as the
+  agent is scheduled after logind's signal — milliseconds — but "before the
+  kernel sleeps" is not guaranteed.
 - **The host can still betray you.** Core dumps are disabled for our own process,
   but `core_pattern` on this machine pipes to systemd-coredump for everything
   else, and zram swap is active. The cockpit shows both rather than claiming

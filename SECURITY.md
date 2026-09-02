@@ -32,6 +32,14 @@ Particularly interesting:
 - Reaching the agent socket as a different user.
 - A generated password with less entropy than the generator reports.
 - Hygiene reporting reuse that is not reuse, or missing reuse that is.
+- A resting secret's plaintext appearing in the process's writable memory
+  while the vault is unlocked and the field is not in use.
+- A copied secret offered without the sensitive hint, or surviving its clear
+  while the selection is still ours.
+- The agent process opening any network socket, or the breach check sending
+  more than five-character SHA-1 prefixes.
+- The vault staying unlocked across a suspend or a session lock the agent was
+  told about.
 
 ## What is out of scope
 
@@ -45,8 +53,12 @@ assumes them will be closed as working-as-documented:
 - The witness file being editable by someone who can already rewrite the vault.
   It is a tripwire against restored backups and sync accidents, not an
   authenticated anti-rollback mechanism, and the documentation says so.
-- `mlock` failing on a host with no memory-lock budget. This is reported rather
-  than silently swallowed, which is the intended behaviour.
+- `memfd_secret` or `mlock` being unavailable on a host. Both are reported
+  rather than silently swallowed, which is the intended behaviour.
+- A clipboard manager that ignores `x-kde-passwordManagerHint`, or a compositor
+  that re-offers the selection without it (GNOME's does). The hint is a
+  convention the desktop honours or does not; Black-Bag offers it correctly.
+- A paste target keeping its own copy of what was pasted into it.
 
 ## Supported versions
 
