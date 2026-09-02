@@ -249,6 +249,40 @@ fn attach_totp(record: &mut Record, value: &str) -> Option<String> {
     }
 }
 
+/// The field an export put a kind's main secret into; the inverse of the
+/// preference order `render_keepassxc` uses.
+fn primary_field_for(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Login | Kind::Totp => "password",
+        Kind::Wifi => "passphrase",
+        Kind::Api => "secret_key",
+        Kind::Ssh | Kind::Pgp => "private_key",
+        Kind::Wallet => "seed",
+        Kind::Bank => "account_number",
+        Kind::Id => "number",
+        Kind::Contact => "notes",
+        Kind::Note => "body",
+        Kind::Recovery => "payload",
+    }
+}
+
+/// Pull a trailing `kind: xxx` line out of a Notes column, returning the
+/// kind and the notes without that line.
+fn split_kind_hint(notes: &str) -> (Option<Kind>, String) {
+    let mut kind = None;
+    let mut kept = Vec::new();
+    for line in notes.lines() {
+        if let Some(rest) = line.strip_prefix("kind: ") {
+            if let Ok(k) = rest.trim().parse::<Kind>() {
+                kind = Some(k);
+                continue;
+            }
+        }
+        kept.push(line);
+    }
+    (kind, kept.join("\n"))
+}
+
 fn host_of(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1).unwrap_or(url);
     let host = rest.split(['/', '?', '#']).next()?.trim();
@@ -426,12 +460,26 @@ fn keepassxc(text: &str) -> Result<Imported> {
         let url = row.get("URL");
         let notes = row.get("Notes");
         let group = row.get("Group");
-        let mut record = if username.is_empty() && password.is_empty() && url.is_empty() {
-            let mut r = Record::new(Kind::Note, Some(title.to_string()));
-            set_secret_if(&mut r, "body", notes);
-            r
-        } else {
-            login(title, username, password, url, notes)
+        // Our own export writes non-login kinds into Notes as a "kind: …"
+        // line, so a Black-Bag → KeePassXC → Black-Bag round trip keeps the
+        // kind rather than flattening everything into logins.
+        let (kind_hint, notes) = split_kind_hint(notes);
+        let mut record = match kind_hint {
+            Some(kind) if kind != Kind::Login => {
+                let mut r = Record::new(kind, Some(title.to_string()));
+                set_attr_if(&mut r, "username", username);
+                set_attr_if(&mut r, "url", url);
+                let primary = primary_field_for(kind);
+                set_secret_if(&mut r, primary, password);
+                set_notes_if(&mut r, &notes);
+                r
+            }
+            _ if username.is_empty() && password.is_empty() && url.is_empty() => {
+                let mut r = Record::new(Kind::Note, Some(title.to_string()));
+                set_secret_if(&mut r, "body", &notes);
+                r
+            }
+            _ => login(title, username, password, url, &notes),
         };
         for part in group.split('/') {
             let tag = part.trim();
@@ -616,7 +664,7 @@ fn render_keepassxc(records: &[Record]) -> Result<Zeroizing<String>> {
             .unwrap_or("")
             .to_string();
         let primary = ["password", "passphrase", "secret_key", "private_key", "seed",
-                       "account_number", "number", "body", "payload"]
+                       "account_number", "number", "body", "notes", "payload"]
             .iter()
             .find_map(|name| r.field(name).map(|s| (name, s)));
         let password = primary
@@ -831,6 +879,23 @@ mod tests {
         assert_eq!(b.tags, vec!["Work"]);
         assert!(b.totp.is_some());
         assert_eq!(b.field("totp").unwrap().open().as_slice(), bytes.as_slice());
+    }
+
+    #[test]
+    fn keepassxc_roundtrip_keeps_non_login_kinds() {
+        let mut api = Record::new(Kind::Api, Some("prod".into()));
+        api.set_attribute("service", "aws");
+        api.set_field("secret_key", Secret::from_str("AKIA"));
+        let mut note = Record::new(Kind::Note, Some("memo".into()));
+        note.set_field("body", Secret::from_str("line one\nline two"));
+        let csv = render(&[api, note], ExportFormat::Keepassxc).unwrap();
+        let back = parse(ImportFormat::Keepassxc, &csv).unwrap();
+        assert_eq!(back.records.len(), 2, "{:?}", back.skipped);
+        assert_eq!(back.records[0].kind, Kind::Api);
+        assert_eq!(back.records[0].field("secret_key").unwrap().expose_str().unwrap().as_str(), "AKIA");
+        assert_eq!(back.records[0].notes.as_ref().unwrap().expose_str().unwrap().as_str(), "service: aws");
+        assert_eq!(back.records[1].kind, Kind::Note);
+        assert_eq!(back.records[1].field("body").unwrap().expose_str().unwrap().as_str(), "line one\nline two");
     }
 
     #[test]

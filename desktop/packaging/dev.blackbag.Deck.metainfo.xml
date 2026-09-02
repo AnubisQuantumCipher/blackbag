@@ -52,6 +52,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="2.5.0" date="2026-09-02">
+      <description>
+        <p>Every secret now rests encrypted in memory under a per-process key held in kernel-invisible memory (memfd_secret). The clipboard is served with the sensitive hint and actually clears on time. Suspend and screen lock seal the vault. Breach checks against Pwned Passwords use k-anonymity and run only on request. Import from Bitwarden, KeePassXC, Firefox, Chrome and CSV; export to JSON and KeePassXC CSV.</p>
+      </description>
+    </release>
     <release version="2.1.0" date="2026-08-30">
       <description>
         <p>First release of the standalone deck.</p>

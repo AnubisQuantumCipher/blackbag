@@ -57,6 +57,20 @@ Item {
   // as the record list itself: it comes over the agent socket, lives only in
   // this process, and never touches status.json.
   property var hygiene: null
+  // Why the last hygiene run produced nothing. "Not yet run" and "the agent
+  // refused" used to be the same state, which drew a permanent READING.
+  property string hygieneError: ""
+
+  // The raw session flag from the last status document. Lock/unlock edges are
+  // taken from this, not from deckState: a stale status reports UNKNOWN, and
+  // an edge computed through UNKNOWN never fires — which left the record list
+  // and the hygiene report resident under a sealed screen.
+  property bool lastSessionUnlocked: false
+
+  // The breach check is the one thing in this deck that goes online, so it is
+  // armed and confirmed like a delete: first press explains, second press runs.
+  property bool breachArmed: false
+  property bool breachRunning: false
 
   // Which record each in-flight request was issued FOR. Without these, moving
   // the selection while a reply is in flight lands one record's secret — or
@@ -122,7 +136,8 @@ Item {
   }
   readonly property real settingScale: {
     var v = Number(setting("uiScale", 0))
-    return isFinite(v) && v > 0 ? v : 0
+    if (!isFinite(v) || v <= 0) return 0
+    return Math.min(v, Model.maxScaleFor(win.width))
   }
   // Bound, not readonly, and deliberately so: a nudge assigns it directly and
   // breaks the binding, which is what makes ctrl/cmd +- feel instant. Writing
@@ -138,7 +153,10 @@ Item {
   // one left off. Rounded to a step the eye can actually distinguish.
   function nudgeScale(delta) {
     var next = Math.round((root.uiScale + delta) * 20) / 20
-    next = Math.max(0.7, Math.min(3.0, next))
+    // Never past the point where the rails no longer fit the window: a deck
+    // that can be zoomed until its own record table vanishes is a deck that
+    // gets zoomed there by accident.
+    next = Math.max(0.7, Math.min(Model.maxScaleFor(win.width), next))
     root.uiScale = next           // now
     root.persistScale(next)       // and next time
     root.actionNote = "scale " + next.toFixed(2)
@@ -197,12 +215,7 @@ Item {
 
     Qt.callLater(function () {
       keyCatcher.forceActiveFocus()
-      // Only focus the passphrase box when it is actually on screen. A stale
-      // or missing status hides it — and Qt happily grants focus to an
-      // invisible field, which then eats every keystroke the deck was
-      // advertising, silently accumulating them in a hidden passphrase buffer
-      // until Enter ships the garbage to the agent.
-      if (!root.unlocked && passField.visible) passField.forceActiveFocus()
+      if (!root.unlocked) root.focusPass()
     })
   }
 
@@ -220,7 +233,12 @@ Item {
     root.closeRequested()
   }
 
-  // Everything sensitive this file can be holding, dropped at once.
+  // Everything sensitive this file can be holding, dropped at once — and
+  // everything the two sheets can be holding, because a host-initiated
+  // dismissal used to leave a half-typed master passphrase sitting in the
+  // first-run sheet and a password in the editor's boxes. Record metadata and
+  // the hygiene report go too: titles, usernames and handles are as sensitive
+  // as the vault that carries them.
   function clearSecrets() {
     root.passphrase = ""
     root.revealedValue = ""
@@ -228,7 +246,26 @@ Item {
     root.revealedFor = ""
     root.revealSecondsLeft = 0
     root.totpState = null
+    root.showPendingId = ""
+    root.showPendingField = ""
+    root.totpPendingId = ""
+    root.pendingDeleteId = ""
+    root.breachArmed = false
+    root.records = []
+    root.hygiene = null
+    root.hygieneError = ""
     passField.text = ""
+    if (recordEditor.open_) recordEditor.dismiss()
+    if (onboardSheet.open_) onboardSheet.clear()
+  }
+
+  // Focus the passphrase box only when it is actually on screen and usable.
+  // Qt happily grants focus to an invisible field, which then eats every
+  // keystroke the deck was advertising, silently accumulating them in a
+  // hidden passphrase buffer until Enter ships the garbage to the agent.
+  function focusPass() {
+    if (passField.visible && passField.enabled) passField.forceActiveFocus()
+    else keyCatcher.forceActiveFocus()
   }
 
   // There being no vault is a first run, not an error. The deck creates one
@@ -250,11 +287,16 @@ Item {
   function applyStatus(raw) {
     try {
       var parsed = JSON.parse(String(raw || ""))
-      if (parsed.schema_version !== 1) return
-      var wasUnlocked = root.unlocked
+      if (parsed.schema_version !== 1) {
+        root.actionError = "this deck reads status schema 1; the engine published schema "
+                         + String(parsed.schema_version) + " — update the plugin"
+        return
+      }
+      var wasUnlocked = root.lastSessionUnlocked
       root.status = parsed
       Qt.callLater(root.maybeOnboard)
       var nowUnlocked = !!(parsed.session && parsed.session.unlocked)
+      root.lastSessionUnlocked = nowUnlocked
       if (nowUnlocked && !wasUnlocked) {
         root.refreshRecords()
         // Unlocked from outside — the CLI, or a stale status catching up. The
@@ -263,28 +305,27 @@ Item {
         Qt.callLater(function () { if (root.opened) keyCatcher.forceActiveFocus() })
       }
       if (!nowUnlocked && wasUnlocked) {
-        root.records = []
-        root.hygiene = null
+        // clearSecrets() also dismisses the editor: left open it sits
+        // invisibly UNDER the sealed screen holding whatever password was
+        // mid-type, and wedges Esc, whose sealed-screen shortcut is gated on
+        // the editor being closed.
         root.clearSecrets()
-        // The editor cannot outlive the session it was editing. Left open it
-        // sits invisibly UNDER the sealed screen — holding whatever password
-        // was mid-type, and worse, wedging Esc: the sealed screen's shortcuts
-        // are gated on the editor being closed, so an idle-lock during an
-        // edit made Esc completely dead. dismiss() also wipes its fields.
-        if (recordEditor.open_) recordEditor.dismiss()
+        var reason = parsed.session ? Model.lockReasonLabel(parsed.session.last_lock_reason) : ""
+        if (reason.length > 0) root.actionNote = reason
         // And the sealed screen must come up ready to type: the footer says
         // "⏎ unlock", which is a lie unless the passphrase box has the caret.
-        Qt.callLater(function () {
-          if (root.opened && passField.visible) passField.forceActiveFocus()
-        })
+        Qt.callLater(function () { if (root.opened) root.focusPass() })
       }
     } catch (e) {
       // Partial read during the atomic replace; keep the last good document.
     }
   }
 
+  property bool refreshPending: false
   function refreshRecords() {
-    if (listProcess.running) return
+    // A refresh asked for while one is running is not dropped: the running
+    // one may predate the write that prompted this one, so it runs again.
+    if (listProcess.running) { root.refreshPending = true; return }
     root.listing = true
     listProcess.running = true
     if (!hygieneProcess.running) hygieneProcess.running = true
@@ -332,6 +373,12 @@ Item {
   function backOut() {
     if (root.revealedValue.length > 0) { root.clearReveal(); return }
     if (root.pendingDeleteId.length > 0) { root.pendingDeleteId = ""; return }
+    if (root.breachArmed) { root.breachArmed = false; root.actionNote = ""; return }
+    // Focus wandered to a button (Tab): the first Esc brings the keys home.
+    if (root.unlocked && !keyCatcher.activeFocus && !searchField.activeFocus) {
+      keyCatcher.forceActiveFocus()
+      return
+    }
     if (root.unlocked && searchField.activeFocus) {
       // First Esc clears the query; a second hands the keyboard back to the
       // list. It used to fall through to dismiss() when the box was already
@@ -350,19 +397,14 @@ Item {
     root.actionNote = "locking…"
   }
 
-  function primaryField(record) {
-    if (!record || !Array.isArray(record.secret_fields) || record.secret_fields.length === 0)
-      return ""
-    var preferred = ["password", "secret_key", "private_key", "passphrase",
-                     "account_number", "seed", "body", "totp", "number", "payload"]
-    for (var p = 0; p < preferred.length; p++)
-      for (var i = 0; i < record.secret_fields.length; i++)
-        if (record.secret_fields[i].name === preferred[p]) return preferred[p]
-    return record.secret_fields[0].name
-  }
+  function primaryField(record) { return Model.primaryField(record) }
 
   function copyField(record, field) {
     if (!record || !field) { root.actionNote = "no record selected"; return }
+    // Setting `running` on a running Process is a silent no-op, so a second
+    // copy while the first is in flight would be dropped while the footer
+    // said "copied". Say what is actually happening instead.
+    if (copyProcess.running) { root.actionNote = "still placing the previous copy"; return }
     root.actionError = ""
 
     // A `totp` field holds the raw shared secret, which is binary — copying it
@@ -375,8 +417,7 @@ Item {
       : ["black-bag", "agent", "reveal", String(record.id), String(field),
          "--to", "clipboard", "--clear-after", String(root.clipboardClearSec)]
     copyProcess.running = true
-    root.actionNote = "copied " + (isTotp ? "current code" : field)
-                    + " · clipboard clears in " + root.clipboardClearSec + "s"
+    root.actionNote = "copying " + (isTotp ? "the current code" : field) + "…"
   }
 
   function showField(record, field) {
@@ -387,6 +428,7 @@ Item {
       root.actionError = "the current code is shown above; the stored secret is binary"
       return
     }
+    if (showProcess.running) { root.actionError = "a reveal is already in flight"; return }
     root.actionError = ""
     root.clearReveal()
     root.showPendingId = String(record.id)
@@ -404,9 +446,30 @@ Item {
 
   function fetchTotp(record) {
     if (!record || !record.has_totp) return
+    // One fetch at a time. Overwriting the pending id while a fetch is in
+    // flight would stamp the FIRST record's code with the SECOND record's id.
+    if (totpProcess.running) return
     root.totpPendingId = String(record.id)
     totpProcess.command = ["black-bag", "agent", "totp", String(record.id)]
     totpProcess.running = true
+  }
+
+  // The breach check: the one deliberate network act in this deck. Armed
+  // first, run second, exactly like delete.
+  function requestBreachCheck() {
+    if (!root.unlocked) return
+    if (root.breachRunning) { root.actionNote = "breach check already running"; return }
+    if (!root.breachArmed) {
+      root.breachArmed = true
+      root.actionError = ""
+      root.actionNote = ""
+      return
+    }
+    root.breachArmed = false
+    root.breachRunning = true
+    root.actionError = ""
+    root.actionNote = "checking against Pwned Passwords…"
+    breachProcess.running = true
   }
 
   function beginAdd() {
@@ -509,12 +572,25 @@ Item {
     }
   }
 
+  // A safety net only: the status file is watched, and the agent republishes
+  // on every state change, so this catches nothing but a vault rewritten by
+  // something that never told the agent.
   Timer {
-    interval: 4000
+    interval: 30000
     running: root.opened
     repeat: true
     onTriggered: if (!refreshProcess.running) refreshProcess.running = true
   }
+
+  // Footer notes expire. "copied password" was still on screen ten minutes
+  // later, asserting a clipboard state that had long since changed.
+  Timer {
+    id: noteTimer
+    interval: 7000
+    repeat: false
+    onTriggered: root.actionNote = ""
+  }
+  onActionNoteChanged: if (root.actionNote.length > 0) noteTimer.restart()
 
   // Writing the scale back is the one thing that differs between the two
   // hosts: the plugin's settings live in the shell's config and are written
@@ -560,7 +636,7 @@ Item {
       } else {
         var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
         root.actionError = err.length > 0 ? err : "unlock failed"
-        Qt.callLater(function () { passField.forceActiveFocus() })
+        Qt.callLater(function () { root.focusPass() })
       }
     }
   }
@@ -569,7 +645,17 @@ Item {
     id: lockProcess
     command: ["black-bag", "agent", "lock"]
     running: false
-    onExited: {
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function (code) {
+      // Never announce a lock that did not happen. A missing agent, a dead
+      // socket or a refused request used to clear the list and say "locked"
+      // while the data key was still held.
+      if (code !== 0) {
+        var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+        root.actionError = "lock failed: " + (err.length > 0 ? err : "the agent did not confirm")
+        root.actionNote = ""
+        return
+      }
       root.records = []
       root.actionNote = "locked"
       refreshProcess.running = true
@@ -606,6 +692,10 @@ Item {
         var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
         root.actionError = err.length > 0 ? err : "list failed"
       }
+      if (root.refreshPending) {
+        root.refreshPending = false
+        Qt.callLater(root.refreshRecords)
+      }
     }
   }
 
@@ -614,11 +704,45 @@ Item {
     running: false
     stderr: StdioCollector { waitForEnd: true }
     onExited: function (code) {
+      var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
       if (code !== 0) {
-        var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
         root.actionError = err.length > 0 ? err : "copy failed"
         root.actionNote = ""
+        return
       }
+      // The engine prints "copied … · clears in Ns" only after the compositor
+      // has been seen offering the value with the sensitive hint. That line
+      // is the truth about the clipboard; the footer repeats it verbatim.
+      root.actionNote = err.length > 0 ? err : "copied"
+    }
+  }
+
+  Process {
+    id: breachProcess
+    command: ["black-bag", "agent", "breach", "--online", "--json"]
+    running: false
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function (code) {
+      root.breachRunning = false
+      var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+      if (code !== 0) {
+        root.actionError = "breach check: " + (err.length > 0 ? err : "failed")
+        root.actionNote = ""
+        return
+      }
+      try {
+        var report = JSON.parse(String(this.stdout.text || "{}"))
+        var n = Number(report.checked) || 0
+        var x = Model.asList(report.exposed).length
+        root.actionNote = "checked " + n + " password" + (n === 1 ? "" : "s")
+                        + " · " + (x === 0 ? "none seen in a breach" : x + " exposed")
+                        + (Number(report.unchecked) > 0 ? " · " + report.unchecked + " not checked" : "")
+      } catch (e) {
+        root.actionNote = "breach check finished"
+      }
+      // The agent now folds exposures into hygiene; re-read it.
+      if (!hygieneProcess.running) hygieneProcess.running = true
     }
   }
 
@@ -628,10 +752,14 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        // The selection may have moved while the agent was answering. A
+        // value that arrives for a record that is no longer selected is
+        // dropped on the floor, never rendered under the new name.
+        if (!root.selectedRecord || String(root.selectedRecord.id) !== root.showPendingId) return
         root.revealedField = root.showPendingField
         root.revealedFor = root.showPendingId
         root.revealedValue = String(this.text || "").replace(/\n+$/, "")
-        root.revealSecondsLeft = root.revealSeconds
+        root.revealSecondsLeft = Math.max(1, root.revealSeconds)
       }
     }
     stderr: StdioCollector { waitForEnd: true }
@@ -651,11 +779,23 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try { root.hygiene = JSON.parse(String(this.text || "null")) }
-        catch (e) { root.hygiene = null }
+        try {
+          root.hygiene = JSON.parse(String(this.text || "null"))
+          root.hygieneError = ""
+        } catch (e) {
+          root.hygiene = null
+          root.hygieneError = "the hygiene report could not be read"
+        }
       }
     }
-    onExited: function (code) { if (code !== 0) root.hygiene = null }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function (code) {
+      if (code !== 0) {
+        root.hygiene = null
+        var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+        root.hygieneError = err.length > 0 ? err : "the agent did not answer"
+      }
+    }
   }
 
   Process {
@@ -780,6 +920,12 @@ Item {
           if (root.unlocked) root.refreshRecords()
         }
       }
+      Shortcut {
+        sequences: ["Ctrl+B"]
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && root.unlocked
+        context: Qt.WindowShortcut
+        onActivated: root.requestBreachCheck()
+      }
 
       Keys.onPressed: function (event) {
         // The first-run sheet owns the keyboard while it is up. Esc abandons
@@ -859,13 +1005,15 @@ Item {
             root.copyField(root.selectedRecord, root.primaryField(root.selectedRecord))
           event.accepted = true
         } else if (event.key === Qt.Key_U && !root.unlocked) {
-          passField.forceActiveFocus(); event.accepted = true
+          root.focusPass(); event.accepted = true
         } else if (event.key === Qt.Key_Home) {
           root.selectedIndex = 0; root.clearReveal(); root.totpState = null
+          root.pendingDeleteId = ""
           event.accepted = true
         } else if (event.key === Qt.Key_End) {
           root.selectedIndex = Math.max(0, root.visibleRecords.length - 1)
           root.clearReveal(); root.totpState = null
+          root.pendingDeleteId = ""
           event.accepted = true
         } else if (event.key === Qt.Key_PageDown) {
           root.moveSelection(10); event.accepted = true
@@ -953,9 +1101,12 @@ Item {
   component FieldMenu: Menu {
     id: fmenu
     property Item target: null
+    // Masked unless the target is a text input that is showing its contents.
+    // A TextArea has no echoMode at all; treating "no echoMode" as unmasked
+    // made Copy the quiet way around the reveal countdown for every
+    // multi-line secret.
     readonly property bool masked:
-      fmenu.target && fmenu.target.echoMode !== undefined
-        ? fmenu.target.echoMode !== TextInput.Normal : false
+      !(fmenu.target && fmenu.target.echoMode === TextInput.Normal)
     background: Rectangle {
       implicitWidth: root.metric.space(170)
       color: Color.background
@@ -1083,6 +1234,7 @@ Item {
       }
 
       component ActionButton: Rectangle {
+        id: actionBtn
         property string label: ""
         property color tone: Color.foreground
         property bool enabledAction: true
@@ -1090,11 +1242,28 @@ Item {
         implicitWidth: actionText.implicitWidth + metric.spacing.lg * 2
         implicitHeight: metric.spacing.controlHeight
         radius: metric.cornerRadius
-        color: mouse.containsMouse && enabledAction
+        color: (mouse.containsMouse || actionBtn.activeFocus) && enabledAction
           ? Util.alpha(tone, 0.18) : Util.alpha(tone, 0.08)
-        border.color: Util.alpha(tone, enabledAction ? 0.45 : 0.15)
-        border.width: 1
+        border.color: actionBtn.activeFocus ? tone : Util.alpha(tone, enabledAction ? 0.45 : 0.15)
+        border.width: actionBtn.activeFocus ? Math.max(1, metric.spacing.hairline) * 2
+                                            : Math.max(1, metric.spacing.hairline)
         opacity: enabledAction ? 1.0 : 0.4
+        // Reachable by Tab and driven by Space or Enter, with a ring that
+        // shows where the keyboard is. A mouse-only button in a keyboard-first
+        // deck is half a button.
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Button
+        Accessible.name: label
+        Accessible.focusable: true
+        Keys.onPressed: function (event) {
+          if (event.key === Qt.Key_Space || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            if (actionBtn.enabledAction) actionBtn.activated()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Escape) {
+            keyCatcher.forceActiveFocus()
+            event.accepted = true
+          }
+        }
         Text {
           id: actionText
           anchors.centerIn: parent
@@ -1275,9 +1444,9 @@ Item {
                     ? Model.totalRecords(agentCounts()) + " RECORDS" : "SEALED")
                 }
                 Repeater {
-                  model: root.unlocked
-                    ? Model.census(agentCounts()).filter(function (c) { return c.count > 0 })
-                    : []
+                  // All twelve kinds, always, so a zero reads as a measured
+                  // zero rather than as a row that happened not to be drawn.
+                  model: root.unlocked ? Model.census(agentCounts()) : []
                   delegate: RowLayout {
                     required property var modelData
                     Layout.fillWidth: true
@@ -1330,23 +1499,6 @@ Item {
                     }
                   }
                 }
-                Text {
-                  visible: root.unlocked
-                  Layout.fillWidth: true
-                  Layout.topMargin: metric.spacing.xs
-                  text: {
-                    var all = Model.census(agentCounts())
-                    var zero = 0
-                    for (var i = 0; i < all.length; i++) if (all[i].count === 0) zero++
-                    return all.length + " kinds tracked · " + zero + " with no records"
-                  }
-                  color: Util.alpha(Color.foreground, 0.3)
-                  font.family: metric.font.family
-                  font.pixelSize: metric.font.caption
-                  textFormat: Text.PlainText
-                  renderType: Text.NativeRendering
-                }
-
                 Text {
                   visible: !root.unlocked
                   Layout.fillWidth: true
@@ -1563,6 +1715,10 @@ Item {
                     // Two stacked lines (title + subtitle) plus breathing room;
                     // at 34 the subtitle was squeezed to zero height.
                     height: metric.space(42)
+                    Accessible.role: Accessible.ListItem
+                    Accessible.name: Model.recordLabel(modelData) + ", " + String(modelData.kind)
+                                     + (modelData.has_totp ? ", with a 2FA code" : "")
+                    Accessible.selected: index === root.selectedIndex
                     color: index === root.selectedIndex
                       ? Util.alpha(Color.accent, 0.12)
                       : (rowMouse.containsMouse
@@ -1679,9 +1835,9 @@ Item {
                   text: root.listing
                     ? "reading…"
                     : (root.records.length === 0
-                       ? "no records in this vault"
+                       ? "no records in this vault — press n to add one"
                        : "nothing matches this filter")
-                  color: Util.alpha(Color.foreground, 0.35)
+                  color: Util.alpha(Color.foreground, 0.55)
                   font.family: metric.font.family
                   font.pixelSize: metric.font.caption
                   renderType: Text.NativeRendering
@@ -1797,7 +1953,7 @@ Item {
                   Layout.fillWidth: true
                   visible: root.selectedRecord === null
                   text: "no record selected"
-                  color: Util.alpha(Color.foreground, 0.35)
+                  color: Util.alpha(Color.foreground, 0.55)
                   font.family: metric.font.family
                   font.pixelSize: metric.font.caption
                   renderType: Text.NativeRendering
@@ -1876,11 +2032,21 @@ Item {
 
                     // The reveal, visible only while its countdown runs.
                     Rectangle {
+                      id: revealPanel
                       Layout.fillWidth: true
                       visible: root.revealedValue.length > 0
                                && root.revealedField === modelData.name
                                && root.selectedRecord
                                && root.revealedFor === String(root.selectedRecord.id)
+                      // A countdown burning below the fold is a countdown
+                      // nobody saw. Bring the panel into view when it appears.
+                      onVisibleChanged: if (visible) Qt.callLater(function () {
+                        var y = revealPanel.mapToItem(rightCol, 0, 0).y
+                        var bottom = y + revealPanel.height
+                        if (bottom > rightRail.contentY + rightRail.height)
+                          rightRail.contentY = Math.max(0, Math.min(rightRail.contentHeight - rightRail.height,
+                                                                   bottom - rightRail.height + metric.spacing.md))
+                      })
                       implicitHeight: revealCol.implicitHeight + metric.spacing.md
                       color: Util.alpha(Color.urgent, 0.08)
                       border.color: Util.alpha(Color.urgent, 0.4)
@@ -1948,15 +2114,19 @@ Item {
                         var ctx = getContext("2d")
                         ctx.reset()
                         var cx = width / 2, cy = height / 2
-                        var r = Math.min(cx, cy) - 3
-                        ctx.lineWidth = 3
+                        var stroke = Math.max(2, metric.space(3))
+                        var r = Math.min(cx, cy) - stroke
+                        ctx.lineWidth = stroke
                         ctx.strokeStyle = Util.alpha(Color.foreground, 0.15)
                         ctx.beginPath()
                         ctx.arc(cx, cy, r, 0, Math.PI * 2)
                         ctx.stroke()
 
                         var left = 1 - progress
-                        ctx.strokeStyle = left < 0.17 ? Color.urgent : Color.accent
+                        var secondsLeft = root.liveTotp
+                          ? Math.max(0, root.liveTotp.ttl - (root.nowMs - root.liveTotp.at) / 1000) : 0
+                        // Red for the last five seconds, whatever the step.
+                        ctx.strokeStyle = Model.totpUrgent(secondsLeft) ? Color.urgent : Color.accent
                         ctx.beginPath()
                         ctx.arc(cx, cy, r, -Math.PI / 2,
                                 -Math.PI / 2 + Math.PI * 2 * left)
@@ -2001,15 +2171,29 @@ Item {
                 }
               }
 
-              // Credential hygiene — computed locally, no network, ever.
+              // Credential hygiene — computed locally. The breach check below
+              // is the one act that goes online, and only on request.
               Card {
                 visible: root.unlocked
                 SectionTitle {
                   text: {
-                    if (!root.hygiene) return "HYGIENE — READING"
+                    if (root.hygieneError.length > 0) return "HYGIENE — UNAVAILABLE"
+                    if (!root.hygiene) return hygieneProcess.running ? "HYGIENE — READING" : "HYGIENE"
                     var n = Model.hygieneCount(root.hygiene)
                     return "HYGIENE — " + (n === 0 ? "CLEAN" : n + " ISSUE" + (n === 1 ? "" : "S"))
                   }
+                }
+
+                Text {
+                  Layout.fillWidth: true
+                  visible: root.hygieneError.length > 0
+                  text: root.hygieneError
+                  color: Color.urgent
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
+                  wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                  textFormat: Text.PlainText
+                  renderType: Text.NativeRendering
                 }
 
                 Text {
@@ -2025,7 +2209,7 @@ Item {
                 }
 
                 Repeater {
-                  model: root.hygiene ? Model.asList(root.hygiene.records) : []
+                  model: root.hygiene ? Model.sortHygiene(root.hygiene) : []
                   delegate: ColumnLayout {
                     required property var modelData
                     Layout.fillWidth: true
@@ -2075,13 +2259,26 @@ Item {
                     HoverHandler { cursorShape: Qt.PointingHandCursor }
                     TapHandler {
                       onTapped: {
+                        // A finding for a record the current filter hides
+                        // used to be a dead click. Drop the filter, then find it.
+                        var wanted = String(modelData.id)
                         var list = root.visibleRecords
-                        for (var i = 0; i < list.length; i++) {
-                          if (String(list[i].id) === String(modelData.id)) {
-                            root.selectedIndex = i
-                            root.clearReveal()
-                            break
-                          }
+                        var found = -1
+                        for (var i = 0; i < list.length; i++)
+                          if (String(list[i].id) === wanted) { found = i; break }
+                        if (found < 0) {
+                          root.filterKind = ""
+                          searchField.text = ""
+                          list = root.visibleRecords
+                          for (var j = 0; j < list.length; j++)
+                            if (String(list[j].id) === wanted) { found = j; break }
+                        }
+                        if (found >= 0) {
+                          root.selectedIndex = found
+                          root.clearReveal()
+                          root.totpState = null
+                          if (root.selectedRecord && root.selectedRecord.has_totp)
+                            root.fetchTotp(root.selectedRecord)
                         }
                         keyCatcher.forceActiveFocus()
                       }
@@ -2089,13 +2286,46 @@ Item {
                   }
                 }
 
-                Text {
+                // The breach check. Armed, explained, then run — never on a
+                // single press, because it is the one thing here that goes
+                // online.
+                RowLayout {
                   Layout.fillWidth: true
                   Layout.topMargin: metric.spacing.xs
-                  text: "computed on this machine · nothing is sent anywhere"
-                  color: Util.alpha(Color.foreground, 0.3)
+                  spacing: metric.spacing.sm
+                  ActionButton {
+                    label: root.breachRunning ? "CHECKING…"
+                         : (root.breachArmed ? "SURE? CHECK ONLINE" : "CHECK BREACHES")
+                    tone: root.breachArmed ? Color.urgent : Util.alpha(Color.foreground, 0.7)
+                    enabledAction: root.unlocked && !root.breachRunning
+                    onActivated: root.requestBreachCheck()
+                  }
+                  Item { Layout.fillWidth: true }
+                }
+                Text {
+                  Layout.fillWidth: true
+                  visible: root.breachArmed
+                  text: "sends the first 5 characters of each password's SHA-1 to haveibeenpwned.com "
+                      + "(k-anonymity: it cannot learn which password you hold) · the full hash never "
+                      + "leaves the agent · ^B or the button confirms · esc backs out"
+                  color: Util.alpha(Color.urgent, 0.9)
                   font.family: metric.font.family
                   font.pixelSize: metric.font.caption
+                  wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                  textFormat: Text.PlainText
+                  renderType: Text.NativeRendering
+                }
+                Text {
+                  Layout.fillWidth: true
+                  visible: !root.breachArmed
+                  text: root.hygiene && Model.exposedCount(root.hygiene) > 0
+                    ? Model.exposedCount(root.hygiene) + " password(s) seen in known breaches — change them"
+                    : "computed on this machine · only the breach check goes online, and only when you ask"
+                  color: root.hygiene && Model.exposedCount(root.hygiene) > 0
+                    ? Color.urgent : Util.alpha(Color.foreground, 0.55)
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
+                  wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                   textFormat: Text.PlainText
                   renderType: Text.NativeRendering
                 }
@@ -2106,6 +2336,16 @@ Item {
                 SectionTitle {
                   text: "FINDINGS — " + (root.status && root.status.findings
                     ? root.status.findings.length : 0)
+                }
+                Text {
+                  Layout.fillWidth: true
+                  visible: Model.sortFindings(root.status).length === 0
+                  text: root.status ? "nothing to report" : "no status yet"
+                  color: Util.alpha(Color.foreground, 0.55)
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
+                  textFormat: Text.PlainText
+                  renderType: Text.NativeRendering
                 }
                 Repeater {
                   model: Model.sortFindings(root.status)
@@ -2155,15 +2395,30 @@ Item {
               // Session controls
               Card {
                 SectionTitle { text: "SESSION" }
-                KV {
-                  k: "idle timeout"
-                  v: root.status && root.status.session
-                    ? Model.fmtCountdown(root.status.session.idle_timeout_secs) : "—"
-                }
-                KV {
-                  k: "unlocked by"
-                  v: root.status && root.status.session && root.status.session.method
-                    ? root.status.session.method : "—"
+                Repeater {
+                  model: Model.sessionRows(root.status, root.nowMs)
+                  delegate: ColumnLayout {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    spacing: 0
+                    KV {
+                      k: modelData.k
+                      v: modelData.v
+                      vColor: modelData.ok === false ? Color.urgent
+                            : modelData.ok === true ? Color.accent : Color.foreground
+                    }
+                    Text {
+                      Layout.fillWidth: true
+                      visible: String(modelData.detail || "").length > 0
+                      text: modelData.detail
+                      color: Util.alpha(Color.foreground, 0.55)
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
+                      wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                      textFormat: Text.PlainText
+                      renderType: Text.NativeRendering
+                    }
+                  }
                 }
                 RowLayout {
                   Layout.fillWidth: true
@@ -2234,6 +2489,8 @@ Item {
             color: Color.urgent
             font.family: metric.font.family
             font.pixelSize: metric.font.caption
+            maximumLineCount: 2
+            wrapMode: Text.WrapAtWordBoundaryOrAnywhere
             elide: Text.ElideRight
             renderType: Text.NativeRendering
           }
@@ -2242,9 +2499,9 @@ Item {
 
           Text {
             text: root.unlocked
-              ? "n new · e edit · del remove · / search · ↑↓ move · ⏎ copy · ⇧⏎ show · ^L lock · esc close"
+              ? "n new · e edit · del remove · / search · ↑↓ move · ⏎ copy · ⇧⏎ show · ^B breaches · ^L lock · esc close"
               : "⏎ unlock · esc close"
-            color: Util.alpha(Color.foreground, 0.4)
+            color: Util.alpha(Color.foreground, 0.55)
             font.family: metric.font.family
             font.pixelSize: metric.font.caption
             renderType: Text.NativeRendering
@@ -2258,6 +2515,7 @@ Item {
         id: recordEditor
         motionMs: root.motionMs
         uiScale: root.uiScale
+        revealSeconds: root.revealSeconds
         onSaved: function (id) {
           root.actionNote = "saved"
           root.refreshRecords()
@@ -2324,11 +2582,14 @@ Item {
           // at exactly the moment the user is wondering whether it took.
           Rectangle {
             visible: root.unlocking
-            width: parent.width * 0.3
+            // With motion off the whole rule lights up and holds still; the
+            // "deriving key…" line below carries the message.
+            width: root.motionEnabled ? parent.width * 0.3 : parent.width
+            x: root.motionEnabled ? x : 0
             height: parent.height
             color: Color.accent
             SequentialAnimation on x {
-              running: root.unlocking
+              running: root.unlocking && root.motionEnabled
               loops: Animation.Infinite
               NumberAnimation { from: 0; to: rule.width * 0.7; duration: 900
                                 easing.type: Easing.InOutQuad }
@@ -2530,7 +2791,7 @@ Item {
           root.passphrase = passphrase
           root.beginUnlock()
         } else {
-          Qt.callLater(function () { passField.forceActiveFocus() })
+          Qt.callLater(function () { root.focusPass() })
         }
       }
       onDismissed: {

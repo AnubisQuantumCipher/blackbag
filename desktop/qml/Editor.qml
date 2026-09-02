@@ -33,6 +33,9 @@ Item {
   // surface behind them.
   property real uiScale: 1.0
   readonly property QtObject metric: DeckMetrics { uiScale: editor.uiScale }
+  // How long a generated or peeked secret stays readable before the box
+  // masks itself again. The deck's setting, so the two countdowns agree.
+  property int revealSeconds: 10
 
   property string errorText: ""
   property bool saving: false
@@ -72,11 +75,11 @@ Item {
       // visit must not still be sitting in the widget now.
       for (var i = 0; i < secretRepeater.count; i++) {
         var si = secretRepeater.itemAt(i)
-        if (si) si.setText("")
+        if (si) si.reset()
       }
 
-      totpUri.text = ""
-      totpSecret.text = ""
+      totpUri.reset()
+      totpSecret.reset()
       titleField.focusInput()
     })
   }
@@ -96,10 +99,10 @@ Item {
     // Whatever was typed into the secret boxes dies with the sheet.
     for (var i = 0; i < secretRepeater.count; i++) {
       var item = secretRepeater.itemAt(i)
-      if (item) item.setText("")
+      if (item) item.reset()
     }
-    totpUri.text = ""
-    totpSecret.text = ""
+    totpUri.reset()
+    totpSecret.reset()
     editor.open_ = false
     editor.errorText = ""
     editor.cancelled()
@@ -219,7 +222,7 @@ Item {
         // left in a closed sheet is a password the next `n` would exhume.
         for (var i = 0; i < secretRepeater.count; i++) {
           var item = secretRepeater.itemAt(i)
-          if (item) item.setText("")
+          if (item) item.reset()
         }
         editor.open_ = false
         editor.saved(id.length > 0 ? id : editor.recordId)
@@ -557,6 +560,10 @@ Item {
   function applyGenerated(value) {
     if (!editor.generateTarget) return
     editor.generateTarget.setText(value)
+    // A generated password written into a masked box is a password nobody
+    // can read, verify or write down. Show it for the reveal window, then
+    // mask it again — the same countdown the inspector's SHOW uses.
+    editor.generateTarget.peekFor(editor.revealSeconds)
     editor.generateTarget = null
   }
 
@@ -614,9 +621,11 @@ Item {
   component FieldMenu: Menu {
     id: fmenu
     property Item target: null
+    // Masked unless the target is a text input showing its contents. A
+    // TextArea has no echoMode; "no echoMode" used to read as unmasked, which
+    // made Copy the quiet way around the countdown for every multi-line secret.
     readonly property bool masked:
-      fmenu.target && fmenu.target.echoMode !== undefined
-        ? fmenu.target.echoMode !== TextInput.Normal : false
+      !(fmenu.target && fmenu.target.echoMode === TextInput.Normal)
     background: Rectangle {
       implicitWidth: editor.metric.space(170)
       color: Color.background
@@ -686,6 +695,7 @@ Item {
   }
 
   component FormField: ColumnLayout {
+    id: formField
     property string label: ""
     property string placeholder: ""
     property bool secret: false
@@ -695,14 +705,48 @@ Item {
     property string value: multiline ? multiLine.text : singleLine.text
     signal generate()
 
+    // A secret box shows its contents only while `peeking`: after a
+    // generate, or while the operator holds the eye open. It masks itself
+    // again on a countdown, and always when the sheet closes.
+    property bool peeking: false
+    property int peekLeft: 0
+    readonly property bool showing: !secret || peeking
+
+    function peekFor(seconds) {
+      formField.peekLeft = Math.max(1, Number(seconds) || 10)
+      formField.peeking = true
+      peekTimer.restart()
+    }
+    function togglePeek() {
+      if (formField.peeking) { formField.peeking = false; formField.peekLeft = 0; peekTimer.stop() }
+      else formField.peekFor(editor.revealSeconds)
+    }
+    function reset() {
+      setText("")
+      formField.peeking = false
+      formField.peekLeft = 0
+      peekTimer.stop()
+    }
+    Timer {
+      id: peekTimer
+      interval: 1000
+      repeat: true
+      onTriggered: {
+        formField.peekLeft -= 1
+        if (formField.peekLeft <= 0) { formField.peeking = false; stop() }
+      }
+    }
+
     spacing: metric.space(3)
 
     // A click inside this component lands on the ColumnLayout, not on the
     // input it wraps — confirmed with an on-screen activeFocusItem probe — so
     // container focus is forwarded to whichever input is actually showing.
     function focusInput() {
-      if (multiline) multiLine.forceActiveFocus()
-      else singleLine.forceActiveFocus()
+      if (multiline) {
+        if (!formField.showing) formField.peekFor(editor.revealSeconds)
+        multiLine.forceActiveFocus()
+      } else singleLine.forceActiveFocus()
     }
 
     // `activeFocus` on this ColumnLayout is always false — a plain Item is not
@@ -714,8 +758,6 @@ Item {
       if (multiline) multiLine.text = v
       else singleLine.text = v
     }
-    onActiveFocusChanged: if (activeFocus) focusInput()
-
     TapHandler {
       // On the container, not the input: a click lands here first, and this
       // hands focus down. Verified against an activeFocusItem probe.
@@ -735,6 +777,28 @@ Item {
       }
       Item { Layout.fillWidth: true }
       Text {
+        visible: formField.secret
+        text: formField.peeking
+          ? "hide" + (formField.peekLeft > 0 ? " · " + formField.peekLeft + "s" : "")
+          : "show"
+        color: Util.alpha(formField.peeking ? Color.urgent : Color.accent,
+                          peekMouse.containsMouse ? 1.0 : 0.6)
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
+        font.bold: peekMouse.containsMouse
+        renderType: Text.NativeRendering
+        Accessible.role: Accessible.Button
+        Accessible.name: formField.peeking ? "hide " + formField.label : "show " + formField.label
+        MouseArea {
+          id: peekMouse
+          anchors.fill: parent
+          anchors.margins: -metric.space(4)
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: formField.togglePeek()
+        }
+      }
+      Text {
         visible: parent.parent.generatable
         text: "generate"
         color: Util.alpha(Color.accent, genMouse.containsMouse ? 1.0 : 0.6)
@@ -742,6 +806,8 @@ Item {
         font.pixelSize: metric.font.caption
         font.bold: genMouse.containsMouse
         renderType: Text.NativeRendering
+        Accessible.role: Accessible.Button
+        Accessible.name: "generate " + formField.label
         MouseArea {
           id: genMouse
           anchors.fill: parent
@@ -778,7 +844,7 @@ Item {
       rightPadding: editor.metric.spacing.controlPaddingX
       Layout.fillWidth: true
       visible: !parent.multiline
-      password: parent.secret
+      password: !formField.showing
       placeholderText: parent.placeholder
       activeFocusOnPress: true
       TapHandler {
@@ -804,10 +870,42 @@ Item {
       border.color: Util.alpha(Color.foreground, 0.15)
       border.width: Math.max(1, metric.spacing.hairline)
       radius: metric.cornerRadius
+
+      // A TextArea cannot mask, so a multi-line secret gets a cover instead:
+      // the text is hidden until the eye is opened, and masks itself again
+      // on the same countdown. Typing while covered is not possible, which
+      // is the point — you see what you are about to store.
+      Rectangle {
+        anchors.fill: parent
+        visible: !formField.showing
+        color: Util.alpha(Color.background, 0.9)
+        radius: metric.cornerRadius
+        Text {
+          anchors.centerIn: parent
+          width: parent.width - metric.space(24)
+          text: multiLine.length > 0
+            ? "hidden · " + multiLine.length + " characters · click to reveal and edit"
+            : "hidden · click to reveal and type"
+          color: Util.alpha(Color.foreground, 0.6)
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
+          horizontalAlignment: Text.AlignHCenter
+          wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+        }
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: { formField.peekFor(editor.revealSeconds); multiLine.forceActiveFocus() }
+        }
+      }
+
       ScrollView {
         anchors.fill: parent
         anchors.margins: metric.space(6)
         clip: true
+        visible: formField.showing
         TextArea {
           id: multiLine
           // Same fence as the single-line fields; in a form, Tab means "next

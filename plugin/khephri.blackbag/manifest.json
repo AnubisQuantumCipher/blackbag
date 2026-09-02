@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "khephri.blackbag",
   "name": "BLACK-BAG",
-  "version": "2.4.1",
+  "version": "2.5.0",
   "author": "Khephri Labs",
   "license": "MIT OR Apache-2.0",
-  "description": "Credential command deck. Argon2id + XChaCha20-Poly1305 vault with hybrid X25519/ML-KEM-1024 recovery recipients, an authenticated header, and an anti-rollback epoch. Secrets are page-locked and never reach the status file.",
+  "description": "Credential command deck. Argon2id + XChaCha20-Poly1305 vault with hybrid X25519/ML-KEM-1024 recovery recipients, an authenticated header and an anti-rollback epoch. Every secret rests encrypted in memory under a key the kernel cannot see (memfd_secret); the clipboard is served with the sensitive hint and cleared on time; suspend and screen lock seal the vault; breach checks use k-anonymity and only on request.",
   "tags": [
     "security",
     "credentials",
@@ -31,7 +31,7 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "pollIntervalSec": 5,
+      "pollIntervalSec": 15,
       "staleAfterSec": 120,
       "clipboardClearSec": 30,
       "revealSeconds": 10,
@@ -45,8 +45,8 @@
         "min": 2,
         "max": 120,
         "step": 1,
-        "defaultValue": 5,
-        "description": "How often status.json is re-read while the shell is running."
+        "defaultValue": 15,
+        "description": "How often status.json is re-published while the shell is running. The file is watched and the agent republishes on every change, so this is a safety net."
       },
       {
         "key": "staleAfterSec",

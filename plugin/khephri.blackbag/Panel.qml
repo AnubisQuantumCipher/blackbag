@@ -36,11 +36,11 @@ BarWidget {
   // Stale desaturates rather than colouring: a status we cannot vouch for must
   // not assert "secure" or "breached" in the bar.
   function stateColor() {
-    if (root.stale || !root.status) return Qt.alpha(root.fg, 0.4)
+    if (root.stale || !root.status) return Util.alpha(root.fg, 0.4)
     if (root.deckState === "ROLLBACK" || root.deckState === "UNREADABLE") return root.urgentColor
     if (Model.countFindings(root.status, "alert") > 0) return root.urgentColor
     if (root.deckState === "UNLOCKED") return Color.accent
-    if (Model.countFindings(root.status, "warn") > 0) return Qt.alpha(root.urgentColor, 0.75)
+    if (Model.countFindings(root.status, "warn") > 0) return Util.alpha(root.urgentColor, 0.75)
     return root.fg
   }
 

@@ -1,10 +1,12 @@
 // Pure logic for the BLACK-BAG surfaces. No QML bindings, no engine access —
 // colours arrive as stringified arguments so this stays a shared library.
 //
-// One rule governs this file: nothing here ever receives a secret. The cockpit
-// asks the agent for a secret only at the moment of an explicit COPY or SHOW,
-// and that value goes straight to the clipboard or to a self-clearing property.
-// It is never parsed, formatted, cached, or logged here.
+// One rule governs this file: nothing here ever retains, formats, caches or
+// logs a secret. Two functions (buildDraft, draftProblems) are handed the
+// editor's secret values so they can be packed into a draft or counted as
+// present; they pass them through and keep nothing. The cockpit asks the agent
+// for a stored secret only at the moment of an explicit COPY or SHOW, and that
+// value goes straight to the clipboard or to a self-clearing property.
 
 .pragma library
 
@@ -197,13 +199,14 @@ function orDash(value) {
   return s.length === 0 ? "—" : s
 }
 
+// Wall-clock time of day for an ISO timestamp, for "session ends at 03:12".
 function fmtClock(iso) {
   if (!iso) return "—"
   var t = Date.parse(iso)
   if (!isFinite(t)) return "—"
   var d = new Date(t)
   function two(n) { return (n < 10 ? "0" : "") + n }
-  return two(d.getHours()) + ":" + two(d.getMinutes()) + ":" + two(d.getSeconds())
+  return two(d.getHours()) + ":" + two(d.getMinutes())
 }
 
 function fmtAgo(iso, nowMs) {
@@ -276,6 +279,48 @@ function sessionRemaining(status, nowMs) {
   var t = Date.parse(iso)
   if (!isFinite(t)) return null
   return Math.max(0, (t - nowMs) / 1000)
+}
+
+// Why the agent last locked, in words a person would use.
+function lockReasonLabel(reason) {
+  var map = {
+    "manual": "locked by hand",
+    "idle": "locked after idling",
+    "session-ceiling": "locked at the session ceiling",
+    "suspend": "locked before suspend",
+    "session-lock": "locked with the screen",
+    "rekeyed": "locked: re-keyed elsewhere",
+    "shutdown": "locked: agent stopped"
+  }
+  var r = String(reason || "")
+  return map[r] || (r.length > 0 ? "locked (" + r + ")" : "")
+}
+
+// The rows the SESSION card draws under the buttons. Every value is a fact the
+// status document carries; absence renders as a dash, never as a blank.
+function sessionRows(status, nowMs) {
+  var s = status && status.session ? status.session : null
+  var rows = []
+  rows.push({ k: "idle timeout", v: s ? fmtCountdown(s.idle_timeout_secs) : "—" })
+  if (s && s.unlocked) {
+    rows.push({ k: "unlocked by", v: orDash(s.method) })
+    if (s.session_ends_at)
+      rows.push({ k: "ends regardless", v: fmtClock(s.session_ends_at)
+                  + " · " + fmtCountdown(Math.max(0, (Date.parse(s.session_ends_at) - nowMs) / 1000)) })
+    else if (s.max_session_secs === 0)
+      rows.push({ k: "session ceiling", v: "off" })
+  } else if (s && s.last_lock_reason) {
+    rows.push({ k: "last lock", v: lockReasonLabel(s.last_lock_reason) })
+  }
+  var watch = s ? String(s.sleep_watch || "") : ""
+  rows.push({
+    k: "suspend & screen lock",
+    v: watch.indexOf("watching") === 0 ? "locks the vault"
+     : (watch.length > 0 ? "not watched" : "—"),
+    ok: watch.indexOf("watching") === 0 ? true : (watch.length > 0 ? false : null),
+    detail: watch.indexOf("watching") === 0 ? "" : watch
+  })
+  return rows
 }
 
 // Worst finding severity present, for the bar widget's single-glyph verdict.
@@ -591,6 +636,29 @@ function sortRecords(records) {
   return copy
 }
 
+// The secret field Enter acts on. Preference order is what a person most
+// often wants copied for that kind; the first listed field otherwise.
+var PRIMARY_FIELD_ORDER = ["password", "secret_key", "private_key", "passphrase",
+                           "account_number", "seed", "body", "totp", "number", "payload"]
+
+function primaryField(record) {
+  var fields = record ? asList(record.secret_fields) : []
+  if (fields.length === 0) return ""
+  for (var p = 0; p < PRIMARY_FIELD_ORDER.length; p++)
+    for (var i = 0; i < fields.length; i++)
+      if (fields[i] && String(fields[i].name) === PRIMARY_FIELD_ORDER[p]) return PRIMARY_FIELD_ORDER[p]
+  return String(fields[0].name)
+}
+
+// The largest deck scale at which the three rails still fit the window. The
+// rails want about 900 logical pixels at scale 1; past that the centre column
+// goes negative and the table vanishes.
+function maxScaleFor(widthPx) {
+  var w = Number(widthPx)
+  if (!isFinite(w) || w <= 0) return 3.0
+  return Math.max(0.7, Math.min(3.0, Math.floor((w / 900) * 20) / 20))
+}
+
 // ── TOTP ─────────────────────────────────────────────────────────────────────
 
 // Fraction of the current step already elapsed, for the countdown arc.
@@ -636,6 +704,7 @@ function recipientRows(status) {
 var HYGIENE_SEVERITY = {
   reused: "alert",
   weak_pin: "alert",
+  exposed: "alert",
   short: "warn",
   stale: "warn",
   duplicate_title: "note",
@@ -678,8 +747,54 @@ function hygieneLine(issue) {
     return String(b.field) + " is " + b.digits + " digits · floor " + b.floor
   if (kind === "duplicate_title")
     return "shares a title with " + asList(b.others).length + " other record(s)"
+  if (kind === "exposed")
+    return String(b.field) + " seen in " + Number(b.breaches || 0).toLocaleString() + " known breaches"
   if (kind.length === 0) return "unrecognised finding"
   return kind.replace(/_/g, " ")
+}
+
+// Records worst-first, issues worst-first within each; stable otherwise, so
+// the engine's own order still shows through among equals.
+function sortHygiene(report) {
+  var rank = { alert: 0, warn: 1, note: 2 }
+  function worst(issues) {
+    var w = 3
+    for (var i = 0; i < issues.length; i++) {
+      var r = rank[hygieneSeverity(issues[i])]
+      if (r !== undefined && r < w) w = r
+    }
+    return w
+  }
+  var records = asList(report ? report.records : null)
+  var indexed = []
+  for (var i = 0; i < records.length; i++) {
+    var issues = asList(records[i].issues)
+    var sortedIssues = []
+    for (var j = 0; j < issues.length; j++) sortedIssues.push([j, issues[j]])
+    sortedIssues.sort(function (a, b) {
+      var ra = rank[hygieneSeverity(a[1])], rb = rank[hygieneSeverity(b[1])]
+      if (ra === undefined) ra = 1
+      if (rb === undefined) rb = 1
+      return ra !== rb ? ra - rb : a[0] - b[0]
+    })
+    var copy = {}
+    for (var k in records[i]) copy[k] = records[i][k]
+    copy.issues = sortedIssues.map(function (x) { return x[1] })
+    indexed.push([i, worst(copy.issues), copy])
+  }
+  indexed.sort(function (a, b) { return a[1] !== b[1] ? a[1] - b[1] : a[0] - b[0] })
+  return indexed.map(function (x) { return x[2] })
+}
+
+// How many fields the breach check found in the corpus, from a hygiene report.
+function exposedCount(report) {
+  var records = asList(report ? report.records : null)
+  var n = 0
+  for (var i = 0; i < records.length; i++) {
+    var issues = asList(records[i].issues)
+    for (var j = 0; j < issues.length; j++) if (hygieneKind(issues[j]) === "exposed") n++
+  }
+  return n
 }
 
 function hygieneCount(report) {
@@ -742,7 +857,22 @@ function postureRows(status) {
       ok: h.traced === undefined ? null : h.traced !== true,
       value: h.traced === true ? "ATTACHED" : (h.traced === false ? "none" : "UNKNOWN"),
       severity: "alert",
-      detail: h.traced === true ? "a debugger can read this process" : "" }
+      detail: h.traced === true ? "a debugger can read this process" : "" },
+
+    // Every resting secret is ciphertext under a per-process key; this row
+    // says where that key lives, which is the thing that actually matters.
+    { label: "session key",
+      ok: h.session_key_backing === undefined ? null
+        : h.session_key_backing !== "unlocked",
+      value: h.session_key_backing === "memfd_secret" ? "kernel-invisible"
+           : h.session_key_backing === "locked-slab" ? "locked page"
+           : h.session_key_backing === "unlocked" ? "UNLOCKED"
+           : "UNKNOWN",
+      severity: "warn",
+      detail: h.session_key_backing === "memfd_secret"
+        ? "memfd_secret · secrets rest encrypted"
+        : h.session_key_backing === "locked-slab" ? "secrets rest encrypted"
+        : h.session_key_backing === "unlocked" ? "the key may be swapped" : "" }
   ]
 }
 
@@ -775,6 +905,34 @@ function sortFindings(status) {
 // What IS reachable from every surface is `shell.shellConfig`, so the merge
 // happens here as a pure function: manifest defaults first, then whatever the
 // user's shell.json carries for this plugin's bar entry.
+// Bounds a settings file cannot push past. A reveal timeout of 0 would leave
+// a secret on screen forever, a clear delay of 0 would never clear, and a
+// stale threshold of 0 would call every status stale. These mirror the
+// manifest schema's min/max and apply to both hosts.
+var SETTING_BOUNDS = {
+  pollIntervalSec:   [2, 120],
+  staleAfterSec:     [10, 3600],
+  clipboardClearSec: [5, 600],
+  revealSeconds:     [3, 120],
+  uiScale:           [0, 3.0]     // 0 is "from the viewport"; else 0.7..3.0
+}
+
+function clampSettings(settings) {
+  var out = {}
+  for (var k in settings) out[k] = settings[k]
+  for (var key in SETTING_BOUNDS) {
+    if (out[key] === undefined || out[key] === null) continue
+    var n = Number(out[key])
+    var lo = SETTING_BOUNDS[key][0], hi = SETTING_BOUNDS[key][1]
+    if (!isFinite(n)) { delete out[key]; continue }
+    if (key === "uiScale") out[key] = n <= 0 ? 0 : Math.max(0.7, Math.min(hi, n))
+    else out[key] = Math.max(lo, Math.min(hi, Math.round(n)))
+  }
+  if (out.motionEnabled !== undefined && typeof out.motionEnabled !== "boolean")
+    out.motionEnabled = String(out.motionEnabled) === "true"
+  return out
+}
+
 function resolvePluginSettings(shellConfig, manifest, pluginId) {
   var merged = {}
 
@@ -805,7 +963,7 @@ function resolvePluginSettings(shellConfig, manifest, pluginId) {
     for (var pk in pe) if (pk !== "id") merged[pk] = pe[pk]
   }
 
-  return merged
+  return clampSettings(merged)
 }
 
 // The application's equivalent of resolvePluginSettings, for a surface with no
@@ -850,7 +1008,7 @@ function desktopSettings(fileSettings) {
       if (isFinite(n)) merged[key] = n
     }
   }
-  return merged
+  return clampSettings(merged)
 }
 
 function settingOf(settings, name, fallback) {
@@ -858,16 +1016,3 @@ function settingOf(settings, name, fallback) {
   return v === undefined || v === null ? fallback : v
 }
 
-// ── shell quoting ────────────────────────────────────────────────────────────
-
-// Arguments are passed to Process as an array, so no quoting is needed and no
-// secret is ever placed in an argument vector. This exists only for the
-// copy-the-command affordance in the footer.
-function displayCommand(parts) {
-  var out = []
-  for (var i = 0; i < parts.length; i++) {
-    var p = String(parts[i])
-    out.push(/[^A-Za-z0-9_\-.\/=:]/.test(p) ? "'" + p.replace(/'/g, "'\\''") + "'" : p)
-  }
-  return out.join(" ")
-}

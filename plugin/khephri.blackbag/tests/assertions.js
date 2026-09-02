@@ -34,6 +34,104 @@ eq(fmtCountdown(90), "1m 30s", "countdown mins")
 eq(fmtCountdown(3700), "1h 1m", "countdown hours")
 eq(fmtCountdown(undefined), "—", "countdown absent")
 
+// ── settings clamping ────────────────────────────────────────────────────────
+eq(clampSettings({ revealSeconds: 0 }).revealSeconds, 3, "reveal 0 clamps up")
+eq(clampSettings({ revealSeconds: -5 }).revealSeconds, 3, "negative reveal clamps up")
+eq(clampSettings({ revealSeconds: 9999 }).revealSeconds, 120, "reveal clamps down")
+eq(clampSettings({ clipboardClearSec: 0 }).clipboardClearSec, 5, "clear 0 clamps up")
+eq(clampSettings({ staleAfterSec: 0 }).staleAfterSec, 10, "stale 0 clamps up")
+eq(clampSettings({ uiScale: 0 }).uiScale, 0, "scale 0 stays auto")
+eq(clampSettings({ uiScale: 0.2 }).uiScale, 0.7, "tiny scale clamps to floor")
+eq(clampSettings({ uiScale: 9 }).uiScale, 3, "huge scale clamps to ceiling")
+eq(clampSettings({ revealSeconds: "abc" }).revealSeconds, undefined, "non-numeric dropped")
+eq(clampSettings({ motionEnabled: "false" }).motionEnabled, false, "string boolean coerced")
+eq(resolvePluginSettings({ bar: { layout: { right: [{ id: "khephri.blackbag", revealSeconds: 0 }] } } },
+                         { barWidget: { defaults: { revealSeconds: 10 } } }, "khephri.blackbag").revealSeconds,
+   3, "plugin settings are clamped")
+eq(desktopSettings({ revealSeconds: 0, uiScale: 1.4 }).revealSeconds, 3, "desktop settings are clamped")
+eq(desktopSettings({ uiScale: 1.4 }).uiScale, 1.4, "desktop uiScale survives the read")
+eq(desktopSettings({ uiScale: "1.5" }).uiScale, 1.5, "desktop numeric string accepted")
+eq(desktopSettings({ bogus: 1 }).bogus, undefined, "unknown desktop keys ignored")
+
+// ── primary field ────────────────────────────────────────────────────────────
+eq(primaryField({ secret_fields: [{ name: "notes" }, { name: "password" }] }), "password", "password preferred")
+eq(primaryField({ secret_fields: [{ name: "custom" }] }), "custom", "first field otherwise")
+eq(primaryField({ secret_fields: [] }), "", "no fields")
+eq(primaryField(null), "", "no record")
+eq(primaryField({ secret_fields: { length: 1, 0: { name: "seed" } } }), "seed", "array-like from QML")
+
+// ── scale ceiling ────────────────────────────────────────────────────────────
+eq(maxScaleFor(1920), 2.1, "1920 wide allows 2.1")
+eq(maxScaleFor(1100), 1.2, "1100 wide allows 1.2")
+eq(maxScaleFor(0), 3.0, "unknown width allows all")
+
+// ── lock reasons + session rows ──────────────────────────────────────────────
+eq(lockReasonLabel("suspend"), "locked before suspend", "suspend reason")
+eq(lockReasonLabel("session-lock"), "locked with the screen", "session-lock reason")
+eq(lockReasonLabel("weird"), "locked (weird)", "unknown reason shown raw")
+eq(lockReasonLabel(""), "", "no reason")
+{
+  const rows = sessionRows(status({ session: { unlocked: true, method: "passphrase", idle_timeout_secs: 900,
+    session_ends_at: "2026-08-30T20:00:00Z", max_session_secs: 43200, sleep_watch: "watching org.freedesktop.login1 for suspend and session lock" } }), NOW)
+  eq(rows[0], { k: "idle timeout", v: "15m 00s" }, "session row idle")
+  eq(rows[1], { k: "unlocked by", v: "passphrase" }, "session row method")
+  eq(rows[2].k, "ends regardless", "session row ceiling")
+  eq(rows[2].v.indexOf("8h 0m") > 0, true, "ceiling countdown")
+  eq(rows[3].v, "locks the vault", "sleep watch active")
+  eq(rows[3].ok, true, "sleep watch ok")
+  const locked = sessionRows(status({ session: { unlocked: false, idle_timeout_secs: 900, last_lock_reason: "suspend", sleep_watch: "unavailable: no bus" } }), NOW)
+  eq(locked[1], { k: "last lock", v: "locked before suspend" }, "last lock row")
+  eq(locked[2].ok, false, "sleep watch unavailable is bad")
+  eq(locked[2].detail, "unavailable: no bus", "sleep watch detail carries the reason")
+  eq(sessionRows(null, NOW)[0], { k: "idle timeout", v: "—" }, "no status")
+}
+
+// ── hygiene sort + exposure ──────────────────────────────────────────────────
+{
+  const report = { records: [
+    { id: "a", title: "A", issues: ["no_totp"] },
+    { id: "b", title: "B", issues: ["no_totp", { reused: { field: "password", shared_with: ["a"], handle: "x" } }] },
+    { id: "c", title: "C", issues: [{ short: { field: "password", bytes: 4, floor: 12 } }] },
+    { id: "d", title: "D", issues: [{ exposed: { field: "password", breaches: 52372427 } }] }
+  ], score: { high: 2, medium: 1, low: 2 } }
+  const sorted = sortHygiene(report)
+  eq(sorted.map(r => r.id), ["b", "d", "c", "a"], "records worst-first, stable among equals")
+  eq(hygieneKind(sorted[0].issues[0]), "reused", "issues worst-first within a record")
+  eq(exposedCount(report), 1, "exposed count")
+  eq(hygieneSeverity({ exposed: { field: "password", breaches: 3 } }), "alert", "exposed is an alert")
+  eq(hygieneLine({ exposed: { field: "password", breaches: 3 } }), "password seen in 3 known breaches", "exposed line")
+  eq(sortHygiene(null), [], "no report sorts to nothing")
+}
+
+// ── posture: session key ─────────────────────────────────────────────────────
+{
+  const rows = postureRows(status({ host: { mlock_working: true, core_dumps_disabled: true, swap_devices: [],
+    memlock_limit_bytes: 8388608, traced: false, session_key_backing: "memfd_secret" } }))
+  const key = rows.find(r => r.label === "session key")
+  eq(key.ok, true, "memfd_secret is good")
+  eq(key.value, "kernel-invisible", "memfd_secret label")
+  const bad = postureRows(status({ host: { session_key_backing: "unlocked" } })).find(r => r.label === "session key")
+  eq(bad.ok, false, "unlocked key is bad")
+  const unk = postureRows(status({ host: {} })).find(r => r.label === "session key")
+  eq(unk.ok, null, "unmeasured key is null")
+}
+
+// ── formatting helpers that carry the list ───────────────────────────────────
+eq(fmtAgo("2026-08-30T11:59:30Z", NOW), "30s ago", "ago seconds")
+eq(fmtAgo("2026-08-30T11:30:00Z", NOW), "30m ago", "ago minutes")
+eq(fmtAgo("2026-08-29T12:00:00Z", NOW), "1d ago", "ago days")
+eq(fmtAgo("garbage", NOW), "—", "ago garbage")
+eq(asList(null), [], "asList null")
+eq(asList({ length: 2, 0: "a", 1: "b" }), ["a", "b"], "asList array-like")
+eq(isStale(status(), NOW, 120), false, "fresh is not stale")
+eq(isStale(status({ published_at: "2026-08-30T11:00:00Z" }), NOW, 120), true, "old is stale")
+eq(isStale(status({ published_at: "2026-08-30T11:58:00Z" }), NOW, 120), false, "exactly at threshold is fresh")
+eq(sessionRemaining(status({ session: { unlocked: true, expires_at: "2026-08-30T12:05:00Z" } }), NOW), 300, "remaining seconds")
+eq(sessionRemaining(status(), NOW), null, "remaining when locked")
+eq(totpUrgent(5), true, "5s is urgent")
+eq(totpUrgent(6), false, "6s is not")
+eq(fmtClock("2026-08-30T12:34:56Z").length, 5, "clock is HH:MM")
+
 eq(orDash(""), "—", "empty is dash")
 eq(orDash(0), "0", "zero is not dash")
 eq(orDash(null), "—", "null is dash")

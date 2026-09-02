@@ -139,6 +139,46 @@ Item {
     }
   }
 
+  // ── lock with the screen ───────────────────────────────────────────────────
+  //
+  // Omarchy's lock screen is the shell's own, not logind's: locking it never
+  // emits Session.Lock on the system bus, so the agent's D-Bus watcher —
+  // which does catch suspend and `loginctl lock-session` — cannot see it.
+  // The shell exposes its lock service in-process, and this service sits
+  // beside it, so the vault locks the moment the screen does.
+  property var lockService: null
+
+  function resolveLockService() {
+    if (!root.shell || typeof root.shell.serviceFor !== "function") return
+    var svc = root.shell.serviceFor("omarchy.lock")
+    if (svc && svc !== root.lockService) root.lockService = svc
+  }
+
+  Timer {
+    interval: 5000
+    running: root.lockService === null
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.resolveLockService()
+  }
+
+  Connections {
+    target: root.lockService
+    ignoreUnknownSignals: true
+    function onLockedChanged() {
+      if (!root.lockService || root.lockService.locked !== true) return
+      if (!root.lastUnlocked) return
+      if (!screenLockProcess.running) screenLockProcess.running = true
+    }
+  }
+
+  Process {
+    id: screenLockProcess
+    command: ["black-bag", "agent", "lock"]
+    running: false
+    onExited: root.refresh()
+  }
+
   // ── notifications ──────────────────────────────────────────────────────────
   // Only two things are worth interrupting the user for: a vault that appears
   // to have been rolled back, and an unlock session about to expire.

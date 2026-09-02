@@ -73,6 +73,10 @@ Item {
   property string recoveryPath: ""
   property string recoveryWritten: ""
 
+  // Skipping the recovery key is a one-way door, so it takes two presses,
+  // the way deleting a record does.
+  property bool skipArmed: false
+
   readonly property int minLength: 12
   readonly property bool matches:
     onboard.pass.length > 0 && onboard.pass === onboard.confirmPass
@@ -90,6 +94,7 @@ Item {
     onboard.recoveryWritten = ""
     onboard.showPass = false
     onboard.busy = false
+    onboard.skipArmed = false
     onboard.recoveryPath = (onboard.homeDir.length > 0 ? onboard.homeDir : "~")
                            + "/black-bag-recovery.key"
     onboard.open_ = true
@@ -109,6 +114,13 @@ Item {
 
   function abandon() {
     var hadVault = onboard.step !== "passphrase"
+    // Leaving while the engine is still working kills the work: a sheet that
+    // cannot be left while `busy` is a modal nobody can escape if the engine
+    // never answers.
+    if (initProcess.running) initProcess.running = false
+    if (recoveryProcess.running) recoveryProcess.running = false
+    onboard.busy = false
+    busyWatchdog.stop()
     onboard.clear()
     onboard.open_ = false
     // Abandoning the recovery step still leaves a usable vault behind, so the
@@ -147,6 +159,18 @@ Item {
     onboard.showPass = true
   }
 
+  // The recovery step's SKIP: first press explains, second press leaves.
+  function skipRecovery() {
+    if (onboard.busy) return
+    if (!onboard.skipArmed) {
+      onboard.skipArmed = true
+      onboard.errorText = "without a recovery key, a forgotten passphrase is a lost vault — "
+                        + "press SKIP again to go on without one"
+      return
+    }
+    onboard.abandon()
+  }
+
   function createVault() {
     if (onboard.busy) return
     // Answer the click even when not ready. The status label already counts
@@ -165,6 +189,7 @@ Item {
     }
     onboard.errorText = ""
     onboard.busy = true
+    busyWatchdog.restart()
     initProcess.running = true
   }
 
@@ -176,9 +201,28 @@ Item {
     }
     onboard.errorText = ""
     onboard.busy = true
+    onboard.skipArmed = false
+    busyWatchdog.restart()
     recoveryProcess.command = ["black-bag", "recovery", "add", "offsite",
                                "--out", onboard.recoveryPath.trim()]
     recoveryProcess.running = true
+  }
+
+  // If the engine never comes back — missing binary, a hung process, a
+  // socket that never answers — `busy` would otherwise stay true forever, and
+  // with it every exit disabled. Two minutes is longer than any Argon2 cost
+  // this deck will ever configure.
+  Timer {
+    id: busyWatchdog
+    interval: 120000
+    repeat: false
+    onTriggered: {
+      if (!onboard.busy) return
+      if (initProcess.running) initProcess.running = false
+      if (recoveryProcess.running) recoveryProcess.running = false
+      onboard.busy = false
+      onboard.errorText = "the engine did not answer in two minutes — try again, or check `black-bag doctor` in a terminal"
+    }
   }
 
   function finish() {
@@ -229,6 +273,7 @@ Item {
     }
     onExited: function (code) {
       onboard.busy = false
+      busyWatchdog.stop()
       if (code === 0) {
         onboard.step = "recovery"
         onboard.errorText = ""
@@ -252,6 +297,7 @@ Item {
     }
     onExited: function (code) {
       onboard.busy = false
+      busyWatchdog.stop()
       if (code === 0) {
         onboard.recoveryWritten = onboard.recoveryPath.trim()
         onboard.step = "done"
@@ -270,11 +316,16 @@ Item {
   // holds focus, and this sheet focuses a text field the moment it opens. A
   // window-scoped Shortcut works wherever the caret is.
 
+  // Esc works while busy too: it abandons the work. A modal that cannot be
+  // left is the worst failure a full-screen surface can have.
   Shortcut {
     sequences: ["Esc"]
-    enabled: onboard.open_ && !onboard.busy
+    enabled: onboard.open_
     context: Qt.WindowShortcut
-    onActivated: onboard.abandon()
+    onActivated: {
+      if (onboard.step === "recovery" && !onboard.busy) onboard.skipRecovery()
+      else onboard.abandon()
+    }
   }
 
   // The last step has no field to press Enter in, so Enter needs a home of its
@@ -580,6 +631,19 @@ Item {
         onTextChanged: onboard.recoveryPath = text
         onAccepted: onboard.createRecovery()
       }
+
+      Text {
+        Layout.fillWidth: true
+        text: "The default is your home directory, which is the one place it should not stay: "
+            + "not next to the vault, not in a folder that syncs. A USB stick or a printed "
+            + "QR code is right. Write it here now, then move it."
+        color: Util.alpha(Color.foreground, 0.55)
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
+        wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+        textFormat: Text.PlainText
+        renderType: Text.NativeRendering
+      }
     }
 
     // ── done ────────────────────────────────────────────────────────────────
@@ -639,11 +703,12 @@ Item {
       Item { Layout.fillWidth: true }
 
       SheetButton {
-        label: onboard.step === "recovery" ? "SKIP" : "CANCEL"
+        label: onboard.step === "recovery"
+          ? (onboard.skipArmed ? "SKIP ANYWAY" : "SKIP")
+          : (onboard.busy ? "ABANDON" : "CANCEL")
         visible: onboard.step !== "done"
-        enabledAction: !onboard.busy
-        tone: Util.alpha(Color.foreground, 0.6)
-        onActivated: onboard.abandon()
+        tone: onboard.skipArmed ? Color.urgent : Util.alpha(Color.foreground, 0.6)
+        onActivated: onboard.step === "recovery" ? onboard.skipRecovery() : onboard.abandon()
       }
 
       SheetButton {
@@ -698,8 +763,7 @@ Item {
     id: fmenu
     property Item target: null
     readonly property bool masked:
-      fmenu.target && fmenu.target.echoMode !== undefined
-        ? fmenu.target.echoMode !== TextInput.Normal : false
+      !(fmenu.target && fmenu.target.echoMode === TextInput.Normal)
     background: Rectangle {
       implicitWidth: onboard.metric.space(170)
       color: Color.background
