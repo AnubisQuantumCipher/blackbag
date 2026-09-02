@@ -17,9 +17,20 @@
 //! one that is not happening, which locks the vault. Both fail safe.
 //!
 //! The parser is bounds-checked at every step and never panics on malformed
-//! input; a message it cannot read is dropped, and a connection that breaks is
-//! retried on a backoff. Its state is reported through `status.json` so the
-//! deck can say whether the watcher is actually connected rather than assume.
+//! input. A message it cannot read is *consumed and skipped*, so the framing
+//! survives and the connection does not: an earlier revision tore the
+//! connection down and slept twenty seconds, which let any local peer blind
+//! the watcher for as long as it cared to by sending one malformed unicast
+//! signal every nineteen. A connection that genuinely breaks is retried on a
+//! growing backoff. The state is reported through `status.json` so the deck
+//! can say whether the watcher is actually connected rather than assume.
+//!
+//! Sender identity is enforced in this process against logind's *unique* bus
+//! name, learned with `GetNameOwner` and re-learned on `NameOwnerChanged`.
+//! The `sender=` clause of a match rule is not enough on its own: the bus
+//! never consults match rules for a signal addressed to a specific
+//! connection, so before this any local process could send a forged
+//! `PrepareForSleep` straight here.
 //!
 //! # What it does not do
 //!
@@ -36,7 +47,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::session::LockReason;
 
@@ -44,9 +55,21 @@ pub const DEFAULT_SYSTEM_BUS: &str = "/run/dbus/system_bus_socket";
 pub const LOGIND: &str = "org.freedesktop.login1";
 pub const LOGIND_MANAGER_IFACE: &str = "org.freedesktop.login1.Manager";
 pub const LOGIND_SESSION_IFACE: &str = "org.freedesktop.login1.Session";
-const RETRY_DELAY: Duration = Duration::from_secs(20);
-/// A header or body larger than this is not something logind sends.
+/// First reconnect delay. It grows to [`MAX_RETRY_DELAY`] on repeated
+/// failure. It used to be a flat 20 s, which was the whole of the
+/// denial-of-service below: one malformed message bought an attacker twenty
+/// seconds of blindness, and repeating it every nineteen kept the watcher
+/// off permanently.
+const FIRST_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// A header or body larger than this is not something logind sends, so it is
+/// not worth buffering to parse.
 const MAX_MESSAGE_BYTES: usize = 1 << 20;
+
+/// The D-Bus specification's own ceiling on a message. Beyond this the stream
+/// is not carrying D-Bus any more and there is nothing to resynchronise to.
+const MAX_DRAIN_BYTES: usize = 128 << 20;
 
 /// Where to connect and what to accept. Production uses the system bus and
 /// only trusts signals from logind's well-known name; the end-to-end test
@@ -124,13 +147,20 @@ pub fn spawn(config: WatchConfig, tx: Sender<LockReason>) -> Arc<Mutex<String>> 
     let spawned = std::thread::Builder::new()
         .name("sleep-watch".into())
         .stack_size(256 * 1024)
-        .spawn(move || loop {
-            set_state(&shared, "connecting");
-            match run(&config, &tx, &shared) {
-                Ok(()) => set_state(&shared, "disconnected; reconnecting"),
-                Err(e) => set_state(&shared, &format!("unavailable: {e:#}")),
+        .spawn(move || {
+            let mut delay = FIRST_RETRY_DELAY;
+            loop {
+                set_state(&shared, "connecting");
+                match run(&config, &tx, &shared) {
+                    Ok(()) => {
+                        set_state(&shared, "disconnected; reconnecting");
+                        delay = FIRST_RETRY_DELAY;
+                    }
+                    Err(e) => set_state(&shared, &format!("unavailable: {e:#}")),
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(MAX_RETRY_DELAY);
             }
-            std::thread::sleep(RETRY_DELAY);
         });
     if let Err(e) = spawned {
         set_state(&state, &format!("unavailable: could not start thread: {e}"));
@@ -176,12 +206,21 @@ pub fn run(config: &WatchConfig, tx: &Sender<LockReason>, state: &Arc<Mutex<Stri
         .as_deref()
         .map(|s| format!(",sender='{s}'"))
         .unwrap_or_default();
-    for rule in [
+    let mut rules = vec![
         format!(
             "type='signal'{sender_clause},interface='{LOGIND_MANAGER_IFACE}',member='PrepareForSleep'"
         ),
         format!("type='signal'{sender_clause},interface='{LOGIND_SESSION_IFACE}',member='Lock'"),
-    ] {
+    ];
+    if let Some(expected) = config.sender.as_deref() {
+        // So a logind restart re-registers rather than leaving us pinned to a
+        // unique name nobody owns any more.
+        rules.push(format!(
+            "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',\
+             member='NameOwnerChanged',arg0='{expected}'"
+        ));
+    }
+    for rule in rules {
         let s = next_serial();
         stream.write_all(&method_call(
             s,
@@ -194,23 +233,132 @@ pub fn run(config: &WatchConfig, tx: &Sender<LockReason>, state: &Arc<Mutex<Stri
         wait_for_reply(&mut stream, s)?;
     }
 
-    set_state(
-        state,
-        &format!(
+    // Who counts as logind. The bus rewrites every SENDER to a unique name, so
+    // the `sender=` clause in a match rule is the only thing enforcing it —
+    // and a match rule is not consulted at all for a *unicast* signal, which
+    // any local peer may send to us directly. Asking the bus who owns the
+    // well-known name, and comparing against that, is what actually closes it.
+    let mut owner = match config.sender.as_deref() {
+        Some(name) => {
+            let s = next_serial();
+            stream.write_all(&method_call(
+                s,
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "GetNameOwner",
+                Some(("s", &marshal_string(name))),
+            ))?;
+            reply_string(&mut stream, s)?
+        }
+        None => None,
+    };
+
+    // Which session's lock is ours. A host with several sessions would
+    // otherwise seal this vault when anyone's screen locked.
+    let session = own_session_path(&mut stream, &mut next_serial).unwrap_or(None);
+
+    let describe = |owner: &Option<String>| match (owner, &session) {
+        (Some(o), Some(sess)) => format!(
+            "watching {} ({o}) for suspend and the lock of {sess}",
+            config.sender.as_deref().unwrap_or("any sender")
+        ),
+        (Some(o), None) => format!(
+            "watching {} ({o}) for suspend and any session lock",
+            config.sender.as_deref().unwrap_or("any sender")
+        ),
+        (None, _) => format!(
             "watching {} for suspend and session lock",
             config.sender.as_deref().unwrap_or("any sender")
         ),
-    );
+    };
+    set_state(state, &describe(&owner));
 
     loop {
-        let message = read_message(&mut stream)?;
-        if let Some(reason) = classify(&message, config.sender.as_deref()) {
+        // A message this parser cannot read is skipped, not fatal. It used to
+        // end the connection, and the module doc claimed otherwise: a peer
+        // that sent one oversized or oddly-shaped unicast signal every few
+        // seconds could hold the watcher off the bus indefinitely, and the
+        // vault then carried its data key into suspend exactly as it had
+        // before this module existed.
+        let Some(message) = read_message(&mut stream)? else {
+            continue;
+        };
+
+        // logind came or went: re-learn who it is.
+        if message.kind() == MessageType::Signal
+            && message.interface.as_deref() == Some("org.freedesktop.DBus")
+            && message.member.as_deref() == Some("NameOwnerChanged")
+        {
+            if let Some(new_owner) = body_strings(&message, 3).and_then(|v| v.into_iter().nth(2)) {
+                owner = (!new_owner.is_empty()).then_some(new_owner);
+                set_state(state, &describe(&owner));
+            }
+            continue;
+        }
+
+        if let Some(reason) = classify_from(&message, owner.as_deref(), session.as_deref()) {
             if tx.send(reason).is_err() {
                 // The agent is gone; nothing to lock any more.
                 return Ok(());
             }
         }
     }
+}
+
+/// The object path of the session this process belongs to, if logind knows of
+/// one. A user service often has none, and the honest answer then is `None`,
+/// which means "any session's lock counts" — eager, but never silent.
+fn own_session_path(
+    stream: &mut UnixStream,
+    next_serial: &mut impl FnMut() -> u32,
+) -> Result<Option<String>> {
+    let pid = unsafe { libc::getpid() } as u32;
+    let s = next_serial();
+    stream.write_all(&method_call(
+        s,
+        LOGIND,
+        "/org/freedesktop/login1",
+        LOGIND_MANAGER_IFACE,
+        "GetSessionByPID",
+        Some(("u", &pid.to_le_bytes())),
+    ))?;
+    Ok(reply_string(stream, s).unwrap_or(None))
+}
+
+/// Wait for the reply to `serial` and read a single string (or object path)
+/// out of its body. An error reply yields `None` rather than failing: not
+/// every question has an answer on every host, and the caller degrades.
+fn reply_string(stream: &mut UnixStream, serial: u32) -> Result<Option<String>> {
+    for _ in 0..64 {
+        let Some(message) = read_message(stream)? else {
+            continue;
+        };
+        if message.reply_serial != Some(serial) {
+            continue;
+        }
+        return Ok(match message.kind() {
+            MessageType::MethodReturn => {
+                body_strings(&message, 1).and_then(|v| v.into_iter().next())
+            }
+            _ => None,
+        });
+    }
+    Ok(None)
+}
+
+/// The first `n` strings of a message body.
+fn body_strings(message: &Message, n: usize) -> Option<Vec<String>> {
+    let mut cursor = Cursor {
+        buf: &message.body,
+        pos: 0,
+        little_endian: message.little_endian,
+    };
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(cursor.string()?);
+    }
+    Some(out)
 }
 
 /// SASL EXTERNAL: prove our uid by the credentials the kernel attaches to the
@@ -251,7 +399,9 @@ fn read_sasl_line(stream: &mut UnixStream) -> Result<String> {
 /// completed yet, so there is nothing to act on.
 fn wait_for_reply(stream: &mut UnixStream, serial: u32) -> Result<()> {
     for _ in 0..64 {
-        let message = read_message(stream)?;
+        let Some(message) = read_message(stream)? else {
+            continue;
+        };
         if message.reply_serial == Some(serial) {
             return match message.kind() {
                 MessageType::MethodReturn => Ok(()),
@@ -286,6 +436,7 @@ pub struct Message {
     pub interface: Option<String>,
     pub member: Option<String>,
     pub sender: Option<String>,
+    pub destination: Option<String>,
     pub error_name: Option<String>,
     pub reply_serial: Option<u32>,
     pub signature: Option<String>,
@@ -301,18 +452,37 @@ impl Message {
 
 /// Decide whether a message is one of the two events we lock on.
 pub fn classify(message: &Message, expected_sender: Option<&str>) -> Option<LockReason> {
+    classify_from(message, expected_sender, None)
+}
+
+/// Decide whether a message is one of the two events we lock on.
+///
+/// `owner` is logind's *unique* name as the bus reported it, not the
+/// well-known name. This matters: the bus rewrites SENDER to the unique name
+/// on every message, so a check against `org.freedesktop.login1` never fired,
+/// and match rules — the only other sender enforcement — are not consulted
+/// for a unicast signal. Any local process could therefore address a forged
+/// `PrepareForSleep` straight at this connection and lock the vault at will.
+/// Verified against dbus-broker before and after.
+///
+/// `session` scopes `Session.Lock` to this process's own session when logind
+/// knows of one, so another user's screen lock does not seal this vault.
+pub fn classify_from(
+    message: &Message,
+    owner: Option<&str>,
+    session: Option<&str>,
+) -> Option<LockReason> {
     if message.kind() != MessageType::Signal {
         return None;
     }
-    if let Some(expected) = expected_sender {
-        // logind's signals carry its unique name (`:1.6`) as sender, not the
-        // well-known one, so the bus-side match rule is what enforces the
-        // sender; here we only refuse a message that names a *different*
-        // well-known name outright.
-        if let Some(sender) = &message.sender {
-            if sender.starts_with("org.") && sender != expected {
-                return None;
-            }
+    if let Some(owner) = owner {
+        if message.sender.as_deref() != Some(owner) {
+            return None;
+        }
+        // logind broadcasts. A signal addressed to us specifically did not
+        // come from a broadcast subscription and has no business being one.
+        if message.destination.is_some() {
+            return None;
         }
     }
     match (message.interface.as_deref(), message.member.as_deref()) {
@@ -320,7 +490,12 @@ pub fn classify(message: &Message, expected_sender: Option<&str>) -> Option<Lock
             let going_to_sleep = read_bool(&message.body, message.little_endian)?;
             going_to_sleep.then_some(LockReason::Suspend)
         }
-        (Some(LOGIND_SESSION_IFACE), Some("Lock")) => Some(LockReason::SessionLock),
+        (Some(LOGIND_SESSION_IFACE), Some("Lock")) => {
+            match (session, message.path.as_deref()) {
+                (Some(ours), Some(theirs)) if ours != theirs => None,
+                _ => Some(LockReason::SessionLock),
+            }
+        }
         _ => None,
     }
 }
@@ -337,12 +512,21 @@ fn read_bool(body: &[u8], little_endian: bool) -> Option<bool> {
 }
 
 /// Read exactly one message off the stream.
-pub fn read_message(stream: &mut impl Read) -> Result<Message> {
+/// Read exactly one message off the stream.
+///
+/// `Ok(None)` means a message arrived and was discarded — too large to be
+/// worth buffering, or shaped in a way this parser cannot walk. The bytes are
+/// still consumed, so the stream stays framed and the next message is read
+/// normally. Only a genuine I/O failure, or a stream that is no longer
+/// carrying D-Bus at all, ends the connection.
+pub fn read_message(stream: &mut impl Read) -> Result<Option<Message>> {
     let mut fixed = [0u8; 16];
     stream.read_exact(&mut fixed)?;
     let little_endian = match fixed[0] {
         b'l' => true,
         b'B' => false,
+        // Without knowing the byte order there is no length to skip by, so
+        // there is nothing to resynchronise to.
         other => bail!("bad endianness byte {other:#x}"),
     };
     let u32_at = |b: &[u8]| -> u32 {
@@ -355,18 +539,40 @@ pub fn read_message(stream: &mut impl Read) -> Result<Message> {
     };
     let body_len = u32_at(&fixed[4..8]) as usize;
     let fields_len = u32_at(&fixed[12..16]) as usize;
-    if body_len > MAX_MESSAGE_BYTES || fields_len > MAX_MESSAGE_BYTES {
-        bail!("message too large");
+
+    let padded_header = (16usize).checked_add(fields_len).map(|t| t.div_ceil(8) * 8);
+    let Some(padded_header) = padded_header else {
+        bail!("message header length overflows");
+    };
+    let Some(remaining) = padded_header
+        .checked_sub(16)
+        .and_then(|h| h.checked_add(body_len))
+    else {
+        bail!("message length overflows");
+    };
+    if remaining > MAX_DRAIN_BYTES {
+        bail!("message far beyond the protocol's own size ceiling");
     }
-    let header_total = 16 + fields_len;
-    let padded_header = header_total.div_ceil(8) * 8;
-    let mut rest = vec![0u8; padded_header - 16 + body_len];
+
+    // Oversized but plausible: consume it so the framing survives, and skip.
+    if body_len > MAX_MESSAGE_BYTES || fields_len > MAX_MESSAGE_BYTES {
+        let mut left = remaining;
+        let mut sink = [0u8; 8192];
+        while left > 0 {
+            let take = sink.len().min(left);
+            stream.read_exact(&mut sink[..take])?;
+            left -= take;
+        }
+        return Ok(None);
+    }
+
+    let mut rest = vec![0u8; remaining];
     stream.read_exact(&mut rest)?;
 
     let mut raw = Vec::with_capacity(padded_header + body_len);
     raw.extend_from_slice(&fixed);
     raw.extend_from_slice(&rest);
-    parse_message(&raw).ok_or_else(|| anyhow!("malformed message"))
+    Ok(parse_message(&raw))
 }
 
 /// Parse a complete message from its bytes. `None` on anything malformed.
@@ -422,17 +628,18 @@ pub fn parse_message(raw: &[u8]) -> Option<Message> {
             (3, "s") => message.member = Some(cursor.string()?),
             (4, "s") => message.error_name = Some(cursor.string()?),
             (5, "u") => message.reply_serial = Some(cursor.u32()?),
-            (6, "s") => {
-                let _destination = cursor.string()?;
-            }
+            (6, "s") => message.destination = Some(cursor.string()?),
             (7, "s") => message.sender = Some(cursor.string()?),
             (8, "g") => message.signature = Some(cursor.signature()?),
             (9, "u") => {
                 let _fds = cursor.u32()?;
             }
             (_, other) => {
-                // Unknown field: skip its value by signature, for the simple
-                // types we understand; anything else is a parse failure.
+                // The specification requires unknown header fields to be
+                // ignored, so every fixed-width type is skipped by its own
+                // size and alignment. A container we cannot walk still fails
+                // the parse, but a failed parse now costs one skipped message
+                // rather than the connection.
                 match other {
                     "s" | "o" => {
                         cursor.string()?;
@@ -440,11 +647,17 @@ pub fn parse_message(raw: &[u8]) -> Option<Message> {
                     "g" => {
                         cursor.signature()?;
                     }
-                    "u" | "i" | "b" => {
-                        cursor.u32()?;
-                    }
                     "y" => {
                         cursor.u8()?;
+                    }
+                    "n" | "q" => {
+                        cursor.skip_fixed(2)?;
+                    }
+                    "u" | "i" | "b" | "h" => {
+                        cursor.skip_fixed(4)?;
+                    }
+                    "x" | "t" | "d" => {
+                        cursor.skip_fixed(8)?;
                     }
                     _ => return None,
                 }
@@ -482,6 +695,18 @@ impl Cursor<'_> {
         self.pos += 1;
         Some(b)
     }
+    /// Step over a fixed-width value of `size` bytes, honouring its natural
+    /// alignment, which for every D-Bus basic type equals its size.
+    fn skip_fixed(&mut self, size: usize) -> Option<()> {
+        self.align(size)?;
+        let end = self.pos.checked_add(size)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        self.pos = end;
+        Some(())
+    }
+
     fn u32(&mut self) -> Option<u32> {
         self.align(4)?;
         let raw = self.buf.get(self.pos..self.pos + 4)?;
@@ -635,8 +860,11 @@ mod tests {
             "PrepareForSleep",
             Some(("b", &1u32.to_le_bytes())),
         );
-        let message = parse_message(&raw).unwrap();
-        assert_eq!(classify(&message, Some(LOGIND)), Some(LockReason::Suspend));
+        let mut message = parse_message(&raw).unwrap();
+        // The bus rewrites SENDER to logind's unique name; `classify` now
+        // compares against exactly that.
+        message.sender = Some(":1.6".into());
+        assert_eq!(classify(&message, Some(":1.6")), Some(LockReason::Suspend));
     }
 
     #[test]
@@ -661,8 +889,9 @@ mod tests {
             "Lock",
             None,
         );
-        let message = parse_message(&raw).unwrap();
-        assert_eq!(classify(&message, Some(LOGIND)), Some(LockReason::SessionLock));
+        let mut message = parse_message(&raw).unwrap();
+        message.sender = Some(":1.6".into());
+        assert_eq!(classify(&message, Some(":1.6")), Some(LockReason::SessionLock));
     }
 
     #[test]
@@ -677,6 +906,134 @@ mod tests {
         );
         let message = parse_message(&raw).unwrap();
         assert_eq!(classify(&message, Some(LOGIND)), None);
+    }
+
+    /// A forged unicast signal must not be able to lock the vault, and a
+    /// broadcast that is not logind's must not either.
+    #[test]
+    fn only_logind_itself_can_trigger_a_lock() {
+        let raw = signal(
+            3,
+            "/org/freedesktop/login1",
+            LOGIND_MANAGER_IFACE,
+            "PrepareForSleep",
+            Some(("b", &1u32.to_le_bytes())),
+        );
+        let mut message = parse_message(&raw).unwrap();
+
+        // No sender at all: refused once an owner is known.
+        assert_eq!(classify_from(&message, Some(":1.6"), None), None);
+
+        // The real thing.
+        message.sender = Some(":1.6".into());
+        assert_eq!(
+            classify_from(&message, Some(":1.6"), None),
+            Some(LockReason::Suspend)
+        );
+
+        // Same shape, different peer.
+        message.sender = Some(":1.4242".into());
+        assert_eq!(classify_from(&message, Some(":1.6"), None), None);
+
+        // logind's own name, but addressed to us rather than broadcast:
+        // logind never does that, and a peer that does is forging.
+        message.sender = Some(":1.6".into());
+        message.destination = Some(":1.99".into());
+        assert_eq!(classify_from(&message, Some(":1.6"), None), None);
+    }
+
+    /// Another session's lock is not ours.
+    #[test]
+    fn session_lock_is_scoped_to_our_own_session() {
+        let raw = signal(
+            9,
+            "/org/freedesktop/login1/session/_32",
+            LOGIND_SESSION_IFACE,
+            "Lock",
+            None,
+        );
+        let mut message = parse_message(&raw).unwrap();
+        message.sender = Some(":1.6".into());
+
+        let ours = "/org/freedesktop/login1/session/_32";
+        let theirs = "/org/freedesktop/login1/session/_77";
+        assert_eq!(
+            classify_from(&message, Some(":1.6"), Some(ours)),
+            Some(LockReason::SessionLock)
+        );
+        assert_eq!(classify_from(&message, Some(":1.6"), Some(theirs)), None);
+        // No session known: any lock counts, which is eager but never silent.
+        assert_eq!(
+            classify_from(&message, Some(":1.6"), None),
+            Some(LockReason::SessionLock)
+        );
+    }
+
+    /// The denial of service the review demonstrated: a message the parser
+    /// cannot read must cost one message, not the connection.
+    #[test]
+    fn an_unreadable_message_is_skipped_and_the_stream_stays_framed() {
+        let mut hostile = signal(
+            1,
+            "/org/freedesktop/login1",
+            LOGIND_MANAGER_IFACE,
+            "PrepareForSleep",
+            Some(("b", &1u32.to_le_bytes())),
+        );
+        // The PATH header field is first, and its string length sits at a
+        // fixed offset. Claim a length nothing could satisfy: the declared
+        // message size is untouched, so the framing stays exactly right while
+        // the parse cannot complete. That is the shape the review used to
+        // knock the watcher off the bus for twenty seconds at a time.
+        hostile[20..24].copy_from_slice(&0xffff_ff00u32.to_le_bytes());
+        assert!(
+            parse_message(&hostile).is_none(),
+            "the test's hostile message must actually be unparseable"
+        );
+
+        let good = signal(
+            2,
+            "/org/freedesktop/login1",
+            LOGIND_MANAGER_IFACE,
+            "PrepareForSleep",
+            Some(("b", &1u32.to_le_bytes())),
+        );
+
+        let joined = [hostile, good].concat();
+        let mut stream: &[u8] = &joined;
+        let first = read_message(&mut stream).expect("skipping is not an error");
+        assert!(first.is_none(), "an unparseable message must be skipped");
+        // The property that matters: the framing survived, so the very next
+        // message — a real one — is still read.
+        let second = read_message(&mut stream)
+            .expect("stream is still framed")
+            .expect("the following message parses");
+        assert_eq!(second.member.as_deref(), Some("PrepareForSleep"));
+        assert_eq!(second.serial, 2);
+    }
+
+    /// An oversized message is drained, not fatal.
+    #[test]
+    fn an_oversized_message_is_drained_and_the_next_one_still_parses() {
+        let big_body = vec![0u8; MAX_MESSAGE_BYTES + 4096];
+        let hostile = signal(
+            1,
+            "/org/freedesktop/login1",
+            LOGIND_MANAGER_IFACE,
+            "PrepareForSleep",
+            Some(("ay", &big_body)),
+        );
+        let good = signal(
+            2,
+            "/org/freedesktop/login1",
+            LOGIND_MANAGER_IFACE,
+            "PrepareForSleep",
+            Some(("b", &1u32.to_le_bytes())),
+        );
+        let mut stream: &[u8] = &[hostile, good].concat();
+        assert!(read_message(&mut stream).unwrap().is_none(), "oversized is skipped");
+        let next = read_message(&mut stream).unwrap().expect("next message parses");
+        assert_eq!(next.serial, 2);
     }
 
     #[test]
