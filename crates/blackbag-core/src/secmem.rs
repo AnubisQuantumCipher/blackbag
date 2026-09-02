@@ -1075,9 +1075,13 @@ mod tests {
         unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
         let maps = std::fs::read_to_string("/proc/self/maps").expect("readable maps");
         let mut mem = std::fs::File::open("/proc/self/mem").expect("readable self mem");
-        let mut hits = 0usize;
-        let mut scanned = 0usize;
-        let mut buf = Vec::new();
+
+        // Parse the writable mappings first, so the scan buffer can be
+        // allocated exactly once. A buffer that grew between mappings would
+        // leave its old contents — possibly a copy of the needle read from
+        // an earlier mapping — in freed heap, and the scan would then find
+        // its own leftovers and report a leak that is not one.
+        let mut ranges = Vec::new();
         for line in maps.lines() {
             let mut parts = line.split_whitespace();
             let (Some(range), Some(perms)) = (parts.next(), parts.next()) else {
@@ -1086,30 +1090,33 @@ mod tests {
             if !perms.starts_with("rw") {
                 continue;
             }
-            // Skip the needle vector's own allocation by excluding a hit at
-            // exactly its address; everything else must be clean.
             let (lo, hi) = range.split_once('-').unwrap();
             let lo = u64::from_str_radix(lo, 16).unwrap();
             let hi = u64::from_str_radix(hi, 16).unwrap();
-            let len = (hi - lo) as usize;
-            if len > 256 * 1024 * 1024 {
+            if hi - lo > 256 * 1024 * 1024 {
                 continue;
             }
-            buf.clear();
-            buf.resize(len, 0);
-            if mem.seek(SeekFrom::Start(lo)).is_err() || mem.read_exact(&mut buf).is_err() {
+            ranges.push((lo, hi));
+        }
+        let max_len = ranges.iter().map(|(lo, hi)| (hi - lo) as usize).max().unwrap_or(0);
+        let mut buf = vec![0u8; max_len];
+        let buf_lo = buf.as_ptr() as u64;
+        let buf_hi = buf_lo + buf.len() as u64;
+        let own = needle.as_ptr() as u64;
+
+        let mut hits = 0usize;
+        let mut scanned = 0usize;
+        for (lo, hi) in ranges {
+            let len = (hi - lo) as usize;
+            let slot = &mut buf[..len];
+            if mem.seek(SeekFrom::Start(lo)).is_err() || mem.read_exact(slot).is_err() {
                 continue;
             }
             scanned += len;
-            let own = needle.as_ptr() as u64;
-            // The scan buffer is itself in the heap: while the heap mapping
-            // is being read, `buf` holds whatever the previous mapping held,
-            // which may include the needle. A hit inside `buf`'s own address
-            // range is the scanner seeing itself, not a leak.
-            let buf_lo = buf.as_ptr() as u64;
-            let buf_hi = buf_lo + buf.len() as u64;
-            for (i, w) in buf.windows(needle.len()).enumerate() {
+            for (i, w) in slot.windows(needle.len()).enumerate() {
                 let at = lo + i as u64;
+                // The needle's own allocation, and the scan buffer seeing
+                // itself while the heap mapping is read, are not leaks.
                 if w == needle.as_slice() && at != own && !(at >= buf_lo && at < buf_hi) {
                     hits += 1;
                 }

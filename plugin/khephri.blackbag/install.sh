@@ -120,9 +120,11 @@ SystemCallArchitectures=native
 # the binary is compromised; the breach check runs in the CLI, not here.
 RestrictAddressFamilies=AF_UNIX
 CapabilityBoundingSet=
-# The syscall allow-list a service needs, which includes the memlock group.
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
+# The syscall allow-list a service needs (it includes the memlock group),
+# plus memfd_secret for the session key's kernel-invisible page. @resources
+# stays allowed: setrlimit(RLIMIT_CORE) is part of the agent's own hardening.
+SystemCallFilter=@system-service memfd_secret
+SystemCallFilter=~@privileged
 SystemCallErrorNumber=EPERM
 # Core dumps would defeat the point of locking pages.
 LimitCORE=0

@@ -1,6 +1,7 @@
 //! `black-bag` — hardened credential storage for Omarchy.
 
 mod clipboard;
+mod import;
 mod tty;
 
 use std::path::PathBuf;
@@ -67,6 +68,10 @@ enum Command {
     Gen(GenCommand),
     /// Convert a black-bagg 0.4.x (v1) vault to this format.
     Migrate(MigrateArgs),
+    /// Bring records in from another password manager's export.
+    Import(ImportArgs),
+    /// Write every record out in plaintext, for moving to another manager.
+    Export(ExportArgs),
     /// Clipboard helper: serve stdin as a sensitive clipboard offer.
     ///
     /// Spawned by `--to clipboard`; not meant to be run by hand. Hidden from
@@ -330,6 +335,31 @@ struct StatusArgs {
 }
 
 #[derive(Args)]
+struct ImportArgs {
+    /// The export file to read.
+    #[arg(long)]
+    from: PathBuf,
+    /// Which tool wrote it.
+    #[arg(long, value_enum)]
+    format: import::ImportFormat,
+    /// Parse and report, but write nothing.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Args)]
+struct ExportArgs {
+    /// Where to write. Created 0600; refuses to overwrite.
+    #[arg(long)]
+    to: PathBuf,
+    #[arg(long, value_enum, default_value_t = import::ExportFormat::Json)]
+    format: import::ExportFormat,
+    /// Required: the file will contain every secret in plaintext.
+    #[arg(long)]
+    plaintext_ok: bool,
+}
+
+#[derive(Args)]
 struct MigrateArgs {
     /// The old v1 vault.
     #[arg(long)]
@@ -374,6 +404,8 @@ fn run(hardening: harden::HardenReport) -> Result<()> {
         Command::Status(args) => cmd_status(&path, args, hardening),
         Command::Gen(cmd) => cmd_gen(cmd),
         Command::Migrate(args) => cmd_migrate(args),
+        Command::Import(args) => cmd_import(&path, args),
+        Command::Export(args) => cmd_export(&path, args),
         Command::ClipServe { clear_after } => clipboard::serve(clear_after),
     }
 }
@@ -1231,6 +1263,90 @@ fn agent_session_view() -> SessionView {
         },
         _ => SessionView::default(),
     }
+}
+
+fn cmd_import(path: &std::path::Path, args: ImportArgs) -> Result<()> {
+    // The export is plaintext; read it into a buffer that is wiped when this
+    // function returns, and never keep it longer than the parse.
+    let raw = Zeroizing::new(
+        std::fs::read_to_string(&args.from)
+            .with_context(|| format!("failed to read {}", args.from.display()))?,
+    );
+    let imported = import::parse(args.format, &raw)?;
+    drop(raw);
+
+    let counts = imported.counts_by_kind();
+    println!(
+        "parsed {} record(s){}",
+        imported.records.len(),
+        if counts.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ": {}",
+                counts
+                    .iter()
+                    .map(|(k, n)| format!("{n} {k}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    );
+    for line in &imported.skipped {
+        eprintln!("skipped {line}");
+    }
+    if args.dry_run {
+        println!("dry run: nothing written");
+        return Ok(());
+    }
+    if imported.records.is_empty() {
+        bail!("nothing to import");
+    }
+
+    let _lock = blackbag_core::vault::open_lock(path)?;
+    let mut vault = open_vault(path)?;
+    let mut added = 0usize;
+    for record in imported.records {
+        vault.add_record(record)?;
+        added += 1;
+    }
+    vault.save()?;
+    println!("imported {added} record(s) into {}", path.display());
+    println!("The export file still holds every secret in plaintext. Delete it: shred -u {}", args.from.display());
+    Ok(())
+}
+
+fn cmd_export(path: &std::path::Path, args: ExportArgs) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if !args.plaintext_ok {
+        bail!(
+            "an export contains every secret in plaintext; pass --plaintext-ok to say you know, \
+             write it to removable media, and shred it when the other tool has read it"
+        );
+    }
+    if args.to.exists() {
+        bail!("{} already exists; refusing to overwrite", args.to.display());
+    }
+    let vault = open_vault(path)?;
+    let rendered = import::render(vault.records(), args.format)?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&args.to)
+        .with_context(|| format!("failed to create {}", args.to.display()))?;
+    file.write_all(rendered.as_bytes())?;
+    file.sync_all()?;
+    println!(
+        "wrote {} record(s) to {} (mode 0600, plaintext)",
+        vault.records().len(),
+        args.to.display()
+    );
+    println!("When the other tool has imported it: shred -u {}", args.to.display());
+    Ok(())
 }
 
 fn cmd_migrate(args: MigrateArgs) -> Result<()> {
