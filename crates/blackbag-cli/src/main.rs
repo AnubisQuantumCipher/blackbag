@@ -959,13 +959,21 @@ fn cmd_breach(online: bool, json: bool) -> Result<()> {
 
     if !online {
         eprintln!(
-            "black-bag agent breach sends the first {} hex characters of the SHA-1 of each \
-             distinct password to {} (Have I Been Pwned, k-anonymity). The service cannot learn \
-             which password you hold, whether it matched, or how many you have. Nothing else \
-             leaves the machine, and the full hash never leaves the agent.\n\n\
+            "black-bag agent breach asks {} (Have I Been Pwned) about your passwords by \
+             k-anonymity.\n\n\
+             What leaves this machine: the first {} hex characters of the SHA-1 of each \
+             distinct password — each naming a bucket of about a thousand leaked hashes — \
+             padded with random decoys to a multiple of {} and shuffled, one HTTPS request \
+             each, plus your IP address, the time, and the user agent black-bag/{}.\n\n\
+             What does not: the full hash, which never leaves the agent; which password you \
+             hold; whether anything matched; which of the prefixes were real; and, to within \
+             {}, how many passwords you have.\n\n\
              Re-run with --online to consent.",
+            breach::RANGE_URL,
             breach::PREFIX_LEN,
-            breach::RANGE_URL
+            breach::PAD_TO,
+            env!("CARGO_PKG_VERSION"),
+            breach::PAD_TO
         );
         std::process::exit(2);
     }
@@ -978,7 +986,11 @@ fn cmd_breach(online: bool, json: bool) -> Result<()> {
         Response::Error { message } => bail!("{message}"),
         _ => bail!("unexpected reply"),
     };
-    let prefixes = breach::distinct_prefixes(&candidates);
+    let real = breach::distinct_prefixes(&candidates);
+    // Padded with decoys and shuffled, so the request count does not report
+    // how many distinct passwords the vault holds and the order does not
+    // sort them. A bucket that belongs to no real prefix is never consulted.
+    let prefixes = breach::padded_prefixes(&real);
     if prefixes.is_empty() {
         if json {
             println!("{}", serde_json::to_string(&breach::Report::default())?);
@@ -994,11 +1006,22 @@ fn cmd_breach(online: bool, json: bool) -> Result<()> {
         let url = format!("{}{}", breach::RANGE_URL, prefix);
         let output = std::process::Command::new("curl")
             .args([
+                // First, or it does not suppress ~/.curlrc at all.
+                "-q",
                 "--silent",
                 "--show-error",
                 "--fail",
                 "--max-time",
                 "20",
+                // The user's own curlrc is not part of this program's
+                // behaviour. An `-o` line in it would send the body to a file
+                // and leave stdout empty, which parsed as an empty bucket and
+                // therefore as "checked, and your password is not in it".
+                // `-q` has to come first to take effect.
+                "--proto",
+                "=https",
+                "--noproxy",
+                "*",
                 "--header",
                 "Add-Padding: true",
                 "--user-agent",
@@ -1015,7 +1038,14 @@ fn cmd_breach(online: bool, json: bool) -> Result<()> {
             continue;
         }
         let body = String::from_utf8_lossy(&output.stdout);
-        ranges.push(breach::parse_range(prefix, &body));
+        let range = breach::parse_range(prefix, &body);
+        // With Add-Padding a real bucket is never empty, so an empty one
+        // means the body did not arrive — not that nothing matched.
+        if range.suffixes.is_empty() {
+            failures.push(format!("{prefix}: empty response"));
+            continue;
+        }
+        ranges.push(range);
     }
 
     let report = match session::ask(&Request::BreachMatch { ranges })? {
@@ -1030,7 +1060,7 @@ fn cmd_breach(online: bool, json: bool) -> Result<()> {
         println!(
             "checked {} password field(s) against {} bucket(s); {} exposed{}",
             report.checked,
-            prefixes.len() - failures.len(),
+            real.len(),
             report.exposed.len(),
             if report.unchecked > 0 {
                 format!("; {} not checked (fetch failed)", report.unchecked)

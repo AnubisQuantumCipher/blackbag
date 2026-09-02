@@ -18,11 +18,22 @@
 //!   in is remembered for the rest of the session so the hygiene report can
 //!   carry it, and forgotten on lock.
 //!
-//! The service sees: your IP address, the moment you asked, and up to one
-//! five-character prefix per distinct password. It does not see which password
-//! you hold, whether it matched, or how many you have — the prefixes are
-//! deduplicated before they are sent, and the caller asks for padded
-//! responses so bucket sizes carry no information either.
+//! Precisely what the service — and anyone counting TLS connections on the
+//! path — can observe:
+//!
+//! * your IP address and the moment you asked;
+//! * one five-character prefix per request, each naming a bucket of roughly a
+//!   thousand real leaked hashes;
+//! * the `User-Agent`, which is `black-bag/<version>`;
+//! * the *number* of requests, which is the number of distinct passwords in
+//!   the vault **rounded up to a multiple of [`PAD_TO`]**. The request list is
+//!   padded with random decoy prefixes and shuffled before it is sent, so the
+//!   count is coarse and the order carries nothing. Without that padding a
+//!   run revealed the exact number of distinct passwords, and two runs from
+//!   the same address revealed that one had changed.
+//!
+//! It does not see which password you hold, whether anything matched, or
+//! which of the prefixes were real.
 //!
 //! What this cannot tell you: a password absent from the corpus is not a
 //! password nobody has leaked, only one Pwned Passwords has not seen.
@@ -44,6 +55,10 @@ pub const RANGE_URL: &str = "https://api.pwnedpasswords.com/range/";
 
 /// The part of the SHA-1 that leaves the agent.
 pub const PREFIX_LEN: usize = 5;
+
+/// Requests are padded up to a multiple of this, so the number of them says
+/// only roughly how many distinct passwords the vault holds.
+pub const PAD_TO: usize = 8;
 
 /// A field the agent is willing to check, identified without its value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,8 +141,8 @@ pub fn candidates(records: &[Record]) -> Vec<Candidate> {
     out
 }
 
-/// The distinct prefixes a caller has to fetch — deduplicated, sorted, so
-/// the request pattern says nothing about how many records share a value.
+/// The distinct prefixes a caller has to fetch — deduplicated and sorted, so
+/// two records sharing a value produce one request rather than two.
 pub fn distinct_prefixes(candidates: &[Candidate]) -> Vec<String> {
     candidates
         .iter()
@@ -135,6 +150,38 @@ pub fn distinct_prefixes(candidates: &[Candidate]) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// The list actually sent: the real prefixes plus random decoys, padded up to
+/// a multiple of [`PAD_TO`] and shuffled.
+///
+/// A bucket the agent did not ask about is simply never consulted, so a decoy
+/// costs one request and changes no result. What it buys is that the number
+/// of requests no longer counts the vault's distinct passwords exactly, and
+/// their order no longer sorts them.
+pub fn padded_prefixes(real: &[String]) -> Vec<String> {
+    use rand::seq::SliceRandom;
+    use rand::Rng;
+
+    let mut rng = rand::rngs::OsRng;
+    let mut out: Vec<String> = real.to_vec();
+    let target = real.len().div_ceil(PAD_TO).max(1) * PAD_TO;
+    let existing: BTreeSet<&String> = real.iter().collect();
+    while out.len() < target {
+        let decoy: String = (0..PREFIX_LEN)
+            .map(|_| {
+                let n: u8 = rng.gen_range(0..16);
+                char::from_digit(u32::from(n), 16)
+                    .unwrap_or('0')
+                    .to_ascii_uppercase()
+            })
+            .collect();
+        if !existing.contains(&decoy) && !out[real.len()..].contains(&decoy) {
+            out.push(decoy);
+        }
+    }
+    out.shuffle(&mut rng);
+    out
 }
 
 /// Parse one bucket body — lines of `SUFFIX:COUNT` — dropping padding.
@@ -258,6 +305,37 @@ mod tests {
         let mut sorted = prefixes.clone();
         sorted.sort();
         assert_eq!(prefixes, sorted);
+    }
+
+    /// The request list must not count the vault's passwords exactly.
+    #[test]
+    fn requests_are_padded_to_a_multiple_and_shuffled() {
+        for real_count in [0usize, 1, 3, 8, 9, 17] {
+            let real: Vec<String> = (0..real_count).map(|i| format!("{i:05X}")).collect();
+            let sent = padded_prefixes(&real);
+
+            assert_eq!(sent.len() % PAD_TO, 0, "{real_count} real prefixes were not padded");
+            assert!(sent.len() >= real_count);
+            assert!(
+                sent.len() < real_count + PAD_TO + 1,
+                "padding should be minimal, not unbounded"
+            );
+            for prefix in &real {
+                assert!(sent.contains(prefix), "a real prefix was dropped by padding");
+            }
+            for prefix in &sent {
+                assert_eq!(prefix.len(), PREFIX_LEN);
+                assert!(prefix.bytes().all(|b| b.is_ascii_hexdigit()));
+            }
+            let unique: BTreeSet<&String> = sent.iter().collect();
+            assert_eq!(unique.len(), sent.len(), "a decoy duplicated a prefix");
+        }
+
+        // Decoys are random, so two runs of the same vault do not look alike.
+        let real: Vec<String> = (0..9).map(|i| format!("{i:05X}")).collect();
+        let a = padded_prefixes(&real);
+        let b = padded_prefixes(&real);
+        assert_ne!(a, b, "the padded list must not be reproducible across runs");
     }
 
     #[test]

@@ -6,9 +6,17 @@
 //! actually write, parsed by hand, with the mapping to Black-Bag's kinds
 //! stated in one table per format so it can be read and argued with.
 //!
-//! Nothing here touches the network. Every parser reads a file the user
-//! named on the command line; secrets inside it are handed to `Record`s and
-//! then to the engine, and the input buffer is wiped on the way out.
+//! Nothing here touches the network. Every parser reads a file the user named
+//! on the command line.
+//!
+//! Be clear about what that costs. The caller's input buffer is `Zeroizing`
+//! and the `Record`s these parsers build hold their secrets in the arena —
+//! but between those two points every value passes through ordinary `String`s
+//! belonging to `serde_json` and to the CSV reader, and those are freed
+//! without being wiped. An import is a bulk plaintext operation over a
+//! plaintext file that was already sitting on the disk; treating its
+//! intermediates as though they were vault secrets would be theatre. Delete
+//! the export when you are done, which is what the command tells you to do.
 //!
 //! Supported inputs:
 //!
@@ -196,7 +204,37 @@ fn header_and_rows(text: &str) -> Result<(Vec<String>, Vec<Vec<String>>)> {
         bail!("the file has no rows");
     }
     let header = rows.remove(0);
+    // An interior blank line parses as a one-cell row and used to import as
+    // an untitled record with no fields. A row with nothing in it is not a
+    // record in any format.
+    rows.retain(|r| r.iter().any(|c| !c.trim().is_empty()));
     Ok((header, rows))
+}
+
+/// Refuse a file whose header names none of the columns this format needs,
+/// rather than importing every row as an untitled record with the password
+/// sitting in a plain attribute.
+fn require_columns(header: &[String], wanted: &[&[&str]], format: &str) -> Result<()> {
+    let present = |names: &[&str]| {
+        names.iter().any(|n| {
+            header
+                .iter()
+                .any(|h| h.trim().eq_ignore_ascii_case(n))
+        })
+    };
+    if wanted.iter().any(|names| present(names)) {
+        return Ok(());
+    }
+    bail!(
+        "this does not look like a {format} export: its header names none of the \
+         columns one has ({})",
+        wanted
+            .iter()
+            .flat_map(|n| n.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 // ── record building ─────────────────────────────────────────────────────────
@@ -268,21 +306,73 @@ fn primary_field_for(kind: Kind) -> &'static str {
     }
 }
 
-/// Pull a trailing `kind: xxx` line out of a Notes column, returning the
-/// kind and the notes without that line.
-fn split_kind_hint(notes: &str) -> (Option<Kind>, String) {
-    let mut kind = None;
-    let mut kept = Vec::new();
-    for line in notes.lines() {
+/// Marks the block this exporter appends to a Notes column. Anything after
+/// it is ours; anything before it is the user's.
+pub const META_MARKER: &str = "[black-bag]";
+
+/// What our own export stashed in a Notes column.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NoteMeta {
+    kind: Option<Kind>,
+    attributes: Vec<(String, String)>,
+    secrets: Vec<(String, String)>,
+}
+
+/// Split a Notes column into the user's notes and whatever our exporter put
+/// after the marker. A column with no marker is all notes, which is what
+/// every other tool's export looks like.
+fn split_meta(notes: &str) -> (NoteMeta, String) {
+    let Some(at) = notes.find(META_MARKER) else {
+        return (NoteMeta::default(), notes.to_string());
+    };
+    let (head, tail) = notes.split_at(at);
+    let mut meta = NoteMeta::default();
+    for line in tail.lines().skip(1) {
+        let line = line.trim_end();
         if let Some(rest) = line.strip_prefix("kind: ") {
-            if let Ok(k) = rest.trim().parse::<Kind>() {
-                kind = Some(k);
-                continue;
+            meta.kind = rest.trim().parse::<Kind>().ok();
+        } else if let Some(rest) = line.strip_prefix("attr ") {
+            if let Some((k, v)) = rest.split_once(": ") {
+                meta.attributes.push((k.to_string(), v.to_string()));
+            }
+        } else if let Some(rest) = line.strip_prefix("secret ") {
+            if let Some((k, v)) = rest.split_once(": ") {
+                meta.secrets.push((k.to_string(), v.to_string()));
             }
         }
-        kept.push(line);
     }
-    (kind, kept.join("\n"))
+    (meta, head.trim_end().to_string())
+}
+
+/// Cells a spreadsheet would treat as a formula rather than as text.
+///
+/// A plaintext CSV is exactly the file someone opens in a spreadsheet "just
+/// to check it", and a title of `=cmd|' /C calc'!A0` is a live payload there.
+/// Quoting does not help — Excel and LibreOffice parse the formula either
+/// way — so the leading character is escaped with the conventional
+/// apostrophe, and [`undefang`] takes it off again on the way in.
+fn defang(value: &str) -> String {
+    match value.chars().next() {
+        Some('=') | Some('+') | Some('-') | Some('@') | Some('\t') | Some('\r') => {
+            format!("'{value}")
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// Reverse [`defang`]. Unambiguous: the apostrophe is only removed when what
+/// follows it is itself dangerous, so a value that genuinely begins with one
+/// survives untouched.
+fn undefang(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix('\'') {
+        if matches!(
+            rest.chars().next(),
+            Some('=') | Some('+') | Some('-') | Some('@') | Some('\t') | Some('\r')
+        ) {
+            return rest.to_string();
+        }
+    }
+    value.to_string()
 }
 
 fn host_of(url: &str) -> Option<String> {
@@ -422,7 +512,23 @@ fn bitwarden(text: &str) -> Result<Imported> {
                 if fname.trim().is_empty() {
                     continue;
                 }
-                let key = fname.trim().to_ascii_lowercase().replace(' ', "_");
+                let mut key = fname.trim().to_ascii_lowercase().replace(' ', "_");
+                // A custom field may not overwrite what the item's own type
+                // already put there. Bitwarden happily holds a custom field
+                // called "password" beside a login password, and a text one
+                // called "totp" would have replaced decoded secret bytes with
+                // its own literal text.
+                let collides = key == "totp"
+                    || record.field(&key).is_some()
+                    || record.attribute(&key).is_some();
+                if collides {
+                    let renamed = format!("custom_{key}");
+                    out.skipped.push(format!(
+                        "item {n} ({name}): custom field '{fname}' renamed to '{renamed}'; it \
+                         collides with a field this item type already defines"
+                    ));
+                    key = renamed;
+                }
                 match f.get("type").and_then(|t| t.as_u64()) {
                     Some(1) => set_secret_if(&mut record, &key, &fvalue),
                     _ => set_attr_if(&mut record, &key, &fvalue),
@@ -450,39 +556,50 @@ fn bitwarden(text: &str) -> Result<Imported> {
 /// Last Modified, Created.
 fn keepassxc(text: &str) -> Result<Imported> {
     let (header, rows) = header_and_rows(text)?;
+    require_columns(&header, &[&["Title"], &["Password"]], "KeePassXC")?;
     let mut out = Imported::default();
     for (n, cells) in rows.iter().enumerate() {
         let row = Row {
             header: &header,
             cells,
         };
-        let title = row.get("Title");
-        let username = row.get("Username");
+        let title = undefang(row.get("Title"));
+        let username = undefang(row.get("Username"));
         let password = row.get("Password");
-        let url = row.get("URL");
-        let notes = row.get("Notes");
+        let url = undefang(row.get("URL"));
+        let notes = undefang(row.get("Notes"));
         let group = row.get("Group");
-        // Our own export writes non-login kinds into Notes as a "kind: …"
-        // line, so a Black-Bag → KeePassXC → Black-Bag round trip keeps the
-        // kind rather than flattening everything into logins.
-        let (kind_hint, notes) = split_kind_hint(notes);
-        let mut record = match kind_hint {
+        let (title, username, url) = (title.as_str(), username.as_str(), url.as_str());
+        // Our own export appends a marked block to Notes, so a Black-Bag →
+        // KeePassXC → Black-Bag round trip keeps the kind, every attribute
+        // and every extra secret field rather than flattening them away.
+        let (meta, notes) = split_meta(&notes);
+        let mut record = match meta.kind {
             Some(kind) if kind != Kind::Login => {
                 let mut r = Record::new(kind, Some(title.to_string()));
                 set_attr_if(&mut r, "username", username);
                 set_attr_if(&mut r, "url", url);
-                let primary = primary_field_for(kind);
-                set_secret_if(&mut r, primary, password);
+                set_secret_if(&mut r, primary_field_for(kind), password);
                 set_notes_if(&mut r, &notes);
                 r
             }
-            _ if username.is_empty() && password.is_empty() && url.is_empty() => {
+            _ if username.is_empty()
+                && password.is_empty()
+                && url.is_empty()
+                && meta.secrets.is_empty() =>
+            {
                 let mut r = Record::new(Kind::Note, Some(title.to_string()));
                 set_secret_if(&mut r, "body", &notes);
                 r
             }
             _ => login(title, username, password, url, &notes),
         };
+        for (k, v) in &meta.attributes {
+            set_attr_if(&mut record, k, v);
+        }
+        for (k, v) in &meta.secrets {
+            set_secret_if(&mut record, k, v);
+        }
         for part in group.split('/') {
             let tag = part.trim();
             if !tag.is_empty() && tag != "Root" {
@@ -505,6 +622,7 @@ fn keepassxc(text: &str) -> Result<Imported> {
 /// formActionOrigin, guid, timeCreated, timeLastUsed, timePasswordChanged.
 fn firefox(text: &str) -> Result<Imported> {
     let (header, rows) = header_and_rows(text)?;
+    require_columns(&header, &[&["url"], &["password"]], "Firefox")?;
     let mut out = Imported::default();
     for (n, cells) in rows.iter().enumerate() {
         let row = Row {
@@ -525,6 +643,7 @@ fn firefox(text: &str) -> Result<Imported> {
 /// Chrome/Chromium/Brave: name, url, username, password, note.
 fn chrome(text: &str) -> Result<Imported> {
     let (header, rows) = header_and_rows(text)?;
+    require_columns(&header, &[&["name"], &["url"], &["password"]], "Chrome")?;
     let mut out = Imported::default();
     for (n, cells) in rows.iter().enumerate() {
         let row = Row {
@@ -558,6 +677,7 @@ fn generic_csv(text: &str) -> Result<Imported> {
     const NOTES: &[&str] = &["notes", "note", "comment", "extra"];
     const TOTP: &[&str] = &["totp", "otp", "otpauth", "2fa"];
     let known: Vec<&str> = [TITLE, USER, PASS, URL, NOTES, TOTP].concat();
+    require_columns(&header, &[TITLE, USER, PASS], "CSV")?;
 
     let mut out = Imported::default();
     for (n, cells) in rows.iter().enumerate() {
@@ -609,15 +729,20 @@ fn render_json(records: &[Record]) -> Result<Zeroizing<String>> {
     for r in records {
         let mut secrets = serde_json::Map::new();
         for f in &r.fields {
-            let value = f
-                .secret
-                .expose_str()
-                .map(|s| serde_json::Value::String(s.to_string()))
-                .unwrap_or_else(|_| {
-                    serde_json::Value::String(
-                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, f.secret.open().as_slice()),
-                    )
-                });
+            // A secret that is not UTF-8 — a raw TOTP seed, a binary key —
+            // is base64, and says so. An untagged fallback was
+            // indistinguishable from a value that merely looked like base64,
+            // so nothing could import this file back without guessing.
+            let value = match f.secret.expose_str() {
+                Ok(text) => serde_json::json!({ "encoding": "utf8", "value": text.to_string() }),
+                Err(_) => serde_json::json!({
+                    "encoding": "base64",
+                    "value": base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        f.secret.open().as_slice(),
+                    ),
+                }),
+            };
             secrets.insert(f.name.clone(), value);
         }
         let notes = r
@@ -665,35 +790,47 @@ fn render_keepassxc(records: &[Record]) -> Result<Zeroizing<String>> {
             .or_else(|| r.attribute("account"))
             .unwrap_or("")
             .to_string();
-        let primary = ["password", "passphrase", "secret_key", "private_key", "seed",
-                       "account_number", "number", "body", "notes", "payload"]
-            .iter()
-            .find_map(|name| r.field(name).map(|s| (name, s)));
+        // The same field the importer will read back out of this column. A
+        // global preference list stood here and disagreed with the importer's
+        // per-kind choice, so an SSH key carrying both a `passphrase` and a
+        // `private_key` came back with the passphrase in the key field and
+        // the key demoted to a note.
+        let primary_name = primary_field_for(r.kind);
+        let primary = r
+            .field(primary_name)
+            .map(|s| (primary_name, s))
+            .or_else(|| r.fields.first().map(|f| (f.name.as_str(), &f.secret)));
         let password = primary
             .and_then(|(_, s)| s.expose_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_default();
         let url = r.attribute("url").unwrap_or("").to_string();
-        // Everything that does not fit a column goes into Notes as k=v
-        // lines, so nothing is silently dropped on the way out.
+        // The user's own notes first, then everything with no column of its
+        // own, in a block we can read back exactly. Marking the block is what
+        // lets an attribute and a second secret be told apart on the way in,
+        // which a bare `name: value` line could not manage.
         let mut notes = Vec::new();
         if let Some(n) = r.notes.as_ref().and_then(|n| n.expose_str().ok()) {
             notes.push(n.to_string());
         }
+        let mut meta = Vec::new();
+        if r.kind != Kind::Login {
+            meta.push(format!("kind: {}", r.kind.as_str()));
+        }
         for (k, v) in &r.attributes {
             if k != "username" && k != "url" && k != "account" {
-                notes.push(format!("{k}: {v}"));
+                meta.push(format!("attr {k}: {v}"));
             }
         }
         for f in &r.fields {
-            if Some(f.name.as_str()) != primary.map(|(n, _)| *n) && f.name != "totp" {
+            if Some(f.name.as_str()) != primary.map(|(n, _)| n) && f.name != "totp" {
                 if let Ok(v) = f.secret.expose_str() {
-                    notes.push(format!("{}: {}", f.name, *v));
+                    meta.push(format!("secret {}: {}", f.name, *v));
                 }
             }
         }
-        if r.kind != Kind::Login {
-            notes.push(format!("kind: {}", r.kind.as_str()));
+        if !meta.is_empty() {
+            notes.push(format!("{}\n{}", META_MARKER, meta.join("\n")));
         }
         let totp = match (&r.totp, r.field("totp")) {
             (Some(cfg), Some(secret)) => {
@@ -717,13 +854,17 @@ fn render_keepassxc(records: &[Record]) -> Result<Zeroizing<String>> {
             }
             _ => String::new(),
         };
+        // Only the columns a spreadsheet would evaluate are defanged. The
+        // Password column is left exactly as stored: a leading apostrophe
+        // there would become part of the secret to any importer, ours
+        // included.
         let line = [
-            group,
-            title,
-            username,
+            defang(&group),
+            defang(&title),
+            defang(&username),
             password,
-            url,
-            notes.join("\n"),
+            defang(&url),
+            defang(&notes.join("\n")),
             totp,
             "0".to_string(),
             r.updated_at.to_rfc3339(),
@@ -895,9 +1036,110 @@ mod tests {
         assert_eq!(back.records.len(), 2, "{:?}", back.skipped);
         assert_eq!(back.records[0].kind, Kind::Api);
         assert_eq!(back.records[0].field("secret_key").unwrap().expose_str().unwrap().as_str(), "AKIA");
-        assert_eq!(back.records[0].notes.as_ref().unwrap().expose_str().unwrap().as_str(), "service: aws");
+        // The attribute travels in the marked block, not smuggled into notes.
+        assert_eq!(back.records[0].attribute("service"), Some("aws"));
+        assert!(back.records[0].notes.is_none(), "the metadata block is not left in the notes");
         assert_eq!(back.records[1].kind, Kind::Note);
         assert_eq!(back.records[1].field("body").unwrap().expose_str().unwrap().as_str(), "line one\nline two");
+    }
+
+    /// The shape the review found broken: an SSH key carrying both a
+    /// private key and its passphrase came back with the passphrase in the
+    /// key field and the key demoted to a note.
+    #[test]
+    fn a_record_with_two_secrets_survives_the_keepassxc_round_trip() {
+        let mut ssh = Record::new(Kind::Ssh, Some("build box".into()));
+        ssh.set_attribute("label", "ci");
+        ssh.set_attribute("comment", "rotate yearly");
+        ssh.set_field("private_key", Secret::from_str("-----BEGIN KEY-----\nabc\n"));
+        ssh.set_field("passphrase", Secret::from_str("unlock me"));
+        ssh.notes = Some(Secret::from_str("kept in the safe"));
+        ssh.tags = vec!["infra".into()];
+
+        let csv = render(&[ssh], ExportFormat::Keepassxc).unwrap();
+        let back = parse(ImportFormat::Keepassxc, &csv).unwrap();
+        assert_eq!(back.records.len(), 1, "{:?}", back.skipped);
+        let r = &back.records[0];
+
+        assert_eq!(r.kind, Kind::Ssh);
+        assert_eq!(r.title.as_deref(), Some("build box"));
+        assert_eq!(
+            r.field("private_key").unwrap().expose_str().unwrap().as_str(),
+            "-----BEGIN KEY-----\nabc\n",
+            "the key must come back as the key"
+        );
+        assert_eq!(
+            r.field("passphrase").unwrap().expose_str().unwrap().as_str(),
+            "unlock me",
+            "and the passphrase as the passphrase"
+        );
+        assert_eq!(r.attribute("label"), Some("ci"));
+        assert_eq!(r.attribute("comment"), Some("rotate yearly"));
+        assert_eq!(r.notes.as_ref().unwrap().expose_str().unwrap().as_str(), "kept in the safe");
+        assert_eq!(r.tags, vec!["infra"]);
+    }
+
+    /// A title that is a spreadsheet formula must not come out of the export
+    /// as one, and must come back in unchanged.
+    #[test]
+    fn formula_shaped_cells_are_defanged_on_the_way_out_and_restored_on_the_way_in() {
+        for hostile in ["=cmd|' /C calc'!A0", "+1+1", "-2+3", "@SUM(A1)"] {
+            let mut r = Record::new(Kind::Login, Some(hostile.into()));
+            r.set_attribute("username", hostile);
+            r.set_field("password", Secret::from_str(hostile));
+
+            let csv = render(&[r], ExportFormat::Keepassxc).unwrap();
+            let title_cell = csv.lines().nth(1).unwrap();
+            assert!(
+                title_cell.contains(&format!("'{hostile}")),
+                "the title column was not defanged: {title_cell}"
+            );
+
+            let back = parse(ImportFormat::Keepassxc, &csv).unwrap();
+            let r = &back.records[0];
+            assert_eq!(r.title.as_deref(), Some(hostile), "defang must be reversible");
+            assert_eq!(r.attribute("username"), Some(hostile));
+            // The password column is never defanged: an apostrophe there
+            // would become part of the secret.
+            assert_eq!(
+                r.field("password").unwrap().expose_str().unwrap().as_str(),
+                hostile
+            );
+        }
+
+        // A value that genuinely starts with an apostrophe is left alone.
+        assert_eq!(undefang("'tis"), "'tis");
+        assert_eq!(undefang("'=1"), "=1");
+        assert_eq!(defang("safe"), "safe");
+    }
+
+    /// A Bitwarden custom field may not quietly replace the item's own.
+    #[test]
+    fn a_colliding_custom_field_is_renamed_and_reported() {
+        let text = r#"{
+          "encrypted": false,
+          "items": [
+            {"type": 1, "name": "GitHub",
+             "login": {"username": "octocat", "password": "real-password", "totp": "JBSWY3DPEHPK3PXP"},
+             "fields": [
+               {"name": "password", "value": "decoy", "type": 1},
+               {"name": "TOTP", "value": "not-a-secret", "type": 0},
+               {"name": "username", "value": "decoy-user", "type": 0}
+             ]}
+          ]}"#;
+        let imported = parse(ImportFormat::Bitwarden, text).unwrap();
+        let r = &imported.records[0];
+        assert_eq!(
+            r.field("password").unwrap().expose_str().unwrap().as_str(),
+            "real-password",
+            "the login password was overwritten by a custom field"
+        );
+        assert_eq!(r.attribute("username"), Some("octocat"));
+        assert!(r.totp.is_some(), "the decoded TOTP config survived");
+        assert_eq!(r.field("custom_password").unwrap().expose_str().unwrap().as_str(), "decoy");
+        assert_eq!(r.attribute("custom_username"), Some("decoy-user"));
+        assert_eq!(r.attribute("custom_totp"), Some("not-a-secret"));
+        assert_eq!(imported.skipped.len(), 3, "each collision is reported: {:?}", imported.skipped);
     }
 
     #[test]
@@ -909,9 +1151,33 @@ mod tests {
         let json = render(&[r], ExportFormat::Json).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(doc["plaintext"], true);
-        assert_eq!(doc["records"][0]["secrets"]["secret_key"], "AKIA...");
+        assert_eq!(doc["records"][0]["secrets"]["secret_key"]["value"], "AKIA...");
+        assert_eq!(doc["records"][0]["secrets"]["secret_key"]["encoding"], "utf8");
         assert_eq!(doc["records"][0]["notes"], "rotate quarterly");
         assert_eq!(doc["records"][0]["attributes"]["service"], "aws");
+    }
+
+    /// Junk in must not become records out.
+    #[test]
+    fn blank_rows_are_dropped_and_an_unrecognisable_header_is_refused() {
+        let with_blanks = "name,url,username,password,note\n\
+                           Example,https://e.com,bob,pw,\n\
+                           \n\
+                           \n\
+                           Other,https://o.com,ann,pw2,\n";
+        let imported = parse(ImportFormat::Chrome, with_blanks).unwrap();
+        assert_eq!(imported.records.len(), 2, "blank lines became records");
+
+        // A header that names none of the columns the format has is a file
+        // this parser has no business guessing at.
+        let wrong = "alpha,beta,gamma\n1,2,3\n";
+        let err = parse(ImportFormat::Chrome, wrong).unwrap_err().to_string();
+        assert!(err.contains("does not look like a Chrome export"), "{err}");
+        assert!(parse(ImportFormat::Csv, wrong).is_err());
+        assert!(parse(ImportFormat::Keepassxc, wrong).is_err());
+
+        // And a real header still works.
+        assert!(parse(ImportFormat::Csv, "Site,Login,Pass\nA,b,c\n").is_ok());
     }
 
     #[test]
