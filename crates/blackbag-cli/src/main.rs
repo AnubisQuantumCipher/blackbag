@@ -300,6 +300,20 @@ enum AgentCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Check passwords against Have I Been Pwned's Pwned Passwords corpus.
+    ///
+    /// The one command in this program that talks to the network, and it
+    /// needs `--online` to say so. What leaves the machine: the first five
+    /// hex characters of each distinct password's SHA-1 (k-anonymity), sent
+    /// by curl. The agent does the matching against the full hash it never
+    /// disclosed, and remembers exposures for the hygiene report until lock.
+    Breach {
+        /// Consent to the network requests described above.
+        #[arg(long)]
+        online: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args)]
@@ -875,6 +889,8 @@ fn cmd_agent(
             }
         }
 
+        AgentCommand::Breach { online, json } => cmd_breach(online, json),
+
         AgentCommand::Totp {
             id,
             sink,
@@ -902,6 +918,119 @@ fn cmd_agent(
             }
         }
     }
+}
+
+/// The breach check. Three round trips: prefixes out of the agent, buckets in
+/// from the service through curl, buckets into the agent for matching.
+fn cmd_breach(online: bool, json: bool) -> Result<()> {
+    use blackbag_core::breach;
+
+    if !online {
+        eprintln!(
+            "black-bag agent breach sends the first {} hex characters of the SHA-1 of each \
+             distinct password to {} (Have I Been Pwned, k-anonymity). The service cannot learn \
+             which password you hold, whether it matched, or how many you have. Nothing else \
+             leaves the machine, and the full hash never leaves the agent.\n\n\
+             Re-run with --online to consent.",
+            breach::PREFIX_LEN,
+            breach::RANGE_URL
+        );
+        std::process::exit(2);
+    }
+    if which("curl").is_none() {
+        bail!("curl is required for the breach check and was not found on PATH");
+    }
+
+    let candidates = match session::ask(&Request::BreachPrefixes)? {
+        Response::BreachPrefixes { candidates } => candidates,
+        Response::Error { message } => bail!("{message}"),
+        _ => bail!("unexpected reply"),
+    };
+    let prefixes = breach::distinct_prefixes(&candidates);
+    if prefixes.is_empty() {
+        if json {
+            println!("{}", serde_json::to_string(&breach::Report::default())?);
+        } else {
+            println!("no password fields to check");
+        }
+        return Ok(());
+    }
+
+    let mut ranges = Vec::with_capacity(prefixes.len());
+    let mut failures = Vec::new();
+    for prefix in &prefixes {
+        let url = format!("{}{}", breach::RANGE_URL, prefix);
+        let output = std::process::Command::new("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                "20",
+                "--header",
+                "Add-Padding: true",
+                "--user-agent",
+                concat!("black-bag/", env!("CARGO_PKG_VERSION")),
+                &url,
+            ])
+            .output()
+            .context("failed to run curl")?;
+        if !output.status.success() {
+            failures.push(format!(
+                "{prefix}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+            continue;
+        }
+        let body = String::from_utf8_lossy(&output.stdout);
+        ranges.push(breach::parse_range(prefix, &body));
+    }
+
+    let report = match session::ask(&Request::BreachMatch { ranges })? {
+        Response::Breach(report) => report,
+        Response::Error { message } => bail!("{message}"),
+        _ => bail!("unexpected reply"),
+    };
+
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!(
+            "checked {} password field(s) against {} bucket(s); {} exposed{}",
+            report.checked,
+            prefixes.len() - failures.len(),
+            report.exposed.len(),
+            if report.unchecked > 0 {
+                format!("; {} not checked (fetch failed)", report.unchecked)
+            } else {
+                String::new()
+            }
+        );
+        for exposure in &report.exposed {
+            println!(
+                "  {}  {:<28}  {} seen in {} breach(es)",
+                exposure.id,
+                exposure.title.as_deref().unwrap_or("(untitled)"),
+                exposure.field,
+                exposure.breaches
+            );
+        }
+    }
+    for failure in &failures {
+        eprintln!("fetch failed for prefix {failure}");
+    }
+    if !failures.is_empty() && report.exposed.is_empty() {
+        bail!("some buckets could not be fetched; the result is incomplete");
+    }
+    Ok(())
+}
+
+fn which(program: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 fn cmd_doctor(
@@ -964,6 +1093,10 @@ fn cmd_doctor(
         status.host.arena_locked_bytes / 1024,
         status.host.arena_unlocked_bytes / 1024,
         status.host.arena_failed_locks
+    );
+    println!(
+        "session key {}  (every resting secret is ciphertext under it)",
+        status.host.session_key_backing.as_deref().unwrap_or("unknown")
     );
     println!("coredump   pattern={}", status.host.core_pattern);
     println!(

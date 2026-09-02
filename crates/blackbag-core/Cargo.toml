@@ -37,6 +37,7 @@ rand_core.workspace = true
 fd-lock.workspace = true
 tempfile.workspace = true
 directories.workspace = true
+sha1 = "0.10"
 
 [dev-dependencies]
 proptest = "1"

@@ -53,6 +53,10 @@ pub struct HostPosture {
     pub arena_unlocked_bytes: u64,
     #[serde(default)]
     pub arena_failed_locks: u64,
+    /// Where the per-process session key lives: memfd_secret, locked-slab,
+    /// or unlocked. Every resting secret is ciphertext under this key.
+    #[serde(default)]
+    pub session_key_backing: Option<String>,
 }
 
 impl HostPosture {
@@ -75,6 +79,7 @@ impl HostPosture {
             arena_locked_bytes: crate::secmem::locked_bytes() as u64,
             arena_unlocked_bytes: crate::secmem::unlocked_bytes() as u64,
             arena_failed_locks: crate::secmem::failed_locks() as u64,
+            session_key_backing: Some(crate::secmem::session_key_backing().as_str().to_string()),
         }
     }
 
@@ -115,6 +120,13 @@ impl HostPosture {
                 "TRACED",
                 "A debugger is attached to this process",
                 "detach it before unlocking",
+            ));
+        }
+        if self.session_key_backing.as_deref() == Some("unlocked") {
+            out.push(Finding::warn(
+                "SESSION_KEY_UNLOCKED",
+                "The in-memory session key is in memory the kernel may swap",
+                "memfd_secret is unavailable and the arena could not lock a page",
             ));
         }
         if self.arena_unlocked_bytes > 0 {

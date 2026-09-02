@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::secmem::SecretBuf;
+use crate::secmem::{Guarded, KeyBacking, SecretBuf};
 
 /// Per-field caps, restored from black-bagg 0.2.x. Enforced on the way in *and*
 /// on the way out, so a hostile vault file cannot blow memory during decode.
@@ -17,24 +17,27 @@ pub const MAX_TAGS_PER_RECORD: usize = 64;
 pub const MAX_TAG_LEN: usize = 128;
 pub const MAX_TITLE_LEN: usize = 256;
 
-/// A secret byte string, carved out of the locked arena and wiped when it dies.
+/// A secret byte string: ciphertext while it rests, plaintext only in a
+/// locked buffer while it is used.
 ///
-/// Storage is a [`SecretBuf`], so the bytes live in pages that this process
-/// mapped and locked itself and that no ordinary allocation shares. The
-/// previous design locked each `Vec` separately and lost the lock whenever a
-/// neighbouring secret on the same page was dropped — see `secmem.rs`.
+/// Storage is a [`Guarded`] — sealed under the per-process session key that
+/// lives in kernel-invisible memory. [`Secret::open`] hands back the plaintext
+/// in a [`SecretBuf`] from the locked arena, wiped when the caller drops it.
+/// See `secmem.rs` for the design and what it does and does not buy.
 ///
-/// Serialised as a map with one `data` entry, exactly as the `Vec<u8>` design
-/// was, so vault format v2 is unchanged.
+/// Serialised as a map with one `data` entry holding the plaintext bytes,
+/// exactly as the original `Vec<u8>` design was, so vault format v2 is
+/// unchanged and the only place the plaintext is ever serialised is into a
+/// payload that is itself about to be encrypted.
 #[derive(Serialize, Deserialize)]
 pub struct Secret {
-    data: SecretBuf,
+    data: Guarded,
 }
 
 impl Secret {
     pub fn new(bytes: &[u8]) -> Self {
         Self {
-            data: SecretBuf::new(bytes),
+            data: Guarded::new(bytes),
         }
     }
 
@@ -42,8 +45,10 @@ impl Secret {
         Self::new(s.as_bytes())
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        self.data.as_slice()
+    /// The plaintext, decrypted into a locked buffer for as long as the
+    /// caller holds it. Hold it briefly.
+    pub fn open(&self) -> SecretBuf {
+        self.data.open()
     }
 
     pub fn len(&self) -> usize {
@@ -56,13 +61,15 @@ impl Secret {
 
     /// Interpret as UTF-8, into a string that is wiped when it is dropped.
     pub fn expose_str(&self) -> Result<Zeroizing<String>> {
-        Ok(self.data.to_zeroizing_string()?)
+        Ok(self.data.open().to_zeroizing_string()?)
     }
 
-    /// Whether the arena slab holding this secret is page-locked. False when
-    /// the kernel refused the lock, which `doctor` also reports.
+    /// Whether the plaintext exists anywhere but a locked buffer while this
+    /// secret rests. It does not: the resting form is ciphertext. Kept for
+    /// callers that ask the question, and answered from the thing that
+    /// actually matters — the home of the session key.
     pub fn is_locked(&self) -> bool {
-        self.data.is_locked()
+        !matches!(crate::secmem::session_key_backing(), KeyBacking::Unlocked)
     }
 
     /// A stable, non-reversible 8-hex-character handle, safe to show in a UI
@@ -71,7 +78,8 @@ impl Secret {
     pub fn handle(&self, domain: &str) -> String {
         let mut hasher = blake3::Hasher::new_derive_key("black-bag::v2::secret-handle");
         hasher.update(domain.as_bytes());
-        hasher.update(self.data.as_slice());
+        let opened = self.data.open();
+        hasher.update(opened.as_slice());
         hex::encode(&hasher.finalize().as_bytes()[..4])
     }
 }
@@ -85,7 +93,8 @@ impl Clone for Secret {
 }
 
 impl PartialEq for Secret {
-    /// Constant-time. Derived equality on secrets is a timing oracle.
+    /// Constant-time over the opened plaintexts. Derived equality on secrets
+    /// is a timing oracle.
     fn eq(&self, other: &Self) -> bool {
         self.data == other.data
     }

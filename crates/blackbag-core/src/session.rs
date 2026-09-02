@@ -124,6 +124,13 @@ pub enum Request {
     Hygiene,
     /// Current TOTP code and its remaining validity.
     TotpCode { id: String },
+    /// The five-character SHA-1 prefixes of every password-like field, so a
+    /// caller can fetch the matching Pwned Passwords buckets. The full hash
+    /// never leaves the agent.
+    BreachPrefixes,
+    /// Buckets fetched by the caller. The agent does the matching and keeps
+    /// the exposures for the rest of the session.
+    BreachMatch { ranges: Vec<crate::breach::Range> },
     /// Push the deadline out; called when the user interacts.
     Touch,
     /// Stop the agent.
@@ -144,6 +151,8 @@ pub enum Response {
     Totp { code: String, ttl_secs: u64, step: u64 },
     Saved { id: String },
     Hygiene(crate::hygiene::VaultReport),
+    BreachPrefixes { candidates: Vec<crate::breach::Candidate> },
+    Breach(crate::breach::Report),
     Ok,
     Error { message: String },
 }
@@ -358,7 +367,7 @@ impl RecordDraft {
                         .totp
                         .clone()
                         .unwrap_or_default();
-                    (record.field("totp").unwrap().as_bytes().to_vec(), existing)
+                    (record.field("totp").unwrap().open().to_vec(), existing)
                 } else {
                     bail!("a TOTP record needs a secret or an otpauth:// URI");
                 };
@@ -505,6 +514,8 @@ pub struct Agent {
 
 struct OpenVault {
     vault: Vault,
+    /// Results of a breach check run this session, folded into hygiene.
+    exposure: crate::breach::ExposureMap,
     /// Slides forward on every request, capped by `ceiling`.
     deadline: Instant,
     /// Fixed at unlock time. Activity does not move it.
@@ -728,6 +739,7 @@ impl Agent {
                     );
                 self.open = Some(OpenVault {
                     vault,
+                    exposure: crate::breach::ExposureMap::new(),
                     deadline: now + self.idle,
                     ceiling: now + self.max_session,
                     ceiling_wall,
@@ -844,8 +856,30 @@ impl Agent {
 
             Request::Hygiene => {
                 let open = self.opened()?;
-                let report = crate::hygiene::analyse(open.vault.records(), Utc::now());
+                let report = crate::hygiene::analyse_with_exposure(
+                    open.vault.records(),
+                    Utc::now(),
+                    crate::hygiene::Policy::default(),
+                    &open.exposure,
+                );
                 Ok(Response::Hygiene(report))
+            }
+
+            Request::BreachPrefixes => {
+                let open = self.opened()?;
+                Ok(Response::BreachPrefixes {
+                    candidates: crate::breach::candidates(open.vault.records()),
+                })
+            }
+
+            Request::BreachMatch { ranges } => {
+                let open = self.opened()?;
+                let (report, map) = crate::breach::match_ranges(open.vault.records(), &ranges);
+                // A fresh check replaces the previous one wholesale: a value
+                // that was exposed and has since been changed must not keep
+                // its old verdict.
+                open.exposure = map;
+                Ok(Response::Breach(report))
             }
 
             Request::Shutdown => {
@@ -1012,7 +1046,7 @@ pub fn totp_now(record: &Record) -> Result<(String, u64, u64)> {
         usize::from(config.digits),
         config.skew,
         config.step,
-        secret.as_bytes().to_vec(),
+        secret.open().to_vec(),
     )
     .map_err(|e| anyhow!("invalid TOTP configuration: {e}"))?;
     let code = totp.generate_current()?;
@@ -1172,6 +1206,10 @@ mod tests {
                 ttl_secs: 12,
                 step: 30,
             },
+            Response::BreachPrefixes {
+                candidates: Vec::new(),
+            },
+            Response::Breach(crate::breach::Report::default()),
             Response::Ok,
             Response::Error {
                 message: "nope".into(),

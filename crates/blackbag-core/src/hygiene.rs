@@ -198,12 +198,16 @@ pub enum Issue {
     /// trimming, and only within one kind: a `login` and a `totp` sharing a title
     /// are a deliberate pair, not a duplicate.
     DuplicateTitle { others: Vec<Uuid> },
+    /// The value appears in the Pwned Passwords corpus. Only present after the
+    /// user has run a breach check in this session — see `breach.rs` for what
+    /// leaves the machine, and how little.
+    Exposed { field: String, breaches: u64 },
 }
 
 impl Issue {
     pub fn severity(&self) -> Severity {
         match self {
-            Issue::Reused { .. } | Issue::WeakPin { .. } => Severity::High,
+            Issue::Reused { .. } | Issue::WeakPin { .. } | Issue::Exposed { .. } => Severity::High,
             Issue::Short { .. } => Severity::Medium,
             Issue::Stale { .. } | Issue::NoTotp | Issue::DuplicateTitle { .. } => Severity::Low,
         }
@@ -218,6 +222,7 @@ impl Issue {
             Issue::NoTotp => "NO_TOTP",
             Issue::WeakPin { .. } => "WEAK_PIN",
             Issue::DuplicateTitle { .. } => "DUPLICATE_TITLE",
+            Issue::Exposed { .. } => "EXPOSED",
         }
     }
 
@@ -254,6 +259,9 @@ impl Issue {
             Issue::DuplicateTitle { others } => format!(
                 "title is shared with {} other record(s) of the same kind",
                 others.len()
+            ),
+            Issue::Exposed { field, breaches } => format!(
+                "{field} appears {breaches} time(s) in known data breaches"
             ),
         }
     }
@@ -350,6 +358,18 @@ pub fn analyse(records: &[Record], now: DateTime<Utc>) -> VaultReport {
 
 /// [`analyse`] under a stated policy.
 pub fn analyse_with(records: &[Record], now: DateTime<Utc>, policy: Policy) -> VaultReport {
+    analyse_with_exposure(records, now, policy, &crate::breach::ExposureMap::new())
+}
+
+/// [`analyse_with`], folding in the results of a breach check the user ran
+/// earlier in this session. `exposure` maps `(record id, field name)` to the
+/// number of breaches the value appears in.
+pub fn analyse_with_exposure(
+    records: &[Record],
+    now: DateTime<Utc>,
+    policy: Policy,
+    exposure: &crate::breach::ExposureMap,
+) -> VaultReport {
     let per_record_handles = handles_per_record(records);
     let clusters = cluster_map(records, &per_record_handles);
     let titles = title_map(records);
@@ -377,7 +397,8 @@ pub fn analyse_with(records: &[Record], now: DateTime<Utc>, policy: Policy) -> V
         }
 
         for field in &record.fields {
-            let bytes = field.secret.as_bytes();
+            let opened = field.secret.open();
+            let bytes = opened.as_slice();
             match field_role(&field.name) {
                 FieldRole::Passphrase => {
                     if bytes.is_empty() {
@@ -444,6 +465,15 @@ pub fn analyse_with(records: &[Record], now: DateTime<Utc>, policy: Policy) -> V
                 if !others.is_empty() {
                     issues.push(Issue::DuplicateTitle { others });
                 }
+            }
+        }
+
+        for field in &record.fields {
+            if let Some(breaches) = exposure.get(&(record.id, field.name.clone())) {
+                issues.push(Issue::Exposed {
+                    field: field.name.clone(),
+                    breaches: *breaches,
+                });
             }
         }
 

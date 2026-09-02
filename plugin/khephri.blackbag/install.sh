@@ -102,12 +102,28 @@ ProtectHome=read-only
 ReadWritePaths=-%h/.local/share/black-bag -%h/.local/state/black-bag -%t/black-bag
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateDevices=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
+RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
 SystemCallArchitectures=native
+# The agent speaks to the deck over its socket and to logind over D-Bus, and
+# to nothing else. Without AF_INET/AF_INET6 there is no network path, however
+# the binary is compromised; the breach check runs in the CLI, not here.
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+# The syscall allow-list a service needs, which includes the memlock group.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 # Core dumps would defeat the point of locking pages.
 LimitCORE=0
 

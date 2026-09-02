@@ -36,7 +36,7 @@ use crate::crypto::{
     MAX_VAULT_FILE_BYTES,
 };
 use crate::record::{Kind, Record, MAX_NOTE_BYTES, MAX_RECORDS};
-use crate::secmem::SecretBuf;
+use crate::secmem::{Guarded, SecretBuf};
 
 pub const VAULT_VERSION: u32 = 2;
 
@@ -206,12 +206,13 @@ pub enum UnlockMethod {
     RecoveryKey,
 }
 
-/// An open vault. The DEK lives in the locked arena and is wiped on drop.
+/// An open vault. The DEK rests sealed under the session key and is opened
+/// into locked memory only for the duration of a save, refresh or rekey.
 pub struct Vault {
     pub path: PathBuf,
     pub file: VaultFile,
     pub payload: Payload,
-    dek: SecretBuf,
+    dek: Guarded,
     pub unlocked_by: UnlockMethod,
     /// Set when the stored epoch was behind the witness — a possible rollback.
     pub rollback_suspected: bool,
@@ -354,16 +355,18 @@ impl Vault {
         if dek_bytes.len() != 32 {
             bail!("unlock failed");
         }
-        let dek = SecretBuf::new(dek_bytes);
+        let dek = Guarded::new(dek_bytes);
 
         // Header authentication. A mismatch means the header was edited after
         // it was written, so we refuse rather than decrypt under it.
-        let expected = crypto::header_mac(dek.as_ref(), &file.header.mac_input(&file.payload));
-        if !crypto::mac_matches(&expected, &file.header.mac) {
-            bail!("vault header failed authentication (tampering or corruption)");
-        }
-
-        let payload = open_payload(dek.as_ref(), &file.payload)?;
+        let payload = {
+            let key = dek.open();
+            let expected = crypto::header_mac(key.as_ref(), &file.header.mac_input(&file.payload));
+            if !crypto::mac_matches(&expected, &file.header.mac) {
+                bail!("vault header failed authentication (tampering or corruption)");
+            }
+            open_payload(key.as_ref(), &file.payload)?
+        };
 
         let rollback_suspected = Witness::check(path, file.header.vault_id, file.header.epoch)?;
 
@@ -393,9 +396,12 @@ impl Vault {
         }
         self.file.header.epoch = self.file.header.epoch.saturating_add(1);
         self.file.header.updated_at = Utc::now();
-        self.file.payload = seal_payload(self.dek.as_ref(), &self.payload)?;
-        self.file.header.mac =
-            crypto::header_mac(self.dek.as_ref(), &self.file.header.mac_input(&self.file.payload));
+        {
+            let key = self.dek.open();
+            self.file.payload = seal_payload(key.as_ref(), &self.payload)?;
+            self.file.header.mac =
+                crypto::header_mac(key.as_ref(), &self.file.header.mac_input(&self.file.payload));
+        }
         write_vault_file(&self.path, &self.file)?;
         self.seen = FileStamp::of(&self.path);
         Witness::record(&self.path, self.file.header.vault_id, self.file.header.epoch)?;
@@ -421,12 +427,14 @@ impl Vault {
         }
 
         let file = read_vault_file(&self.path)?;
-        let expected = crypto::header_mac(self.dek.as_ref(), &file.header.mac_input(&file.payload));
+        let key = self.dek.open();
+        let expected = crypto::header_mac(key.as_ref(), &file.header.mac_input(&file.payload));
         if !crypto::mac_matches(&expected, &file.header.mac) {
             bail!("the vault was re-keyed by another process; unlock again");
         }
 
-        let payload = open_payload(self.dek.as_ref(), &file.payload)?;
+        let payload = open_payload(key.as_ref(), &file.payload)?;
+        drop(key);
         self.rollback_suspected =
             Witness::check(&self.path, file.header.vault_id, file.header.epoch)?;
         self.file = file;
@@ -442,6 +450,7 @@ impl Vault {
         let mut fresh = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(fresh.as_mut());
         let new_dek = SecretBuf::new(fresh.as_ref());
+        drop(fresh);
 
         let mut rewrapped = Vec::with_capacity(self.file.header.recipients.len());
         for recipient in &self.file.header.recipients {
@@ -485,7 +494,8 @@ impl Vault {
         }
 
         self.file.header.recipients = rewrapped;
-        self.dek = new_dek;
+        self.dek = Guarded::new(new_dek.as_ref());
+        drop(new_dek);
         self.save()
     }
 
@@ -509,12 +519,15 @@ impl Vault {
         let x_public = x25519_dalek::PublicKey::from(&x_secret);
         let (mlkem_dk, mlkem_ek) = MlKem1024::generate_keypair();
 
-        let recipient = wrap_hybrid(
-            label.to_string(),
-            x_public.as_bytes(),
-            &mlkem_ek.to_bytes(),
-            self.dek.as_ref(),
-        )?;
+        let recipient = {
+            let key = self.dek.open();
+            wrap_hybrid(
+                label.to_string(),
+                x_public.as_bytes(),
+                &mlkem_ek.to_bytes(),
+                key.as_ref(),
+            )?
+        };
         self.file.header.recipients.push(recipient);
         self.save()?;
 
@@ -1123,7 +1136,7 @@ mod tests {
         let vault = Vault::unlock(&path, PASS).unwrap();
         let body = vault.records()[0].field("body").unwrap();
         assert_eq!(body.len(), MAX_NOTE_BYTES);
-        assert!(body.as_bytes().iter().all(|&b| b == 0x5a));
+        assert!(body.open().iter().all(|&b| b == 0x5a));
     }
 
     #[test]
