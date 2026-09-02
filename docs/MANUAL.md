@@ -73,15 +73,18 @@ cp -r plugin/khephri.blackbag ~/.config/omarchy/plugins/
 ~/.config/omarchy/plugins/khephri.blackbag/install.sh
 ```
 
-The installer is idempotent and does five things:
+The installer is idempotent and does six things:
 
 1. Adds `{"id": "khephri.blackbag"}` to `bar.layout.right` in
    `~/.config/omarchy/shell.json`.
 2. Appends a managed block to `~/.config/hypr/bindings.lua` binding
    `SUPER + SHIFT + K` to `omarchy-shell shell summon khephri.blackbag`.
-3. Writes `~/.config/systemd/user/black-bag-agent.service`.
-4. Installs `~/.local/share/applications/black-bag.desktop`.
-5. Publishes a first `status.json`, rescans the shell's plugins and reloads
+3. Creates `~/.local/share/black-bag` and `~/.local/state/black-bag` (mode
+   `0700`) if they do not exist, so the unit's `ReadWritePaths` resolve on a
+   machine that has not yet run `black-bag init`.
+4. Writes `~/.config/systemd/user/black-bag-agent.service`.
+5. Installs `~/.local/share/applications/black-bag.desktop`.
+6. Publishes a first `status.json`, rescans the shell's plugins and reloads
    Hyprland.
 
 ### Install the standalone desktop application
@@ -162,9 +165,14 @@ on screen forever and a clear delay of zero would never clear.
 | `uiScale` | 0 | 0, or 0.7–3.0 | Deck size. `0` means "from the viewport"; anything else is an absolute scale, never above what the window can hold |
 | `motionEnabled` | true | boolean | Animations on or off |
 
+The Accepted column is what a settings file may carry. The shell's settings
+panel, driven by the plugin's `manifest.json` schema, offers narrower ranges:
+`staleAfterSec` 30–3600, `clipboardClearSec` 5–300, `revealSeconds` 3–60.
+
 Out-of-range numbers are rounded and pinned to the nearest bound, and a value
-that is not a number is dropped so the default applies. The poll default was
-5 s before 2.5.0.
+that is not a number is dropped so the surface's built-in fallback applies —
+which matches the default for every setting except `pollIntervalSec`, where
+the fallback is still 5 s. The poll default was 5 s before 2.5.0.
 
 ---
 
@@ -176,7 +184,8 @@ Open the deck with nothing at the vault path and it offers to create one.
 `↵` on the empty slot, or the sheet appears on its own.
 
 1. **Set a master passphrase.** Type one, or press `Ctrl+G` to have the engine
-   generate one. A generated passphrase is shown in **plain text** on purpose —
+   generate one. The sheet refuses a passphrase shorter than 12 characters.
+   A generated passphrase is shown in **plain text** on purpose —
    this is the moment to write it down, and it is the last time it is displayed.
    The engine's own entropy verdict is shown beside it. A passphrase you typed
    gets no score, because the engine rates only what it generated.
@@ -185,8 +194,10 @@ Open the deck with nothing at the vault path and it offers to create one.
    offline media.
 3. **Open the deck.** It unlocks with the passphrase you just proved.
 
-`Ctrl+↵` commits either step; `Esc` abandons. Nothing is written until you
-commit, and the passphrase crosses to the engine on stdin.
+`Ctrl+↵` commits either step. `Esc` abandons the passphrase step; on the
+recovery step it is SKIP, and takes two presses because the vault from step 1
+already exists and a vault with no recovery key is a one-way door. Nothing is
+written until you commit, and the passphrase crosses to the engine on stdin.
 
 ### From the terminal
 
@@ -207,9 +218,10 @@ deck, until you `rekey` upward.
 
 ### Choosing a passphrase
 
-This is the one secret nothing else can recover for you. If it is short, a
-note is printed — a note, not a refusal, because a tool that rejects your
+This is the one secret nothing else can recover for you. From the terminal, a
+short passphrase gets a note, not a refusal — because a tool that rejects your
 passphrase is a tool you end up storing your passphrase in a file to satisfy.
+The deck's first-run sheet, by contrast, insists on twelve characters.
 The advice is the honest one: a six-word phrase drawn at random resists
 offline cracking far better than a short complex string.
 `black-bag gen passphrase` will mint one and tell you exactly what it is
@@ -395,8 +407,9 @@ the right one) and *agent stopped*.
 
 The suspend watcher (`crates/blackbag-core/src/sleepwatch.rs`) is a
 hand-written D-Bus client — SASL `EXTERNAL`, `Hello`, two `AddMatch` calls,
-a bounds-checked parser that drops any message it cannot read and caps
-messages at 1 MiB. It connects to the system bus (honouring
+a bounds-checked parser that never panics on malformed input — a message it
+cannot read ends that connection, and the watcher reconnects 20 s later,
+during which nothing is watched — and caps messages at 1 MiB. It connects to the system bus (honouring
 `DBUS_SYSTEM_BUS_ADDRESS`), retries every 20 s if the bus is unreachable, and
 reports its state in `status.json` as `session.sleep_watch`, which is what
 the SESSION card's `suspend & screen lock` row draws. It takes **no inhibitor
@@ -802,7 +815,7 @@ TOTP secret is prompted for, like every other secret, because
 | `black-bag agent list` | `--json`, `--kind`, `--query` | Titles, tags, attributes and per-field handles. Never secret bytes |
 | `black-bag agent reveal <ID> <FIELD>` | `--to tty\|clipboard\|stdout` (**clipboard**), `--clear-after <SECS>` (30) | |
 | `black-bag agent show <ID> <FIELD>` | — | The one command that writes a secret to stdout |
-| `black-bag agent totp <ID>` | — | JSON: `code`, `ttl_secs`, `step` |
+| `black-bag agent totp <ID>` | `--to tty\|clipboard\|stdout` (none: prints JSON), `--clear-after <SECS>` (30) | Without `--to`: JSON `code`, `ttl_secs`, `step`. With `--to`, the current code goes to that sink |
 | `black-bag agent add` | — | Reads a JSON record draft on stdin |
 | `black-bag agent edit <ID>` | — | Reads a JSON record draft on stdin |
 | `black-bag agent delete <ID>` | `--yes` (required) | |
@@ -863,8 +876,10 @@ What happens to your data:
 - Every v1 record kind maps onto the corresponding v2 kind, keeping its
   `created_at`, `updated_at`, title and tags.
 - The old `metadata_notes` field — which v1 stored in the clear inside the
-  payload — becomes a secret field, sealed in memory like every other,
-  because notes on a credential routinely are one.
+  payload — is carried over as the record's sealed `notes` value, because
+  notes on a credential routinely are a secret. Note that `notes` is not a
+  listed secret field: the deck, `list`, `get` and `agent reveal` do not show
+  it — it survives in the vault and is written out by `black-bag export`.
 - The new vault gets a fresh vault id, a fresh Argon2 salt at the current
   default cost, a fresh data key, an authenticated header and an epoch.
 - No recovery recipient is created. Add one afterwards (§3).
@@ -897,17 +912,22 @@ black-bag-agent.service: Failed to set up mount namespacing:
 black-bag-agent.service: Failed at step NAMESPACE spawning ...
 ```
 
-The unit lists `%t/black-bag` in `ReadWritePaths`, and at the moment the unit
-starts on a fresh login that directory may not exist yet. The vault is not
-harmed. Create the directory and restart:
+Units written before 2.5.0 listed `%t/black-bag` in `ReadWritePaths` without
+the leading `-`, and at the moment the unit starts on a fresh login that
+directory may not exist yet. The vault is not harmed. Re-run `install.sh`: the
+2.5.0 unit prefixes every `ReadWritePaths` entry with `-` so a missing
+directory is ignored, and the installer now creates `~/.local/share/black-bag`
+and `~/.local/state/black-bag` (mode `0700`) itself. If you would rather not
+re-install, create the directory and restart:
 
 ```bash
 black-bag status --publish          # creates $XDG_RUNTIME_DIR/black-bag
 systemctl --user restart black-bag-agent
 ```
 
-`Restart=on-failure` usually wins this race on its own — the log will show one
-failure followed by a successful start two seconds later.
+`Restart=always` (with `RestartSec=2`) restarts the agent after any exit, so
+on an old unit the log shows one failure followed by a successful start two
+seconds later.
 
 ### "vault is locked"
 
@@ -917,9 +937,11 @@ seconds by default) and is extended by operations that touch the vault; asking
 for status alone does not extend it. It also ends at the session ceiling
 (twelve hours after the unlock by default, `--max-secs`), when the machine
 suspends, when the screen locks, on `Ctrl+L`, on LOCK NOW, on
-`black-bag agent lock`, and whenever the agent process restarts. The SESSION
+`black-bag agent lock`, and whenever the agent process stops. The SESSION
 card's `last lock` row, and `last_lock_reason` in `agent status`, say which
-it was (§4, *How the vault locks*).
+it was (§4, *How the vault locks*) — except after a restart: only
+`black-bag agent stop` records *agent stopped*; a `systemctl` stop, a crash or
+the unit's `Restart=always` start a fresh agent with no last-lock reason.
 
 ### `mlock` failures
 
@@ -1003,7 +1025,7 @@ while the agent holds a key means the two could not talk.
 | `core dumps` | `disabled` / `ENABLED` | Whether *this process* set `RLIMIT_CORE` to 0. When enabled, the row shows the host's `core_pattern` |
 | `swap` | device list / `none` | Non-empty means "secrets never touch disk" holds only because of `mlock` |
 | `memlock` | a size or `unlimited` | `RLIMIT_MEMLOCK`. Below 64 MiB is flagged as a note |
-| `tracer` | `none` / `ATTACHED` | `TracerPid` from `/proc/self/status`. `ATTACHED` blocks typing on the sealed screen |
+| `tracer` | `none` / `ATTACHED` | `TracerPid` from `/proc/self/status`, as seen when the publishing process started — the agent's copy of this row is its own start-time snapshot; the plugin's periodic `status --publish` re-measures. `ATTACHED` blocks typing on the sealed screen |
 | `session key` | `kernel-invisible` / `locked page` / `UNLOCKED` | Where the per-process key lives: `memfd_secret`, a locked arena page, or neither. `UNLOCKED` is a warning: the key may be swapped |
 | any row | `UNKNOWN` | Not measured. An unmeasured host is not a healthy host, and the row says so rather than showing a pass |
 
@@ -1042,7 +1064,10 @@ TTY, `WAYLAND_DISPLAY` unset — and nothing was copied.
 
 `black-bag agent breach` shells out to `curl`; install it. Offline, or behind
 a proxy `curl` does not know about, each prefix fetch fails and is reported
-as *not checked* — never as clean — and the command's summary counts them.
+as *not checked* — never as clean — and the command's summary counts them. If
+any bucket could not be fetched and nothing was found exposed, the command
+also exits 1 with *some buckets could not be fetched; the result is
+incomplete*, so the deck shows it as an error.
 The deck shows the CLI's stderr in the footer as *breach check: …*. Without
 `--online` the command exits 2 and prints what it would send; that is not a
 failure, it is the consent gate.
@@ -1109,7 +1134,8 @@ is no terminal, and there is no exception anywhere in the CLI.
 `rekey` open the vault file directly, while a running agent keeps its own
 unlocked copy in memory — so the agent checks the file before serving any
 request and re-reads it if another writer got there first. A record you add in
-a terminal appears in the deck without restarting anything, and neither side
+a terminal appears in the deck the next time it re-reads the list — `Ctrl+R`,
+REFRESH, or reopening the deck — without restarting anything, and neither side
 overwrites the other.
 
 Two consequences worth knowing. If another process re-keys the vault, the
@@ -1148,8 +1174,10 @@ engine maps itself — 256 KiB each, `mmap` + `mlock` + `MADV_DONTDUMP` +
 `MADV_DONTFORK`, free ranges zeroed and reused, an oversize value getting a
 dedicated slab — and the decrypted payload, the serialised payload and the
 decoder's scratch (one buffer of the 256 KiB field maximum plus 4096) live in
-the same arena, so no secret byte crosses unlocked memory between the file and
-a record. A test reads `/proc/self/mem` across every writable mapping of the
+the same arena, so a secret's plaintext lives in unlocked memory only for the
+instant it is sealed in place — the decrypted payload, the serialised payload
+and the decoder's scratch are all in the locked arena, and nothing plaintext
+is left behind in ordinary memory. A test reads `/proc/self/mem` across every writable mapping of the
 test process and asserts a resting secret's plaintext appears nowhere. What
 this does not cover: the Argon2 working set, the compositor's copy of a
 pasted value, the QML surfaces, and a debugger attached with ptrace — the

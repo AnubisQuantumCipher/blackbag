@@ -237,10 +237,19 @@ impl Guarded {
         let cipher = XChaCha20Poly1305::new(Key::from_slice(key.bytes()));
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
-        let mut sealed = plain.to_vec();
+        // Sealed in the arena. `plain.to_vec()` stood here, and `plain` is
+        // locked memory in every caller — so each field's plaintext was
+        // copied straight back out into swappable heap for the length of the
+        // cipher pass, and the `extend_from_slice` that followed reallocated
+        // (capacity was exactly `len`) and moved it again.
+        let mut buf = SecretBuf::new(plain);
         let tag = cipher
-            .encrypt_in_place_detached(XNonce::from_slice(&nonce), AAD_GUARDED, &mut sealed)
+            .encrypt_in_place_detached(XNonce::from_slice(&nonce), AAD_GUARDED, buf.as_mut_slice())
             .expect("in-memory sealing cannot fail for a buffer this size");
+
+        // Ciphertext is not secret, so this one allocation may be ordinary.
+        let mut sealed = Vec::with_capacity(buf.len() + tag.len());
+        sealed.extend_from_slice(buf.as_slice());
         sealed.extend_from_slice(&tag);
         Self {
             nonce,
@@ -393,7 +402,10 @@ fn page_size() -> usize {
 impl Slab {
     fn map(size: usize, dedicated: bool) -> Option<Slab> {
         let page = page_size();
-        let size = size.div_ceil(page) * page;
+        // Checked: a request within a page of `usize::MAX` would otherwise
+        // wrap to a small — or zero — mapping that the arena then treats as
+        // if it had the requested capacity.
+        let size = size.div_ceil(page).checked_mul(page)?;
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -493,8 +505,14 @@ impl Slab {
     }
 }
 
+/// Round a request up to the allocation granule.
+///
+/// Saturating, not wrapping: a request within `ALIGN` of `usize::MAX` used to
+/// wrap to zero, and a zero-length range is one the arena hands out without
+/// tracking. Saturating makes the mapping below fail instead, which is the
+/// honest outcome for a request that cannot be satisfied.
 fn round_up(len: usize) -> usize {
-    len.max(1).div_ceil(ALIGN) * ALIGN
+    len.max(1).div_ceil(ALIGN).saturating_mul(ALIGN)
 }
 
 /// Where a buffer's bytes live.
@@ -619,9 +637,17 @@ impl SecretBuf {
     }
 
     /// A buffer of `len` zero bytes.
+    ///
+    /// The zeros are written, not inherited. Arena slabs are zero on map and
+    /// re-zeroed on release, but the fallback path below is an ordinary
+    /// allocation, and handing out a `&[u8]` over uninitialised memory is
+    /// undefined behaviour however carefully the caller then overwrites it.
     pub fn zeroed(len: usize) -> Self {
         let mut out = Self::with_capacity(len);
-        out.len = len;
+        if len > 0 && len <= out.capacity() {
+            unsafe { std::ptr::write_bytes(out.ptr.as_ptr(), 0, len) };
+            out.len = len;
+        }
         out
     }
 
@@ -642,7 +668,10 @@ impl SecretBuf {
             // before it could count a lock.
             None => {
                 FAILED_LOCKS.fetch_add(1, Ordering::Relaxed);
-                let mut v = Vec::<u8>::with_capacity(cap.max(1));
+                // Zeroed, not merely reserved: a recycled glibc chunk carries
+                // the previous allocation's bytes, and `zeroed()` promises
+                // this memory reads as zeros.
+                let mut v = vec![0u8; cap.max(1)];
                 let ptr = NonNull::new(v.as_mut_ptr()).unwrap_or(NonNull::dangling());
                 std::mem::forget(v);
                 Self {
@@ -1036,6 +1065,43 @@ mod tests {
         assert_eq!(&*back.open(), b"\x00\x01secret\xff");
     }
 
+    /// The property `memfd_secret` exists for, asserted rather than assumed:
+    /// the page holding the session key cannot be read back through this
+    /// process's own `/proc/self/mem`, which is the interface every
+    /// memory-scraping tool in the 2019 ISE survey used.
+    #[test]
+    fn the_session_key_page_is_unreadable_through_proc_self_mem() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        if session_key_backing() != KeyBacking::SecretMem {
+            eprintln!("no secret memory on this kernel; skipping");
+            return;
+        }
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("readable maps");
+        let line = maps
+            .lines()
+            .find(|l| l.contains("/secretmem"))
+            .expect("the secret-memory mapping is listed");
+        let lo = u64::from_str_radix(line.split('-').next().unwrap(), 16).unwrap();
+
+        let mut mem = std::fs::File::open("/proc/self/mem").expect("readable self mem");
+        let mut page = [0u8; 4096];
+        let read = mem
+            .seek(SeekFrom::Start(lo))
+            .and_then(|_| mem.read_exact(&mut page));
+        assert!(
+            read.is_err(),
+            "the session key page was readable through /proc/self/mem; \
+             memfd_secret is not providing what it is relied on for"
+        );
+
+        // And the key still works from inside the process that owns it.
+        let g = Guarded::new(b"still usable");
+        assert_eq!(&*g.open(), b"still usable");
+    }
+
     #[test]
     fn the_session_key_has_a_named_home() {
         let backing = session_key_backing();
@@ -1055,79 +1121,312 @@ mod tests {
     /// needle that appears in no other test.
     #[test]
     fn a_resting_secret_is_nowhere_in_writable_memory() {
-        use std::io::{Read, Seek, SeekFrom};
+        // A needle the main thread keeps, so the scan has something to look
+        // for. Assembled at run time so the literal is not sitting in
+        // .rodata as one string the scan would trip over.
+        let needle: Vec<u8> = b"ZETA-"
+            .iter()
+            .chain(b"NEEDLE-".iter())
+            .chain(b"7741".iter())
+            .copied()
+            .collect();
 
-        // Assembled at run time so the literal itself is not sitting in
-        // .rodata as a single string the scan could trip over.
-        let needle: Vec<u8> = b"ZETA-".iter().chain(b"NEEDLE-".iter()).chain(b"7741".iter()).copied().collect();
+        // The secret's whole life happens on a worker thread, which then
+        // parks and is never joined. Its stack stays mapped, so anything the
+        // seal or open path left on it is still there to be found — and the
+        // scanner, built afterwards on the main thread, cannot have
+        // overwritten it. Doing this inline used to make the test vacuous:
+        // the scan's own preamble reused exactly the frames and heap chunks
+        // a residue would occupy.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let secret_needle = needle.clone();
+        std::thread::Builder::new()
+            .name("secret-worker".into())
+            .spawn(move || {
+                let guarded = Guarded::new(&secret_needle);
+                {
+                    let opened = guarded.open();
+                    assert_eq!(opened.as_slice(), secret_needle.as_slice());
+                }
+                // The worker's own copy of the needle is the test's doing,
+                // not the vault's, so it goes before the scan runs. The
+                // `Guarded` stays alive: its ciphertext is expected in memory.
+                drop(secret_needle);
+                done_tx.send(()).unwrap();
+                loop {
+                    std::thread::park();
+                }
+            })
+            .expect("worker thread");
+        done_rx.recv().expect("worker finished its round trip");
 
-        let guarded = Guarded::new(&needle);
-        {
-            let opened = guarded.open();
-            assert_eq!(opened.as_slice(), needle.as_slice());
-            // `opened` is dropped here and its range zeroed.
-        }
+        // The positive control. A scanner that finds nothing proves nothing
+        // unless it can be shown to find something, so plant a distinct
+        // needle in a deliberately leaked heap allocation and require the
+        // scan to see it.
+        let control: Vec<u8> = b"OMEGA-"
+            .iter()
+            .chain(b"CONTROL-".iter())
+            .chain(b"3318".iter())
+            .copied()
+            .collect();
+        let control_copy = control.clone();
+        let planted = control_copy.as_ptr() as u64;
+        std::mem::forget(control_copy);
 
-        // Another test in this binary runs `harden_process`, which clears
-        // PR_SET_DUMPABLE and thereby makes /proc/self/mem root-owned. This
-        // test needs to read its own memory, so it re-enables dumpability for
-        // the test process. Test-only; production never does this.
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
-        let maps = std::fs::read_to_string("/proc/self/maps").expect("readable maps");
-        let mut mem = std::fs::File::open("/proc/self/mem").expect("readable self mem");
+        let mut scan = MemScan::new();
 
-        // Parse the writable mappings first, so the scan buffer can be
-        // allocated exactly once. A buffer that grew between mappings would
-        // leave its old contents — possibly a copy of the needle read from
-        // an earlier mapping — in freed heap, and the scan would then find
-        // its own leftovers and report a leak that is not one.
-        let mut ranges = Vec::new();
-        for line in maps.lines() {
-            let mut parts = line.split_whitespace();
-            let (Some(range), Some(perms)) = (parts.next(), parts.next()) else {
-                continue;
-            };
-            if !perms.starts_with("rw") {
-                continue;
-            }
-            let (lo, hi) = range.split_once('-').unwrap();
-            let lo = u64::from_str_radix(lo, 16).unwrap();
-            let hi = u64::from_str_radix(hi, 16).unwrap();
-            if hi - lo > 256 * 1024 * 1024 {
-                continue;
-            }
-            ranges.push((lo, hi));
-        }
-        let max_len = ranges.iter().map(|(lo, hi)| (hi - lo) as usize).max().unwrap_or(0);
-        let mut buf = vec![0u8; max_len];
-        let buf_lo = buf.as_ptr() as u64;
-        let buf_hi = buf_lo + buf.len() as u64;
         let own = needle.as_ptr() as u64;
+        let mine = [(own, own + needle.len() as u64)];
+        let secret = scan.count(&needle, &mine);
+        let control_hits = scan.count(
+            &control,
+            &[(control.as_ptr() as u64, control.as_ptr() as u64 + control.len() as u64)],
+        );
 
-        let mut hits = 0usize;
-        let mut scanned = 0usize;
-        for (lo, hi) in ranges {
-            let len = (hi - lo) as usize;
-            let slot = &mut buf[..len];
-            if mem.seek(SeekFrom::Start(lo)).is_err() || mem.read_exact(slot).is_err() {
-                continue;
+        assert!(secret.scanned > 0, "nothing was scanned");
+        // Every live thread stack has a band of never-faulted pages the
+        // kernel refuses with EIO — measured here as 32 of 2272, all of them
+        // in the two worker stacks. What must not happen is coverage quietly
+        // collapsing: before this was measured, one bad page discarded its
+        // whole mapping, and a 528-page stack was dropped for the sake of 16.
+        assert!(
+            secret.unreadable_pages * 20 < secret.pages,
+            "{} of {} pages were unreadable; the scan no longer covers enough \
+             memory for its silence to mean anything",
+            secret.unreadable_pages,
+            secret.pages
+        );
+        assert!(
+            control_hits.hits > 0,
+            "the scanner did not find a needle deliberately planted at {planted:#x}; \
+             it cannot vouch for the absence of anything"
+        );
+        assert_eq!(
+            secret.hits, 0,
+            "plaintext of a resting secret found {} time(s) in writable memory",
+            secret.hits
+        );
+    }
+
+    struct ScanResult {
+        hits: usize,
+        scanned: usize,
+        /// Pages `/proc/self/mem` refused. A live thread stack always has a
+        /// few; a large number means the scan stopped covering memory and
+        /// its silence stopped being evidence.
+        unreadable_pages: usize,
+        pages: usize,
+    }
+
+    /// Reads this process's own writable mappings, looking for a byte string.
+    ///
+    /// Constructed *after* the thing it is meant to catch has been created and
+    /// dropped, and on a different thread from it, so that the scanner's own
+    /// allocations and stack frames cannot sit on top of the residue it is
+    /// hunting for.
+    struct MemScan {
+        mem: std::fs::File,
+        ranges: Vec<(u64, u64)>,
+        buf: Vec<u8>,
+    }
+
+    impl MemScan {
+        fn new() -> Self {
+            // Another test in this binary runs `harden_process`, which clears
+            // PR_SET_DUMPABLE and thereby makes /proc/self/mem root-owned.
+            // This test reads its own memory, so it re-enables dumpability for
+            // the test process. Test-only; production never does this.
+            unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+            let maps = std::fs::read_to_string("/proc/self/maps").expect("readable maps");
+            let mem = std::fs::File::open("/proc/self/mem").expect("readable self mem");
+
+            let mut ranges = Vec::new();
+            for line in maps.lines() {
+                let mut parts = line.split_whitespace();
+                let (Some(range), Some(perms)) = (parts.next(), parts.next()) else {
+                    continue;
+                };
+                if !perms.starts_with("rw") {
+                    continue;
+                }
+                let Some((lo, hi)) = range.split_once('-') else {
+                    continue;
+                };
+                let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16))
+                else {
+                    continue;
+                };
+                // The session key's page is unreadable through /proc/self/mem
+                // by design — that is the property `memfd_secret` exists for,
+                // and `the_session_key_page_is_unreadable` asserts it
+                // directly. Excluding it here is not a gap in coverage.
+                if line.contains("/secretmem") {
+                    continue;
+                }
+                if hi.saturating_sub(lo) > 256 * 1024 * 1024 {
+                    continue;
+                }
+                ranges.push((lo, hi));
             }
-            scanned += len;
+
+            // One chunk, allocated once. A buffer that grew between mappings
+            // would leave its old contents — possibly a copy of the needle
+            // read from an earlier mapping — in freed heap for the scan to
+            // find again.
+            let buf = vec![0u8; 64 * 4096];
+            Self { mem, ranges, buf }
+        }
+
+        /// Scan every readable page of every writable mapping.
+        ///
+        /// Chunked, with a page-by-page fallback, because `/proc/self/mem`
+        /// refuses some pages of a live thread stack with `EIO` — measured
+        /// here as 16 of a worker's 528 — and a single whole-mapping
+        /// `read_exact` therefore used to discard that entire stack silently.
+        /// A carry of `needle.len() - 1` bytes spans the chunk seams, and is
+        /// reset whenever a page is skipped, since a needle straddling an
+        /// unreadable page cannot be seen whole anyway.
+        fn count(&mut self, needle: &[u8], exclude: &[(u64, u64)]) -> ScanResult {
+            use std::io::{Read, Seek, SeekFrom};
+
+            const PAGE: usize = 4096;
+            const CHUNK: usize = 64 * PAGE;
+
+            let buf_lo = self.buf.as_ptr() as u64;
+            let buf_hi = buf_lo + self.buf.len() as u64;
+            let carry_len = needle.len().saturating_sub(1);
+
+            let mut out = ScanResult {
+                hits: 0,
+                scanned: 0,
+                unreadable_pages: 0,
+                pages: 0,
+            };
+            let ranges = self.ranges.clone();
+
+            for (lo, hi) in ranges {
+                let mut carry: Vec<u8> = Vec::new();
+                let mut carry_at = 0u64;
+                let mut at = lo;
+
+                while at < hi {
+                    let want = CHUNK.min((hi - at) as usize);
+                    out.pages += want.div_ceil(PAGE);
+
+                    let read_ok = {
+                        let slot = &mut self.buf[..want];
+                        self.mem
+                            .seek(SeekFrom::Start(at))
+                            .and_then(|_| self.mem.read_exact(slot))
+                            .is_ok()
+                    };
+
+                    if read_ok {
+                        out.scanned += want;
+                        Self::search(
+                            &self.buf[..want],
+                            at,
+                            needle,
+                            &carry,
+                            carry_at,
+                            exclude,
+                            buf_lo,
+                            buf_hi,
+                            &mut out.hits,
+                        );
+                        let tail = want.saturating_sub(carry_len);
+                        carry = self.buf[tail..want].to_vec();
+                        carry_at = at + tail as u64;
+                        at += want as u64;
+                        continue;
+                    }
+
+                    // Some page in this chunk is unreadable. Take the chunk
+                    // apart so the rest of it still counts.
+                    let mut page_at = at;
+                    let chunk_end = at + want as u64;
+                    while page_at < chunk_end {
+                        let plen = PAGE.min((chunk_end - page_at) as usize);
+                        let ok = {
+                            let slot = &mut self.buf[..plen];
+                            self.mem
+                                .seek(SeekFrom::Start(page_at))
+                                .and_then(|_| self.mem.read_exact(slot))
+                                .is_ok()
+                        };
+                        if ok {
+                            out.scanned += plen;
+                            Self::search(
+                                &self.buf[..plen],
+                                page_at,
+                                needle,
+                                &carry,
+                                carry_at,
+                                exclude,
+                                buf_lo,
+                                buf_hi,
+                                &mut out.hits,
+                            );
+                            let tail = plen.saturating_sub(carry_len);
+                            carry = self.buf[tail..plen].to_vec();
+                            carry_at = page_at + tail as u64;
+                        } else {
+                            out.unreadable_pages += 1;
+                            carry.clear();
+                        }
+                        page_at += plen as u64;
+                    }
+                    at = chunk_end;
+                }
+            }
+            out
+        }
+
+        /// Count matches in `slot`, including any that begin in the carried
+        /// tail of the previous contiguous read.
+        #[allow(clippy::too_many_arguments)]
+        fn search(
+            slot: &[u8],
+            at: u64,
+            needle: &[u8],
+            carry: &[u8],
+            carry_at: u64,
+            exclude: &[(u64, u64)],
+            buf_lo: u64,
+            buf_hi: u64,
+            hits: &mut usize,
+        ) {
+            let mut consider = |addr: u64| {
+                // The scan buffer looking at itself while it reads the heap
+                // is not a finding, and neither is a holder the caller named.
+                if addr >= buf_lo && addr < buf_hi {
+                    return;
+                }
+                if exclude.iter().any(|&(lo, hi)| addr >= lo && addr < hi) {
+                    return;
+                }
+                *hits += 1;
+            };
+
+            if !carry.is_empty() && carry_at + carry.len() as u64 == at {
+                let mut seam = Vec::with_capacity(carry.len() + needle.len());
+                seam.extend_from_slice(carry);
+                seam.extend_from_slice(&slot[..needle.len().min(slot.len())]);
+                for (i, w) in seam.windows(needle.len()).enumerate() {
+                    // Only seam-crossing starts; the rest are found below.
+                    if i < carry.len() && w == needle {
+                        consider(carry_at + i as u64);
+                    }
+                }
+            }
+
             for (i, w) in slot.windows(needle.len()).enumerate() {
-                let at = lo + i as u64;
-                // The needle's own allocation, and the scan buffer seeing
-                // itself while the heap mapping is read, are not leaks.
-                if w == needle.as_slice() && at != own && !(at >= buf_lo && at < buf_hi) {
-                    hits += 1;
+                if w == needle {
+                    consider(at + i as u64);
                 }
             }
         }
-        assert!(scanned > 0, "nothing was scanned");
-        assert_eq!(
-            hits, 0,
-            "plaintext of a resting secret found {hits} time(s) in writable memory"
-        );
-        drop(guarded);
     }
 
     #[test]

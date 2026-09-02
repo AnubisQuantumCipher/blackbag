@@ -1,7 +1,12 @@
 //! Primitives: Argon2id KDF, XChaCha20-Poly1305 AEAD, header MAC, padding.
 
 use anyhow::{anyhow, bail, Result};
-use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
+// `Aead` is deliberately NOT imported. Its blanket `encrypt`/`decrypt` copy
+// the plaintext into an ordinary `Vec` before working on it, which put the
+// whole padded vault — and the data key on every wrap — into swappable heap.
+// Both directions here work in place inside the locked arena instead, and
+// re-introducing `Aead` would have to re-introduce this import to compile.
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Key, Tag, XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
@@ -113,6 +118,14 @@ pub struct Sealed {
 }
 
 /// Encrypt under `key`, binding `aad`.
+///
+/// The plaintext is copied into the locked arena and encrypted there in
+/// place; the only allocation that leaves the arena holds ciphertext, which
+/// is not secret. `aead::Aead::encrypt` was used here and does the opposite —
+/// its blanket implementation stages the whole plaintext in a fresh heap
+/// `Vec` and encrypts that — so every `Vault::save` put the entire padded
+/// vault, and every wrap put the data key, into swappable memory for the
+/// duration of the cipher pass.
 pub fn seal(key: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Sealed> {
     if key.len() != 32 {
         bail!("AEAD key must be 32 bytes");
@@ -120,15 +133,15 @@ pub fn seal(key: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Sealed> {
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut nonce);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
-    let ciphertext = cipher
-        .encrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
+
+    let mut buf = SecretBuf::new(plaintext);
+    let tag = cipher
+        .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, buf.as_mut_slice())
         .map_err(|_| anyhow!("encryption failed"))?;
+
+    let mut ciphertext = Vec::with_capacity(buf.len() + tag.len());
+    ciphertext.extend_from_slice(buf.as_slice());
+    ciphertext.extend_from_slice(&tag);
     Ok(Sealed { nonce, ciphertext })
 }
 
