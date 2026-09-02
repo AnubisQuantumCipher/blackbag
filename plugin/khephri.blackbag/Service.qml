@@ -162,15 +162,25 @@ Item {
     onTriggered: root.resolveLockService()
   }
 
-  Connections {
-    target: root.lockService
-    ignoreUnknownSignals: true
-    function onLockedChanged() {
-      if (!root.lockService || root.lockService.locked !== true) return
-      if (!root.lastUnlocked) return
-      if (!screenLockProcess.running) screenLockProcess.running = true
-    }
+  /// True while the shell holds the screen locked.
+  readonly property bool screenLocked:
+    root.lockService ? root.lockService.locked === true : false
+
+  /// Seal the vault whenever both are true, in whichever order they became
+  /// true. Reacting only to the instant the screen locked missed the case
+  /// that matters most: an unlock already in flight — Argon2id takes
+  /// seconds — completing *after* the screen had locked, which left the
+  /// vault open behind the lock screen with nothing left to notice it. The
+  /// agent's own D-Bus watcher cannot see this lock; Omarchy's is the
+  /// shell's, not logind's.
+  function sealIfScreenLocked() {
+    if (!root.screenLocked || !root.lastUnlocked) return
+    if (screenLockProcess.running) return
+    screenLockProcess.running = true
   }
+
+  onScreenLockedChanged: root.sealIfScreenLocked()
+  onLockStateChanged: root.sealIfScreenLocked()
 
   Process {
     id: screenLockProcess

@@ -91,6 +91,8 @@ Item {
   property bool onboardSuppressed: false
 
   property string totpPendingId: ""
+  /// A record whose code was asked for while another fetch was in flight.
+  property string totpWantedId: ""
   property string showPendingId: ""
   property string showPendingField: ""
 
@@ -252,9 +254,17 @@ Item {
     root.records = []
     root.hygiene = null
     root.hygieneError = ""
+    root.refreshPending = false
+    root.totpWantedId = ""
     passField.text = ""
     if (recordEditor.open_) recordEditor.dismiss()
-    if (onboardSheet.open_) onboardSheet.clear()
+    // Past step one the vault already exists and `onboard.pass` is the only
+    // copy of the passphrase that made it — the recovery step is about to
+    // write it to the engine's stdin. Merely emptying the field left the
+    // sheet reopening on the next visit still at "recovery" with nothing to
+    // send, and no way forward. Abandoning it closes it and hands the deck
+    // back its own unlock screen, which is the only honest outcome.
+    if (onboardSheet.open_) onboardSheet.abandon()
   }
 
   // Focus the passphrase box only when it is actually on screen and usable.
@@ -296,7 +306,10 @@ Item {
       var nowUnlocked = !!(parsed.session && parsed.session.unlocked)
       root.lastSessionUnlocked = nowUnlocked
       if (nowUnlocked && !wasUnlocked) {
-        root.refreshRecords()
+        // Only when the deck is actually on screen. An unlock from the CLI
+        // used to fill this overlay's record list while it was hidden, and
+        // the shell keeps it loaded.
+        if (root.opened) root.refreshRecords()
         // Unlocked from outside — the CLI, or a stale status catching up. The
         // keyboard may still be sitting on the sealed screen's (now hidden)
         // passphrase field; hand it to the deck or every footer key is dead.
@@ -323,6 +336,7 @@ Item {
   function refreshRecords() {
     // A refresh asked for while one is running is not dropped: the running
     // one may predate the write that prompted this one, so it runs again.
+    if (!root.opened || !root.unlocked) return
     if (listProcess.running) { root.refreshPending = true; return }
     root.listing = true
     listProcess.running = true
@@ -444,9 +458,16 @@ Item {
 
   function fetchTotp(record) {
     if (!record || !record.has_totp) return
-    // One fetch at a time. Overwriting the pending id while a fetch is in
-    // flight would stamp the FIRST record's code with the SECOND record's id.
-    if (totpProcess.running) return
+    // One fetch at a time: overwriting the pending id mid-flight would stamp
+    // the FIRST record's code with the SECOND record's id. But the second
+    // request cannot simply be dropped either — nothing re-issued it, so
+    // moving the selection while a fetch was in flight left the card empty
+    // for good. Remember what was wanted and pick it up when the reply lands.
+    if (totpProcess.running) {
+      root.totpWantedId = String(record.id)
+      return
+    }
+    root.totpWantedId = ""
     root.totpPendingId = String(record.id)
     totpProcess.command = ["black-bag", "agent", "totp", String(record.id)]
     totpProcess.running = true
@@ -661,6 +682,11 @@ Item {
         var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
         root.actionError = "lock failed: " + (err.length > 0 ? err : "the agent did not confirm")
         root.actionNote = ""
+        // The vault is still open, so the deck must stop showing an empty one.
+        // clearSecrets() ran before the attempt; nothing else brings it back,
+        // because the session never changed and no status edge follows.
+        refreshProcess.running = true
+        root.refreshRecords()
         return
       }
       root.records = []
@@ -676,6 +702,10 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        // A reply that lands after the deck was closed or locked must not
+        // repopulate it: titles, usernames and handles are as sensitive as
+        // the vault they came from.
+        if (!root.opened || !root.unlocked) return
         try {
           var parsed = JSON.parse(String(this.text || "[]"))
           root.records = Array.isArray(parsed) ? parsed : []
@@ -786,6 +816,7 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        if (!root.opened || !root.unlocked) return
         try {
           root.hygiene = JSON.parse(String(this.text || "null"))
           root.hygieneError = ""
@@ -827,6 +858,16 @@ Item {
     running: false
     stderr: StdioCollector { waitForEnd: true }
     onExited: function (code) {
+      // A selection that moved while this was in flight asked for a code that
+      // was never fetched. Pick it up now rather than leaving the card blank.
+      if (root.totpWantedId.length > 0) {
+        var wanted = root.totpWantedId
+        root.totpWantedId = ""
+        Qt.callLater(function () {
+          if (root.selectedRecord && String(root.selectedRecord.id) === wanted)
+            root.fetchTotp(root.selectedRecord)
+        })
+      }
       if (code !== 0) {
         root.totpState = null
         var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()

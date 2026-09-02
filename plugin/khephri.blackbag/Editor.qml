@@ -729,13 +729,30 @@ Item {
       formField.peekLeft = 0
       peekTimer.stop()
     }
+    /// Typing counts as looking. Without this a long note went blind
+    /// mid-sentence: the countdown started when the cover was opened and ran
+    /// regardless of what the person was doing.
+    function keepAwake() {
+      if (formField.peeking) formField.peekLeft = Math.max(1, editor.revealSeconds)
+    }
+
     Timer {
       id: peekTimer
       interval: 1000
       repeat: true
       onTriggered: {
         formField.peekLeft -= 1
-        if (formField.peekLeft <= 0) { formField.peeking = false; stop() }
+        if (formField.peekLeft <= 0) {
+          formField.peeking = false
+          stop()
+          // The cover is only a cover if it also takes the keyboard away.
+          // It used to be painted over a TextArea that still held focus and
+          // still accepted keystrokes and pastes, so "typing while covered is
+          // not possible" was false of the one field it was written about.
+          if (formField.multiline && multiLine.activeFocus) {
+            editor.forceActiveFocus()
+          }
+        }
       }
     }
 
@@ -846,6 +863,7 @@ Item {
       rightPadding: editor.metric.spacing.controlPaddingX
       Layout.fillWidth: true
       visible: !parent.multiline
+      onTextChanged: formField.keepAwake()
       password: !formField.showing
       placeholderText: parent.placeholder
       activeFocusOnPress: true
@@ -888,6 +906,8 @@ Item {
           text: multiLine.length > 0
             ? "hidden · " + multiLine.length + " characters · click to reveal and edit"
             : "hidden · click to reveal and type"
+          // Both branches are honest now: while this cover is up the field
+          // below is read-only and does not hold the keyboard.
           color: Util.alpha(Color.foreground, 0.6)
           font.family: metric.font.family
           font.pixelSize: metric.font.caption
@@ -914,6 +934,8 @@ Item {
           // field", not "insert a tab character into the note".
           activeFocusOnTab: false
           Keys.onPressed: function (event) {
+            // Reading a long note counts as looking at it, not only typing.
+            formField.keepAwake()
             if (event.key === Qt.Key_Backtab
                 || (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
               editor.moveFocus(-1); event.accepted = true
@@ -936,6 +958,10 @@ Item {
               fieldMenu.popup()
             }
           }
+          // Read-only while covered, so a keystroke that arrives before
+          // focus has moved cannot land in a field nobody can see.
+          readOnly: !formField.showing
+          onTextChanged: formField.keepAwake()
           wrapMode: TextArea.WrapAnywhere
           color: Color.foreground
           font.family: metric.font.family
