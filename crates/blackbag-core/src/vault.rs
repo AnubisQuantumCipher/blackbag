@@ -227,14 +227,20 @@ pub struct Vault {
 struct FileStamp {
     len: u64,
     mtime: Option<std::time::SystemTime>,
+    /// Every write lands through a rename, so the inode changes each time.
+    /// Length alone is useless here — padding makes most writes the same size
+    /// — and mtime resolution is the filesystem's, not ours.
+    ino: u64,
 }
 
 impl FileStamp {
     fn of(path: &Path) -> Self {
+        use std::os::unix::fs::MetadataExt;
         match fs::metadata(path) {
             Ok(meta) => Self {
                 len: meta.len(),
                 mtime: meta.modified().ok(),
+                ino: meta.ino(),
             },
             Err(_) => Self::default(),
         }
@@ -776,11 +782,33 @@ struct WitnessEntry {
     updated_at: DateTime<Utc>,
 }
 
+/// Process-wide override of where the witness lives. Set once by tests so a
+/// test vault never writes into the operator's real state directory — which is
+/// exactly what every test in this crate used to do.
+static WITNESS_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 impl Witness {
     fn path() -> Result<PathBuf> {
-        let dir = crate::state_dir()?;
+        let dir = match WITNESS_DIR_OVERRIDE.get() {
+            Some(dir) => dir.clone(),
+            None => crate::state_dir()?,
+        };
         fs::create_dir_all(&dir)?;
         Ok(dir.join("witness.json"))
+    }
+
+    /// Point the witness at a private temporary directory for the life of
+    /// this process. Idempotent; the first call wins.
+    #[doc(hidden)]
+    pub fn isolate_for_tests() {
+        WITNESS_DIR_OVERRIDE.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "black-bag-test-witness-{}",
+                std::process::id()
+            ));
+            let _ = fs::create_dir_all(&dir);
+            dir
+        });
     }
 
     fn load() -> WitnessFile {
@@ -876,6 +904,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn temp_vault() -> (TempDir, PathBuf) {
+        Witness::isolate_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("vault.cbor");
         (dir, path)

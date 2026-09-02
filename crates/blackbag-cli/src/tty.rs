@@ -11,7 +11,6 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
@@ -30,6 +29,10 @@ pub enum Sink {
 }
 
 /// Deliver `secret` to the chosen sink.
+///
+/// The clipboard path prints its own confirmation, and only after the
+/// compositor has been seen offering the value with the sensitive hint —
+/// "copied" is a report, not a hope.
 pub fn emit_secret(secret: &str, label: &str, sink: Sink, clip_seconds: u64) -> Result<()> {
     match sink {
         Sink::Tty => {
@@ -47,55 +50,23 @@ pub fn emit_secret(secret: &str, label: &str, sink: Sink, clip_seconds: u64) -> 
             out.flush()?;
             Ok(())
         }
-        Sink::Clipboard => copy_to_clipboard(secret, clip_seconds),
+        Sink::Clipboard => {
+            let placed = crate::clipboard::copy_secret(secret.as_bytes(), clip_seconds)?;
+            if !crate::clipboard::wait_until_sensitive(std::time::Duration::from_secs(3))? {
+                bail!("the compositor never offered the value; nothing was copied");
+            }
+            eprintln!(
+                "copied {label} to the clipboard · marked sensitive so clipboard managers skip it · {}{}",
+                if placed.clear_after_secs == 0 {
+                    "stays until something else is copied".to_string()
+                } else {
+                    format!("clears in {}s", placed.clear_after_secs)
+                },
+                if placed.helper_locked { "" } else { " · helper could not lock its memory" }
+            );
+            Ok(())
+        }
     }
-}
-
-/// Put `secret` on the Wayland clipboard and schedule a wipe.
-///
-/// `wl-copy` is fed on stdin, never argv, for the same reason passphrases are:
-/// `/proc/<pid>/cmdline` is world-readable.
-pub fn copy_to_clipboard(secret: &str, clear_after_secs: u64) -> Result<()> {
-    if which("wl-copy").is_none() {
-        bail!("wl-copy not found; install wl-clipboard for clipboard support");
-    }
-
-    let mut child = Command::new("wl-copy")
-        .arg("--foreground")
-        .arg("--type")
-        .arg("text/plain")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to run wl-copy")?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("wl-copy did not accept stdin")?;
-        stdin.write_all(secret.as_bytes())?;
-        stdin.flush()?;
-    }
-
-    // wl-copy --foreground serves the selection from its own process, so
-    // killing it after the timeout is what actually clears the clipboard.
-    if clear_after_secs > 0 {
-        let pid = child.id();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(clear_after_secs));
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        });
-    }
-    Ok(())
-}
-
-fn which(program: &str) -> Option<std::path::PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(program))
-            .find(|candidate| candidate.is_file())
-    })
 }
 
 /// Read a passphrase without echoing, from the terminal when there is one and
@@ -161,9 +132,4 @@ mod tests {
         assert_eq!(Sink::default(), Sink::Tty);
     }
 
-    #[test]
-    fn which_finds_a_real_program_and_misses_a_fake_one() {
-        assert!(which("sh").is_some());
-        assert!(which("definitely-not-a-real-program-xyzzy").is_none());
-    }
 }

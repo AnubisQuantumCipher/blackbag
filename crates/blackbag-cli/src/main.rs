@@ -1,5 +1,6 @@
 //! `black-bag` — hardened credential storage for Omarchy.
 
+mod clipboard;
 mod tty;
 
 use std::path::PathBuf;
@@ -66,6 +67,15 @@ enum Command {
     Gen(GenCommand),
     /// Convert a black-bagg 0.4.x (v1) vault to this format.
     Migrate(MigrateArgs),
+    /// Clipboard helper: serve stdin as a sensitive clipboard offer.
+    ///
+    /// Spawned by `--to clipboard`; not meant to be run by hand. Hidden from
+    /// help so nobody reaches for it with a secret on argv.
+    #[command(hide = true, name = "clip-serve")]
+    ClipServe {
+        #[arg(long, default_value_t = 30)]
+        clear_after: u64,
+    },
 }
 
 /// Generated values go to STDOUT and the strength line to STDERR, so a pipe
@@ -213,8 +223,13 @@ enum RecoveryCommand {
 enum AgentCommand {
     /// Run the agent in the foreground.
     Serve {
+        /// Lock after this many seconds without a request.
         #[arg(long, default_value_t = session::DEFAULT_IDLE_SECS)]
         idle_secs: u64,
+        /// Lock this many seconds after an unlock no matter how busy the
+        /// session is. 0 disables the ceiling.
+        #[arg(long, default_value_t = session::DEFAULT_MAX_SESSION_SECS)]
+        max_secs: u64,
     },
     /// Unlock the running agent (passphrase on stdin or the terminal).
     Unlock,
@@ -345,6 +360,7 @@ fn run(hardening: harden::HardenReport) -> Result<()> {
         Command::Status(args) => cmd_status(&path, args, hardening),
         Command::Gen(cmd) => cmd_gen(cmd),
         Command::Migrate(args) => cmd_migrate(args),
+        Command::ClipServe { clear_after } => clipboard::serve(clear_after),
     }
 }
 
@@ -530,9 +546,6 @@ fn cmd_get(path: &std::path::Path, args: GetArgs) -> Result<()> {
             .ok_or_else(|| anyhow!("no secret field named {name}"))?;
         let value = secret.expose_str()?;
         tty::emit_secret(&value, name, args.sink, args.clear_after)?;
-        if args.sink == Sink::Clipboard {
-            eprintln!("Copied {name} to the clipboard; clearing in {}s.", args.clear_after);
-        }
     }
     Ok(())
 }
@@ -675,13 +688,19 @@ fn cmd_agent(
     hardening: harden::HardenReport,
 ) -> Result<()> {
     match cmd {
-        AgentCommand::Serve { idle_secs } => {
+        AgentCommand::Serve { idle_secs, max_secs } => {
             eprintln!(
                 "black-bag agent listening at {}",
                 session::socket_path()?.display()
             );
+            // Host events that must lock the vault: suspend, session lock.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let watch_state =
+                blackbag_core::sleepwatch::spawn(blackbag_core::sleepwatch::WatchConfig::system(), tx);
             session::Agent::new(path.to_path_buf(), idle_secs)
+                .with_max_session_secs(max_secs)
                 .with_hardening(hardening)
+                .with_lock_signals(rx, watch_state)
                 .serve()
         }
         AgentCommand::Unlock => {
@@ -764,9 +783,6 @@ fn cmd_agent(
                     // however the emit path returns.
                     let value = Zeroizing::new(value);
                     tty::emit_secret(&value, &field, sink, clear_after)?;
-                    if sink == Sink::Clipboard {
-                        eprintln!("copied {field}; clipboard clears in {clear_after}s");
-                    }
                     Ok(())
                 }
                 Response::Error { message } => bail!("{message}"),
@@ -877,9 +893,6 @@ fn cmd_agent(
                     match sink {
                         Some(sink) => {
                             tty::emit_secret(&code, "code", sink, clear_after)?;
-                            if sink == Sink::Clipboard {
-                                eprintln!("copied the current code; clears in {clear_after}s");
-                            }
                         }
                         None => println!(
                             "{}",
@@ -1076,6 +1089,10 @@ fn agent_session_view() -> SessionView {
             method: status.method,
             expires_at: status.expires_at,
             idle_timeout_secs: status.idle_timeout_secs,
+            session_ends_at: status.session_ends_at,
+            max_session_secs: status.max_session_secs,
+            last_lock_reason: status.last_lock_reason.map(|r| r.as_str().to_string()),
+            sleep_watch: status.sleep_watch,
         },
         _ => SessionView::default(),
     }

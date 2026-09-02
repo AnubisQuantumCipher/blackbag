@@ -12,6 +12,7 @@ pub mod hygiene;
 pub mod memlock;
 pub mod record;
 pub mod session;
+pub mod sleepwatch;
 pub mod status;
 pub mod vault;
 

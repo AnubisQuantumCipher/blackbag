@@ -178,13 +178,27 @@ pub struct KdfView {
     pub meets_current_defaults: bool,
 }
 
-/// Agent/session state. Carries a deadline, never key material.
+/// Agent/session state. Carries deadlines and reasons, never key material.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionView {
     pub unlocked: bool,
     pub method: Option<String>,
+    /// The nearer of the idle deadline and the session ceiling.
     pub expires_at: Option<DateTime<Utc>>,
     pub idle_timeout_secs: u64,
+    /// When the session ends regardless of activity.
+    #[serde(default)]
+    pub session_ends_at: Option<DateTime<Utc>>,
+    /// The ceiling in seconds; 0 means the operator disabled it.
+    #[serde(default)]
+    pub max_session_secs: u64,
+    /// Why the vault was last locked: manual, idle, session-ceiling, suspend,
+    /// session-lock, rekeyed, shutdown.
+    #[serde(default)]
+    pub last_lock_reason: Option<String>,
+    /// What the agent's host-event watcher reports about itself.
+    #[serde(default)]
+    pub sleep_watch: Option<String>,
 }
 
 impl Default for SessionView {
@@ -194,6 +208,10 @@ impl Default for SessionView {
             method: None,
             expires_at: None,
             idle_timeout_secs: 0,
+            session_ends_at: None,
+            max_session_secs: 0,
+            last_lock_reason: None,
+            sleep_watch: None,
         }
     }
 }
@@ -347,10 +365,15 @@ impl Status {
     /// Publish atomically so a reader never sees a half-written document.
     pub fn publish(&self) -> Result<PathBuf> {
         let dir = runtime_dir()?;
-        fs::create_dir_all(&dir)?;
-        set_owner_only(&dir)?;
+        self.publish_to(&dir)
+    }
+
+    /// Publish into an explicit directory.
+    pub fn publish_to(&self, dir: &Path) -> Result<PathBuf> {
+        fs::create_dir_all(dir)?;
+        set_owner_only(dir)?;
         let path = dir.join("status.json");
-        let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         serde_json::to_writer_pretty(&mut tmp, self)?;
         use std::io::Write;
         tmp.write_all(b"\n")?;
@@ -409,6 +432,7 @@ mod tests {
 
     #[test]
     fn status_never_serialises_record_material() {
+        Witness::isolate_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("vault.cbor");
         Vault::init(&path, b"pass pass pass", 32_768).unwrap();
@@ -453,6 +477,7 @@ mod tests {
 
     #[test]
     fn missing_recovery_recipient_is_noted() {
+        Witness::isolate_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("vault.cbor");
         Vault::init(&path, b"pass pass pass", 32_768).unwrap();
@@ -462,6 +487,7 @@ mod tests {
 
     #[test]
     fn findings_are_ordered_worst_first() {
+        Witness::isolate_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("vault.cbor");
         Vault::init(&path, b"pass pass pass", 32_768).unwrap();

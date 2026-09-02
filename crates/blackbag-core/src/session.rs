@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -35,6 +36,53 @@ use crate::vault::{UnlockMethod, Vault};
 /// Default idle timeout. Long enough to work, short enough that a walked-away
 /// desk does not stay unlocked.
 pub const DEFAULT_IDLE_SECS: u64 = 900;
+
+/// Default ceiling on how long one unlock can last, however busy the user is.
+/// Idle expiry alone lets a session that is touched every few minutes stay
+/// open for days; a hard deadline bounds the window a stolen key is useful.
+pub const DEFAULT_MAX_SESSION_SECS: u64 = 12 * 3600;
+
+/// How long the agent waits for a connected peer to send its one request line,
+/// or to accept the reply. The agent is single-threaded by design (the vault is
+/// one object), so before this existed a peer that connected and sent nothing
+/// held every other client — and idle expiry — hostage for as long as it liked.
+/// Found by opening a socket and waiting.
+pub const PEER_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Why the vault stopped being open. Surfaced through status so the deck can
+/// say "locked before suspend" instead of a generic "locked".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockReason {
+    /// The user asked.
+    Manual,
+    /// No request arrived for the idle timeout.
+    Idle,
+    /// The hard session ceiling was reached.
+    SessionCeiling,
+    /// The host announced it is about to sleep.
+    Suspend,
+    /// The login session was locked.
+    SessionLock,
+    /// The vault was re-keyed by another process; the held key was stale.
+    Rekeyed,
+    /// The agent was told to stop.
+    Shutdown,
+}
+
+impl LockReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockReason::Manual => "manual",
+            LockReason::Idle => "idle",
+            LockReason::SessionCeiling => "session-ceiling",
+            LockReason::Suspend => "suspend",
+            LockReason::SessionLock => "session-lock",
+            LockReason::Rekeyed => "rekeyed",
+            LockReason::Shutdown => "shutdown",
+        }
+    }
+}
 
 pub fn socket_path() -> Result<PathBuf> {
     Ok(status::runtime_dir()?.join("agent.sock"))
@@ -354,8 +402,21 @@ impl RecordDraft {
 pub struct AgentStatus {
     pub unlocked: bool,
     pub method: Option<String>,
+    /// The nearer of the idle deadline and the session ceiling.
     pub expires_at: Option<DateTime<Utc>>,
     pub idle_timeout_secs: u64,
+    /// When the session ends regardless of activity. `None` while locked.
+    #[serde(default)]
+    pub session_ends_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub max_session_secs: u64,
+    /// Why the vault was last locked, if it has been locked since the agent
+    /// started.
+    #[serde(default)]
+    pub last_lock_reason: Option<LockReason>,
+    /// Whether the agent is subscribed to host sleep and session-lock events.
+    #[serde(default)]
+    pub sleep_watch: Option<String>,
     pub record_count: usize,
     pub counts_by_kind: Vec<(String, usize)>,
     pub rollback_suspected: bool,
@@ -420,18 +481,39 @@ impl RecordView {
 pub struct Agent {
     vault_path: PathBuf,
     idle: Duration,
+    /// Ceiling on one unlock, measured from the unlock itself.
+    max_session: Duration,
     open: Option<OpenVault>,
     shutdown_requested: bool,
     /// What hardening this process actually achieved. Without it the agent
     /// published a default report and the cockpit raised a CORE_DUMPS finding
     /// against a process that had in fact disabled them.
     hardening: crate::harden::HardenReport,
+    last_lock_reason: Option<LockReason>,
+    /// Host events that must lock the vault (suspend, session lock), delivered
+    /// by whatever watcher the caller attached. `None` means nobody is watching.
+    lock_signals: Option<Receiver<LockReason>>,
+    /// A one-line description of the watcher's state, for status.
+    sleep_watch: Option<std::sync::Arc<std::sync::Mutex<String>>>,
+    /// Where `status.json` goes. `None` means the runtime directory; tests
+    /// point it elsewhere so a test agent never overwrites the live document.
+    status_dir: Option<PathBuf>,
 }
 
 struct OpenVault {
     vault: Vault,
+    /// Slides forward on every request, capped by `ceiling`.
     deadline: Instant,
+    /// Fixed at unlock time. Activity does not move it.
+    ceiling: Instant,
+    ceiling_wall: DateTime<Utc>,
     method: UnlockMethod,
+}
+
+impl OpenVault {
+    fn effective_deadline(&self) -> Instant {
+        self.deadline.min(self.ceiling)
+    }
 }
 
 impl Agent {
@@ -439,9 +521,14 @@ impl Agent {
         Self {
             vault_path,
             idle: Duration::from_secs(idle_secs.max(30)),
+            max_session: Duration::from_secs(DEFAULT_MAX_SESSION_SECS),
             open: None,
             shutdown_requested: false,
             hardening: crate::harden::HardenReport::default(),
+            last_lock_reason: None,
+            lock_signals: None,
+            sleep_watch: None,
+            status_dir: None,
         }
     }
 
@@ -452,10 +539,45 @@ impl Agent {
         self
     }
 
-    /// Serve until shutdown. Publishes status on every state change so the bar
-    /// widget tracks the lock state without polling the agent.
-    pub fn serve(mut self) -> Result<()> {
+    /// Bound one unlock to `secs` regardless of activity. Zero disables the
+    /// ceiling, which is a choice the operator has to make out loud.
+    pub fn with_max_session_secs(mut self, secs: u64) -> Self {
+        self.max_session = if secs == 0 {
+            Duration::from_secs(u64::MAX / 4)
+        } else {
+            Duration::from_secs(secs.max(60))
+        };
+        self
+    }
+
+    /// Attach a source of host lock events. Each event received locks the
+    /// vault with the given reason.
+    pub fn with_lock_signals(
+        mut self,
+        rx: Receiver<LockReason>,
+        state: std::sync::Arc<std::sync::Mutex<String>>,
+    ) -> Self {
+        self.lock_signals = Some(rx);
+        self.sleep_watch = Some(state);
+        self
+    }
+
+    /// Publish `status.json` into `dir` instead of the runtime directory.
+    pub fn with_status_dir(mut self, dir: PathBuf) -> Self {
+        self.status_dir = Some(dir);
+        self
+    }
+
+    /// Serve at the default socket until shutdown.
+    pub fn serve(self) -> Result<()> {
         let path = socket_path()?;
+        self.serve_at(&path)
+    }
+
+    /// Serve at `path` until shutdown. Publishes status on every state change
+    /// so the bar widget tracks the lock state without polling the agent.
+    pub fn serve_at(mut self, path: &Path) -> Result<()> {
+        let path = path.to_path_buf();
         let dir = path
             .parent()
             .ok_or_else(|| anyhow!("bad socket path"))?
@@ -480,6 +602,7 @@ impl Agent {
 
         loop {
             self.expire_if_idle()?;
+            self.drain_lock_signals()?;
             match listener.accept() {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(false)?;
@@ -498,8 +621,34 @@ impl Agent {
         }
 
         let _ = std::fs::remove_file(&path);
-        self.open = None;
+        self.lock(LockReason::Shutdown);
         self.publish()?;
+        Ok(())
+    }
+
+    /// Lock the vault, remembering why. Dropping `OpenVault` drops the `Vault`,
+    /// whose data key and every record are wiped and unlocked on the way out.
+    fn lock(&mut self, reason: LockReason) {
+        if self.open.take().is_some() {
+            self.last_lock_reason = Some(reason);
+        }
+    }
+
+    /// Apply any host event the watcher delivered since the last pass.
+    fn drain_lock_signals(&mut self) -> Result<()> {
+        let mut received = None;
+        if let Some(rx) = &self.lock_signals {
+            while let Ok(reason) = rx.try_recv() {
+                received = Some(reason);
+            }
+        }
+        if let Some(reason) = received {
+            if self.open.is_some() {
+                eprintln!("black-bag agent: locking ({})", reason.as_str());
+                self.lock(reason);
+                self.publish()?;
+            }
+        }
         Ok(())
     }
 
@@ -510,13 +659,29 @@ impl Agent {
             bail!("rejected connection from uid {peer}");
         }
 
+        // Rule 4: a peer gets a bounded slice of the agent's attention. One
+        // request line in, one reply out, each within PEER_IO_TIMEOUT.
+        stream.set_read_timeout(Some(PEER_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(PEER_IO_TIMEOUT))?;
+
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(());
+        match reader.read_line(&mut line) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                line.zeroize();
+                bail!("peer sent nothing within {}s; dropped", PEER_IO_TIMEOUT.as_secs());
+            }
+            Err(e) => {
+                line.zeroize();
+                return Err(e.into());
+            }
         }
 
-        let response = match serde_json::from_str::<Request>(&line) {
+        let mut response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => self.dispatch(request),
             Err(e) => Response::Error {
                 message: format!("malformed request: {e}"),
@@ -525,10 +690,16 @@ impl Agent {
         line.zeroize();
 
         let mut out = stream;
-        serde_json::to_writer(&mut out, &response)?;
-        out.write_all(b"\n")?;
-        out.flush()?;
-        Ok(())
+        let written = serde_json::to_writer(&mut out, &response)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| out.write_all(b"\n").map_err(Into::into))
+            .and_then(|_| out.flush().map_err(Into::into));
+        // Whatever happened on the wire, a revealed value does not outlive the
+        // request in this process.
+        if let Response::Secret { value } = &mut response {
+            value.zeroize();
+        }
+        written
     }
 
     fn dispatch(&mut self, request: Request) -> Response {
@@ -548,9 +719,16 @@ impl Agent {
                 let passphrase = Zeroizing::new(passphrase);
                 let vault = Vault::unlock(&self.vault_path, passphrase.as_bytes())?;
                 let method = vault.unlocked_by;
+                let now = Instant::now();
+                let ceiling_wall = Utc::now()
+                    + ChronoDuration::seconds(
+                        self.max_session.as_secs().min(i64::MAX as u64 / 4) as i64,
+                    );
                 self.open = Some(OpenVault {
                     vault,
-                    deadline: Instant::now() + self.idle,
+                    deadline: now + self.idle,
+                    ceiling: now + self.max_session,
+                    ceiling_wall,
                     method,
                 });
                 self.publish()?;
@@ -558,7 +736,7 @@ impl Agent {
             }
 
             Request::Lock => {
-                self.open = None;
+                self.lock(LockReason::Manual);
                 self.publish()?;
                 Ok(Response::Ok)
             }
@@ -622,9 +800,15 @@ impl Agent {
                 })
             }
 
+            // Every mutation holds the vault's advisory lock across the
+            // refresh-modify-save sequence, the same lock the CLI takes. The
+            // file-stamp check in `Vault::save` catches a write that landed
+            // between the refresh and the save; the lock makes sure one does
+            // not land there in the first place.
             Request::Add { draft } => {
                 let record = draft.into_record()?;
                 let id = record.id;
+                let _guard = crate::vault::open_lock(&self.vault_path)?;
                 let open = self.opened()?;
                 open.vault.add_record(record)?;
                 open.vault.save()?;
@@ -634,6 +818,7 @@ impl Agent {
 
             Request::Update { id, draft } => {
                 let id: Uuid = id.parse().context("invalid record id")?;
+                let _guard = crate::vault::open_lock(&self.vault_path)?;
                 let open = self.opened()?;
                 let record = open
                     .vault
@@ -647,6 +832,7 @@ impl Agent {
 
             Request::Delete { id } => {
                 let id: Uuid = id.parse().context("invalid record id")?;
+                let _guard = crate::vault::open_lock(&self.vault_path)?;
                 let open = self.opened()?;
                 open.vault.remove_record(id)?;
                 open.vault.save()?;
@@ -662,7 +848,7 @@ impl Agent {
 
             Request::Shutdown => {
                 self.shutdown_requested = true;
-                self.open = None;
+                self.lock(LockReason::Shutdown);
                 Ok(Response::Ok)
             }
         }
@@ -685,7 +871,7 @@ impl Agent {
             None => false,
         };
         if rekeyed {
-            self.open = None;
+            self.lock(LockReason::Rekeyed);
             self.publish()?;
             bail!("the vault was re-keyed by another process; unlock again");
         }
@@ -694,6 +880,7 @@ impl Agent {
         self.open.as_mut().ok_or_else(|| anyhow!("vault is locked"))
     }
 
+    /// Slide the idle deadline forward. The ceiling does not move.
     fn touch(&mut self) {
         let idle = self.idle;
         if let Some(open) = self.open.as_mut() {
@@ -702,21 +889,34 @@ impl Agent {
     }
 
     fn expire_if_idle(&mut self) -> Result<()> {
-        let expired = self
-            .open
-            .as_ref()
-            .is_some_and(|open| Instant::now() >= open.deadline);
-        if expired {
-            self.open = None;
+        let now = Instant::now();
+        let reason = match self.open.as_ref() {
+            Some(open) if now >= open.ceiling => Some(LockReason::SessionCeiling),
+            Some(open) if now >= open.deadline => Some(LockReason::Idle),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.lock(reason);
             self.publish()?;
         }
         Ok(())
     }
 
     fn status_snapshot(&self) -> AgentStatus {
+        let sleep_watch = self
+            .sleep_watch
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|g| g.clone()));
+        let max_session_secs = if self.max_session >= Duration::from_secs(u64::MAX / 4) {
+            0
+        } else {
+            self.max_session.as_secs()
+        };
         match &self.open {
             Some(open) => {
-                let remaining = open.deadline.saturating_duration_since(Instant::now());
+                let remaining = open
+                    .effective_deadline()
+                    .saturating_duration_since(Instant::now());
                 AgentStatus {
                     unlocked: true,
                     method: Some(method_str(open.method).into()),
@@ -725,6 +925,10 @@ impl Agent {
                             + ChronoDuration::seconds(remaining.as_secs().min(i64::MAX as u64) as i64),
                     ),
                     idle_timeout_secs: self.idle.as_secs(),
+                    session_ends_at: (max_session_secs > 0).then_some(open.ceiling_wall),
+                    max_session_secs,
+                    last_lock_reason: self.last_lock_reason,
+                    sleep_watch,
                     record_count: open.vault.records().len(),
                     counts_by_kind: open
                         .vault
@@ -740,6 +944,10 @@ impl Agent {
                 method: None,
                 expires_at: None,
                 idle_timeout_secs: self.idle.as_secs(),
+                session_ends_at: None,
+                max_session_secs,
+                last_lock_reason: self.last_lock_reason,
+                sleep_watch,
                 record_count: 0,
                 counts_by_kind: Vec::new(),
                 rollback_suspected: false,
@@ -756,13 +964,20 @@ impl Agent {
             method: snapshot.method.clone(),
             expires_at: snapshot.expires_at,
             idle_timeout_secs: snapshot.idle_timeout_secs,
+            session_ends_at: snapshot.session_ends_at,
+            max_session_secs: snapshot.max_session_secs,
+            last_lock_reason: snapshot.last_lock_reason.map(|r| r.as_str().to_string()),
+            sleep_watch: snapshot.sleep_watch.clone(),
         };
-        Status::probe(
+        let status = Status::probe(
             &self.vault_path,
             view,
             HostPosture::measure().with_harden(self.hardening),
-        )
-        .publish()?;
+        );
+        match &self.status_dir {
+            Some(dir) => status.publish_to(dir)?,
+            None => status.publish()?,
+        };
         Ok(())
     }
 }
@@ -834,10 +1049,15 @@ fn peer_uid(stream: &UnixStream) -> Result<u32> {
     Ok(cred.uid)
 }
 
-/// Client side: one request, one response.
+/// Client side: one request, one response, at the default socket.
 pub fn ask(request: &Request) -> Result<Response> {
     let path = socket_path()?;
-    let mut stream = UnixStream::connect(&path)
+    ask_at(&path, request)
+}
+
+/// Client side against an explicit socket path.
+pub fn ask_at(path: &Path, request: &Request) -> Result<Response> {
+    let mut stream = UnixStream::connect(path)
         .with_context(|| format!("no agent listening at {}", path.display()))?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     serde_json::to_writer(&mut stream, request)?;
@@ -927,6 +1147,10 @@ mod tests {
             method: Some("passphrase".into()),
             expires_at: None,
             idle_timeout_secs: 900,
+            session_ends_at: None,
+            max_session_secs: DEFAULT_MAX_SESSION_SECS,
+            last_lock_reason: Some(LockReason::Idle),
+            sleep_watch: None,
             record_count: 1,
             counts_by_kind: vec![("login".into(), 1)],
             rollback_suspected: false,
@@ -1190,6 +1414,135 @@ mod tests {
         // added a Debug that would spill them into a log or panic message.
         let shown = format!("{:?}", login_draft().into_record().unwrap());
         assert!(!shown.contains("hunter2"), "Record Debug leaked: {shown}");
+    }
+
+    // ── the agent itself ────────────────────────────────────────────────────
+
+    fn spawn_test_agent(idle_secs: u64, max_secs: u64) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use crate::vault::Vault;
+        crate::vault::Witness::isolate_for_tests();
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault = dir.path().join("vault.cbor");
+        Vault::init(&vault, b"agent test passphrase", 32_768).unwrap();
+        let sock = dir.path().join("agent.sock");
+        let status_dir = dir.path().join("status");
+        let agent = Agent::new(vault.clone(), idle_secs)
+            .with_max_session_secs(max_secs)
+            .with_status_dir(status_dir);
+        let sock_for_thread = sock.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = agent.serve_at(&sock_for_thread) {
+                eprintln!("test agent: {e}");
+            }
+        });
+        let started = Instant::now();
+        while UnixStream::connect(&sock).is_err() {
+            assert!(started.elapsed() < Duration::from_secs(10), "agent never listened");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        (dir, vault, sock)
+    }
+
+    #[test]
+    fn a_silent_peer_cannot_stall_the_agent() {
+        // Before PEER_IO_TIMEOUT existed this test hung forever: `handle`
+        // blocked in `read_line` on the silent stream and no other client —
+        // and no idle expiry — could run until the peer went away.
+        let (_dir, _vault, sock) = spawn_test_agent(60, 0);
+
+        let _silent = UnixStream::connect(&sock).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        let started = Instant::now();
+        let reply = ask_at(&sock, &Request::Status).expect("the agent must still answer");
+        assert!(matches!(reply, Response::Status(_)));
+        assert!(
+            started.elapsed() < PEER_IO_TIMEOUT + Duration::from_secs(5),
+            "a silent peer delayed the agent by {:?}",
+            started.elapsed()
+        );
+        let _ = ask_at(&sock, &Request::Shutdown);
+    }
+
+    #[test]
+    fn the_session_ceiling_locks_a_busy_session() {
+        // Idle = 60 s, ceiling = 60 s floor... the ceiling floor is 60 s, so
+        // instead assert the arithmetic through the status document: the
+        // ceiling is reported and the effective deadline never exceeds it.
+        let (_dir, _vault, sock) = spawn_test_agent(30, 60);
+        let reply = ask_at(
+            &sock,
+            &Request::Unlock {
+                passphrase: "agent test passphrase".into(),
+            },
+        )
+        .unwrap();
+        let Response::Status(status) = reply else {
+            panic!("unlock did not return status: {reply:?}");
+        };
+        assert!(status.unlocked);
+        assert_eq!(status.max_session_secs, 60);
+        let ends = status.session_ends_at.expect("ceiling is reported while unlocked");
+        let expires = status.expires_at.expect("deadline is reported while unlocked");
+        assert!(expires <= ends + ChronoDuration::seconds(1));
+
+        // Touch keeps the idle deadline sliding but never past the ceiling.
+        std::thread::sleep(Duration::from_millis(300));
+        let Response::Status(after) = ask_at(&sock, &Request::Touch).unwrap() else {
+            panic!("touch did not return status");
+        };
+        assert!(after.expires_at.unwrap() <= ends + ChronoDuration::seconds(1));
+        let _ = ask_at(&sock, &Request::Shutdown);
+    }
+
+    #[test]
+    fn a_lock_signal_locks_and_names_its_reason() {
+        use crate::vault::Vault;
+        crate::vault::Witness::isolate_for_tests();
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault = dir.path().join("vault.cbor");
+        Vault::init(&vault, b"agent test passphrase", 32_768).unwrap();
+        let sock = dir.path().join("agent.sock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state = std::sync::Arc::new(std::sync::Mutex::new("test watcher".to_string()));
+        let agent = Agent::new(vault.clone(), 60)
+            .with_lock_signals(rx, state)
+            .with_status_dir(dir.path().join("status"));
+        let sock_for_thread = sock.clone();
+        std::thread::spawn(move || {
+            let _ = agent.serve_at(&sock_for_thread);
+        });
+        let started = Instant::now();
+        while UnixStream::connect(&sock).is_err() {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let reply = ask_at(
+            &sock,
+            &Request::Unlock {
+                passphrase: "agent test passphrase".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(reply, Response::Status(AgentStatus { unlocked: true, .. })));
+
+        tx.send(LockReason::Suspend).unwrap();
+        // The serve loop drains signals between accepts (every ~120 ms).
+        let started = Instant::now();
+        loop {
+            let Response::Status(status) = ask_at(&sock, &Request::Status).unwrap() else {
+                panic!("status did not return status");
+            };
+            if !status.unlocked {
+                assert_eq!(status.last_lock_reason, Some(LockReason::Suspend));
+                assert_eq!(status.sleep_watch.as_deref(), Some("test watcher"));
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "signal never locked the vault");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = ask_at(&sock, &Request::Shutdown);
     }
 
     #[test]
