@@ -87,7 +87,7 @@ After=graphical-session.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/black-bag agent serve --idle-secs 900
-Restart=on-failure
+Restart=always
 RestartSec=2
 
 # The agent holds a decryption key in memory for as long as the vault is
