@@ -321,13 +321,17 @@ impl RecordDraft {
     ///
     /// A secret submitted as an empty string is left untouched, so a UI can
     /// present an edit form without ever holding the current password.
-    pub fn apply_to(&self, record: &mut Record) -> Result<()> {
+    /// Apply the draft, returning the names of the secret fields whose value
+    /// this changed — replaced or removed. The caller uses that to drop any
+    /// breach verdict attached to the value that is no longer there.
+    pub fn apply_to(&self, record: &mut Record) -> Result<Vec<String>> {
         let kind: Kind = self.kind.parse()?;
         record.kind = kind;
         record.title = self.title.clone();
         record.tags = self.tags.clone();
         record.attributes = self.attributes.clone();
 
+        let mut changed: Vec<String> = Vec::new();
         for (name, value) in &self.secrets {
             if name.trim().is_empty() {
                 bail!("a secret field must have a name");
@@ -336,6 +340,7 @@ impl RecordDraft {
                 continue;
             }
             record.set_field(name, Secret::from_str(value));
+            changed.push(name.clone());
         }
 
         // A field the draft no longer lists is a field the user removed.
@@ -345,6 +350,11 @@ impl RecordDraft {
             .map(|(n, _)| n.as_str())
             .chain(self.totp.is_some().then_some("totp"))
             .collect();
+        for field in &record.fields {
+            if !kept.contains(field.name.as_str()) {
+                changed.push(field.name.clone());
+            }
+        }
         record.fields.retain(|f| kept.contains(f.name.as_str()));
 
         match &self.totp {
@@ -406,7 +416,7 @@ impl RecordDraft {
 
         record.updated_at = Utc::now();
         record.validate()?;
-        Ok(())
+        Ok(changed)
     }
 }
 
@@ -838,7 +848,14 @@ impl Agent {
                     .vault
                     .get_mut(id)
                     .ok_or_else(|| anyhow!("record not found"))?;
-                draft.apply_to(record)?;
+                let changed = draft.apply_to(record)?;
+                // A field whose value the user just replaced cannot still be
+                // carrying the verdict the corpus gave the old one. Without
+                // this the deck kept calling a freshly changed password
+                // breached until the next online check.
+                for name in changed {
+                    open.exposure.remove(&(id, name));
+                }
                 open.vault.save()?;
                 self.publish()?;
                 Ok(Response::Saved { id: id.to_string() })
@@ -849,6 +866,7 @@ impl Agent {
                 let _guard = crate::vault::open_lock(&self.vault_path)?;
                 let open = self.opened()?;
                 open.vault.remove_record(id)?;
+                open.exposure.retain(|(record_id, _), _| *record_id != id);
                 open.vault.save()?;
                 self.publish()?;
                 Ok(Response::Ok)
@@ -874,10 +892,8 @@ impl Agent {
 
             Request::BreachMatch { ranges } => {
                 let open = self.opened()?;
-                let (report, map) = crate::breach::match_ranges(open.vault.records(), &ranges);
-                // A fresh check replaces the previous one wholesale: a value
-                // that was exposed and has since been changed must not keep
-                // its old verdict.
+                let (report, map) =
+                    crate::breach::match_ranges(open.vault.records(), &ranges, &open.exposure);
                 open.exposure = map;
                 Ok(Response::Breach(report))
             }
@@ -1021,9 +1037,14 @@ fn method_str(method: UnlockMethod) -> &'static str {
 }
 
 /// Current TOTP code plus seconds until it rolls.
+/// Current TOTP code plus seconds until it rolls.
+///
+/// Computed by [`crate::totp`] rather than by `totp-rs`, which takes the
+/// shared secret as an ordinary `Vec<u8>` and holds it, unzeroized, for the
+/// life of the `TOTP` object — so every code the deck displayed copied the
+/// long-lived 2FA credential into unlocked heap that was freed without being
+/// wiped. Here the secret is borrowed straight out of the arena.
 pub fn totp_now(record: &Record) -> Result<(String, u64, u64)> {
-    use totp_rs::{Algorithm, TOTP};
-
     let config = record
         .totp
         .as_ref()
@@ -1031,21 +1052,18 @@ pub fn totp_now(record: &Record) -> Result<(String, u64, u64)> {
     let secret = record
         .field("totp")
         .ok_or_else(|| anyhow!("record has no TOTP secret"))?;
-    let algorithm = match config.algorithm {
-        crate::record::TotpAlgorithm::Sha1 => Algorithm::SHA1,
-        crate::record::TotpAlgorithm::Sha256 => Algorithm::SHA256,
-        crate::record::TotpAlgorithm::Sha512 => Algorithm::SHA512,
-    };
-    let totp = TOTP::new(
-        algorithm,
-        usize::from(config.digits),
-        config.skew,
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| anyhow!("the system clock is before the epoch"))?
+        .as_secs();
+    let opened = secret.open();
+    let (code, ttl) = crate::totp::totp_at(
+        opened.as_slice(),
+        now,
         config.step,
-        secret.open().to_vec(),
-    )
-    .map_err(|e| anyhow!("invalid TOTP configuration: {e}"))?;
-    let code = totp.generate_current()?;
-    let ttl = totp.ttl()?;
+        config.digits,
+        config.algorithm,
+    )?;
     Ok((code, ttl, config.step))
 }
 

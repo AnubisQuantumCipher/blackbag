@@ -37,7 +37,6 @@ rpassword = "7"
 directories = "5"
 fd-lock = "4"
 tempfile = "3"
-totp-rs = { version = "5", features = ["serde_support"] }
 base32 = "0.5"
 base64 = "0.22"
 hex = "0.4"

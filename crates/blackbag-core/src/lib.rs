@@ -16,6 +16,7 @@ pub mod secmem;
 pub mod session;
 pub mod sleepwatch;
 pub mod status;
+pub mod totp;
 pub mod vault;
 
 use std::path::PathBuf;

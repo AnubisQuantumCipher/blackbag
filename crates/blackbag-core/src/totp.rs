@@ -40,10 +40,21 @@ pub fn hotp(secret: &[u8], counter: u64, digits: u8, algorithm: TotpAlgorithm) -
     // The MAC output is not secret — it is a function of a counter the world
     // can compute — but it is derived from one, so it goes in the arena too
     // and is wiped when this returns.
+    // Written out per hash rather than behind a generic bound, so this module
+    // needs no `digest` dependency of its own: the whole point of it is to
+    // keep the shared secret's path short.
+    macro_rules! mac {
+        ($hash:ty) => {{
+            let mut mac = <Hmac<$hash> as Mac>::new_from_slice(secret)
+                .expect("HMAC accepts any key length");
+            mac.update(&message);
+            SecretBuf::new(&mac.finalize().into_bytes())
+        }};
+    }
     let mac: SecretBuf = match algorithm {
-        TotpAlgorithm::Sha1 => mac_with::<Sha1>(secret, &message),
-        TotpAlgorithm::Sha256 => mac_with::<Sha256>(secret, &message),
-        TotpAlgorithm::Sha512 => mac_with::<Sha512>(secret, &message),
+        TotpAlgorithm::Sha1 => mac!(Sha1),
+        TotpAlgorithm::Sha256 => mac!(Sha256),
+        TotpAlgorithm::Sha512 => mac!(Sha512),
     };
 
     // Dynamic truncation. The offset comes from the low nibble of the LAST
@@ -63,14 +74,6 @@ pub fn hotp(secret: &[u8], counter: u64, digits: u8, algorithm: TotpAlgorithm) -
     ))
 }
 
-fn mac_with<D>(secret: &[u8], message: &[u8]) -> SecretBuf
-where
-    D: digest::Digest + digest::core_api::BlockSizeUser + Clone + digest::FixedOutputReset,
-{
-    let mut mac = <Hmac<D> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(message);
-    SecretBuf::new(&mac.finalize().into_bytes())
-}
 
 /// The code for `unix_seconds`, and how many seconds of its step remain.
 pub fn totp_at(

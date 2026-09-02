@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::record::Record;
 
@@ -86,13 +87,22 @@ pub struct Report {
 /// The map the agent keeps for the life of a session.
 pub type ExposureMap = HashMap<(Uuid, String), u64>;
 
-/// Uppercase hex SHA-1 of `bytes`.
-pub fn sha1_hex(bytes: &[u8]) -> String {
-    let digest = Sha1::digest(bytes);
-    let mut out = String::with_capacity(40);
-    for b in digest {
-        out.push_str(&format!("{b:02X}"));
+/// Uppercase hex SHA-1 of `bytes`, in a buffer that wipes itself.
+///
+/// The full hash is the password's hash, and a password hash is exactly what
+/// an offline attacker wants; leaving forty bytes of it in freed heap for the
+/// life of the process would hand that over for nothing. The string is
+/// allocated at its final size so it cannot reallocate and strand a copy, and
+/// the digest itself is wiped before this returns.
+pub fn sha1_hex(bytes: &[u8]) -> Zeroizing<String> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut digest = Sha1::digest(bytes);
+    let mut out = Zeroizing::new(String::with_capacity(40));
+    for b in digest.iter() {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
     }
+    digest.as_mut_slice().zeroize();
     out
 }
 
@@ -155,7 +165,18 @@ pub fn parse_range(prefix: &str, body: &str) -> Range {
 
 /// Match every candidate field against the supplied buckets. Runs inside the
 /// agent: the full hash is computed here and compared here.
-pub fn match_ranges(records: &[Record], ranges: &[Range]) -> (Report, ExposureMap) {
+///
+/// `previous` carries the verdicts from an earlier check in this session, and
+/// a field whose bucket did not arrive this time keeps the one it had. The
+/// map used to be replaced wholesale, so a single failed fetch — one HTTP 429,
+/// or a run with the network down — silently downgraded a known-exposed
+/// password to "not exposed" while the report said only that something had
+/// not been checked.
+pub fn match_ranges(
+    records: &[Record],
+    ranges: &[Range],
+    previous: &ExposureMap,
+) -> (Report, ExposureMap) {
     let buckets: BTreeMap<&str, &Range> = ranges.iter().map(|r| (r.prefix.as_str(), r)).collect();
     let mut report = Report::default();
     let mut map = ExposureMap::new();
@@ -169,6 +190,10 @@ pub fn match_ranges(records: &[Record], ranges: &[Range]) -> (Report, ExposureMa
             let (prefix, suffix) = hash.split_at(PREFIX_LEN);
             let Some(bucket) = buckets.get(prefix) else {
                 report.unchecked += 1;
+                // Not checked is not the same as not exposed.
+                if let Some(&count) = previous.get(&(record.id, field.name.clone())) {
+                    map.insert((record.id, field.name.clone()), count);
+                }
                 continue;
             };
             report.checked += 1;
@@ -199,7 +224,7 @@ mod tests {
 
     #[test]
     fn sha1_matches_the_known_vector() {
-        assert_eq!(sha1_hex(b"password"), PASSWORD_SHA1);
+        assert_eq!(sha1_hex(b"password").as_str(), PASSWORD_SHA1);
     }
 
     fn vault() -> Vec<Record> {
@@ -255,7 +280,7 @@ mod tests {
             &PASSWORD_SHA1[..5],
             &format!("{}:3861493\n", &PASSWORD_SHA1[5..]),
         );
-        let (report, map) = match_ranges(&records, &[range]);
+        let (report, map) = match_ranges(&records, &[range], &ExposureMap::new());
         assert_eq!(report.checked, 1, "only the bucket we supplied is checked");
         assert_eq!(report.unchecked, 1, "the strong password's prefix had no bucket");
         assert_eq!(report.exposed.len(), 1);
@@ -263,6 +288,31 @@ mod tests {
         assert_eq!(report.exposed[0].breaches, 3_861_493);
         assert_eq!(map.len(), 1);
         assert_eq!(map[&(records[0].id, "password".to_string())], 3_861_493);
+    }
+
+    /// A failed fetch must not downgrade a known-exposed password.
+    #[test]
+    fn an_unchecked_field_keeps_the_verdict_it_already_had() {
+        let records = vault();
+        let key = (records[0].id, "password".to_string());
+
+        // First run: the bucket arrives and the password is found.
+        let range = parse_range(&PASSWORD_SHA1[..5], &format!("{}:9\n", &PASSWORD_SHA1[5..]));
+        let (_, first) = match_ranges(&records, &[range], &ExposureMap::new());
+        assert_eq!(first.get(&key), Some(&9));
+
+        // Second run with nothing fetched at all: the verdict survives, and
+        // every field is reported as unchecked rather than as clean.
+        let (report, second) = match_ranges(&records, &[], &first);
+        assert_eq!(report.checked, 0);
+        assert_eq!(report.unchecked, 2);
+        assert_eq!(second.get(&key), Some(&9), "a failed fetch erased a real finding");
+
+        // A run that does check it and does not find it clears the verdict.
+        let empty_bucket = parse_range(&PASSWORD_SHA1[..5], "0000000000000000000000000000000000A:1\n");
+        let (report, third) = match_ranges(&records, &[empty_bucket], &second);
+        assert_eq!(report.checked, 1);
+        assert_eq!(third.get(&key), None, "a checked-and-absent field must be cleared");
     }
 
     #[test]
@@ -276,7 +326,7 @@ mod tests {
             &canary_hash[..5],
             &format!("{}:7\n", &canary_hash[5..]),
         );
-        let (report, _) = match_ranges(&records, &[range]);
+        let (report, _) = match_ranges(&records, &[range], &ExposureMap::new());
         assert_eq!(report.exposed.len(), 1);
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("LEAK-CANARY-VALUE"), "value leaked: {json}");
