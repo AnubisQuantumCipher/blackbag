@@ -47,6 +47,9 @@ pub enum ImportFormat {
     Firefox,
     Chrome,
     Csv,
+    /// This program's own JSON export. An export you cannot import is a
+    /// backup you cannot restore.
+    BlackBag,
 }
 
 /// Formats this build writes.
@@ -83,6 +86,102 @@ pub fn parse(format: ImportFormat, text: &str) -> Result<Imported> {
         ImportFormat::Firefox => firefox(text),
         ImportFormat::Chrome => chrome(text),
         ImportFormat::Csv => generic_csv(text),
+        ImportFormat::BlackBag => black_bag_json(text),
+    }
+}
+
+/// This program's own JSON export, read back whole: kinds, tags, attributes,
+/// every secret field with its declared encoding, notes and TOTP.
+fn black_bag_json(text: &str) -> Result<Imported> {
+    let doc: serde_json::Value =
+        serde_json::from_str(text).context("not a Black-Bag JSON export")?;
+    if doc.get("format").and_then(|f| f.as_str()) != Some("black-bag-export") {
+        bail!("this is not a Black-Bag export; its `format` field does not say so");
+    }
+    let records = doc
+        .get("records")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| anyhow!("no records array in this export"))?;
+
+    let mut out = Imported::default();
+    for (n, item) in records.iter().enumerate() {
+        let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
+        let kind: Kind = match item.get("kind").and_then(|k| k.as_str()).unwrap_or("login").parse() {
+            Ok(k) => k,
+            Err(e) => {
+                out.skipped.push(format!("record {n} ({title}): {e}"));
+                continue;
+            }
+        };
+        let mut record = Record::new(kind, (!title.is_empty()).then(|| title.to_string()));
+
+        if let Some(tags) = item.get("tags").and_then(|t| t.as_array()) {
+            record.tags = tags
+                .iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect();
+        }
+        if let Some(attrs) = item.get("attributes").and_then(|a| a.as_object()) {
+            for (k, v) in attrs {
+                if let Some(v) = v.as_str() {
+                    set_attr_if(&mut record, k, v);
+                }
+            }
+        }
+        if let Some(secrets) = item.get("secrets").and_then(|s| s.as_object()) {
+            for (name, value) in secrets {
+                match decode_export_secret(value) {
+                    Some(bytes) => record.set_field(name, Secret::new(&bytes)),
+                    None => out
+                        .skipped
+                        .push(format!("record {n} ({title}): field '{name}' is not readable")),
+                }
+            }
+        }
+        if let Some(notes) = item.get("notes").and_then(|v| v.as_str()) {
+            set_notes_if(&mut record, notes);
+        }
+        if let Some(totp) = item.get("totp").filter(|t| !t.is_null()) {
+            let defaults = TotpConfig::default();
+            record.totp = Some(TotpConfig {
+                issuer: totp.get("issuer").and_then(|v| v.as_str()).map(str::to_string),
+                account: totp.get("account").and_then(|v| v.as_str()).map(str::to_string),
+                digits: totp
+                    .get("digits")
+                    .and_then(|v| v.as_u64())
+                    .map(|d| d as u8)
+                    .unwrap_or(defaults.digits),
+                step: totp
+                    .get("step")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(defaults.step),
+                algorithm: match totp.get("algorithm").and_then(|v| v.as_str()) {
+                    Some("sha256") => blackbag_core::record::TotpAlgorithm::Sha256,
+                    Some("sha512") => blackbag_core::record::TotpAlgorithm::Sha512,
+                    _ => blackbag_core::record::TotpAlgorithm::Sha1,
+                },
+                ..defaults
+            });
+        }
+
+        if let Err(e) = record.validate() {
+            out.skipped.push(format!("record {n} ({title}): {e}"));
+            continue;
+        }
+        out.records.push(record);
+    }
+    Ok(out)
+}
+
+/// A secret from the export: `{"encoding": "utf8"|"base64", "value": …}`.
+fn decode_export_secret(value: &serde_json::Value) -> Option<Vec<u8>> {
+    let text = value.get("value")?.as_str()?;
+    match value.get("encoding").and_then(|e| e.as_str()) {
+        Some("base64") => {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text).ok()
+        }
+        Some("utf8") => Some(text.as_bytes().to_vec()),
+        _ => None,
     }
 }
 
@@ -1158,6 +1257,60 @@ mod tests {
     }
 
     /// Junk in must not become records out.
+    /// An export you cannot import is a backup you cannot restore.
+    #[test]
+    fn the_json_export_imports_back_exactly() {
+        let mut login = Record::new(Kind::Login, Some("GitHub".into()));
+        login.set_attribute("username", "octocat");
+        login.set_attribute("url", "https://github.com");
+        login.set_field("password", Secret::from_str("hunter2"));
+        login.tags = vec!["work".into()];
+        login.notes = Some(Secret::from_str("the main one"));
+
+        let mut totp = Record::new(Kind::Totp, Some("GitHub 2FA".into()));
+        let (bytes, mut cfg) =
+            parse_otpauth("otpauth://totp/GitHub:octocat?secret=JBSWY3DPEHPK3PXP&issuer=GitHub")
+                .unwrap();
+        cfg.issuer = Some("GitHub".into());
+        cfg.digits = 8;
+        cfg.step = 60;
+        // A raw seed is not UTF-8, which is the case the untagged export
+        // could not represent unambiguously.
+        totp.set_field("totp", Secret::new(&bytes));
+        totp.totp = Some(cfg);
+
+        let json = render(&[login, totp], ExportFormat::Json).unwrap();
+        let back = parse(ImportFormat::BlackBag, &json).unwrap();
+        assert_eq!(back.records.len(), 2, "{:?}", back.skipped);
+        assert!(back.skipped.is_empty(), "{:?}", back.skipped);
+
+        let a = &back.records[0];
+        assert_eq!(a.kind, Kind::Login);
+        assert_eq!(a.title.as_deref(), Some("GitHub"));
+        assert_eq!(a.attribute("username"), Some("octocat"));
+        assert_eq!(a.field("password").unwrap().expose_str().unwrap().as_str(), "hunter2");
+        assert_eq!(a.tags, vec!["work"]);
+        assert_eq!(a.notes.as_ref().unwrap().expose_str().unwrap().as_str(), "the main one");
+
+        let b = &back.records[1];
+        assert_eq!(b.kind, Kind::Totp);
+        assert_eq!(
+            b.field("totp").unwrap().open().as_slice(),
+            bytes.as_slice(),
+            "a non-UTF-8 seed must survive the round trip byte for byte"
+        );
+        let cfg = b.totp.as_ref().unwrap();
+        assert_eq!(cfg.digits, 8);
+        assert_eq!(cfg.step, 60);
+        assert_eq!(cfg.issuer.as_deref(), Some("GitHub"));
+
+        // And something that is not one of our exports is refused by name.
+        let err = parse(ImportFormat::BlackBag, r#"{"records": []}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a Black-Bag export"), "{err}");
+    }
+
     #[test]
     fn blank_rows_are_dropped_and_an_unrecognisable_header_is_refused() {
         let with_blanks = "name,url,username,password,note\n\
