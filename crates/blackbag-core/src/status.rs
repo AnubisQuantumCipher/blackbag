@@ -214,6 +214,7 @@ pub struct KdfView {
 
 /// Agent/session state. Carries deadlines and reasons, never key material.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct SessionView {
     pub unlocked: bool,
     pub method: Option<String>,
@@ -235,20 +236,6 @@ pub struct SessionView {
     pub sleep_watch: Option<String>,
 }
 
-impl Default for SessionView {
-    fn default() -> Self {
-        Self {
-            unlocked: false,
-            method: None,
-            expires_at: None,
-            idle_timeout_secs: 0,
-            session_ends_at: None,
-            max_session_secs: 0,
-            last_lock_reason: None,
-            sleep_watch: None,
-        }
-    }
-}
 
 /// The whole document.
 #[derive(Debug, Clone, Serialize, Deserialize)]

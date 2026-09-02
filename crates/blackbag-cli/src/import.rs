@@ -233,9 +233,11 @@ fn attach_totp(record: &mut Record, value: &str) -> Option<String> {
         parse_otpauth(value)
     } else {
         decode_base32(value).map(|bytes| {
-            let mut config = TotpConfig::default();
-            config.issuer = record.title.clone();
-            config.account = record.attribute("username").map(str::to_string);
+            let config = TotpConfig {
+                issuer: record.title.clone(),
+                account: record.attribute("username").map(str::to_string),
+                ..TotpConfig::default()
+            };
             (bytes, config)
         })
     };
@@ -686,7 +688,7 @@ fn render_keepassxc(records: &[Record]) -> Result<Zeroizing<String>> {
         for f in &r.fields {
             if Some(f.name.as_str()) != primary.map(|(n, _)| *n) && f.name != "totp" {
                 if let Ok(v) = f.secret.expose_str() {
-                    notes.push(format!("{}: {}", f.name, &*v));
+                    notes.push(format!("{}: {}", f.name, *v));
                 }
             }
         }

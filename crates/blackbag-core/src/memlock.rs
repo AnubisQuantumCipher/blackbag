@@ -88,7 +88,7 @@ pub fn memlock_limit() -> (u64, bool) {
         return (0, false);
     }
     let unlimited = lim.rlim_cur == libc::RLIM_INFINITY;
-    (lim.rlim_cur as u64, unlimited)
+    (lim.rlim_cur, unlimited)
 }
 
 /// Probe whether locking works at all right now, without keeping the lock.

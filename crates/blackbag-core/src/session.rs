@@ -898,12 +898,7 @@ impl Agent {
         // lose by re-reading — and without this the next save would silently
         // overwrite the other writer's records.
         let rekeyed = match self.open.as_mut() {
-            Some(open) => match open.vault.refresh() {
-                Ok(_) => false,
-                // The data key no longer opens the file: somebody re-keyed it.
-                // Holding a stale key would be worse than making them unlock.
-                Err(_) => true,
-            },
+            Some(open) => open.vault.refresh().is_err(),
             None => false,
         };
         if rekeyed {

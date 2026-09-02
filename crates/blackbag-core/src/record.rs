@@ -41,6 +41,9 @@ impl Secret {
         }
     }
 
+    /// Not `FromStr`: that trait returns a `Result`, and building a secret from
+    /// text cannot fail.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Self::new(s.as_bytes())
     }
