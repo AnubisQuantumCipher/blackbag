@@ -25,7 +25,7 @@
 //! is a few hundred bytes; anything approaching a megabyte is a bug or an
 //! attack, so the cap is enforced here rather than trusted to the peer.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use blackbag_core::session::{self, Request, Response};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
