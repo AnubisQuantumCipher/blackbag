@@ -423,7 +423,40 @@ fn main() {
     }
 }
 
+/// The extension allowed to speak native messaging to this binary.
+///
+/// Chromium already enforces `allowed_origins` from the host manifest before it
+/// launches us, so this is a second lock on the same door. It is cheap, and it
+/// means a manifest that was edited to point another extension at this binary
+/// still gets nowhere.
+const PASSKEY_EXTENSION_ORIGIN: &str = "chrome-extension://hjplachgmkpbbfdembcbodppbjcfgfpk/";
+
+/// Did the browser launch us as a native messaging host?
+///
+/// Chromium does not let a host manifest carry arguments. It runs the binary
+/// named by `path` and passes the calling extension's origin as the first
+/// argument (plus, on some platforms, a parent-window handle). So a native
+/// messaging host either is a dedicated binary, or it recognises the shape of
+/// that invocation — this does the latter, because a wrapper script whose only
+/// job is to drop an argument is one more file to install, keep in step and get
+/// wrong.
+///
+/// Without this, `black-bag` saw `chrome-extension://…` as an unknown argument,
+/// printed its usage and exited — and the extension reported only "Native host
+/// has exited", which says nothing about why.
+fn native_messaging_origin() -> Option<String> {
+    let arg = std::env::args().nth(1)?;
+    arg.starts_with("chrome-extension://").then_some(arg)
+}
+
 fn run(hardening: harden::HardenReport) -> Result<()> {
+    if let Some(origin) = native_messaging_origin() {
+        if origin.trim_end_matches('/') != PASSKEY_EXTENSION_ORIGIN.trim_end_matches('/') {
+            bail!("this native messaging host does not serve {origin}");
+        }
+        return passkey_host::serve();
+    }
+
     let cli = Cli::parse();
     let path = match cli.vault {
         Some(p) => p,

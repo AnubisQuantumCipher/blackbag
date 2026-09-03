@@ -36,6 +36,7 @@ use anyhow::{bail, Context, Result};
 use blackbag_core::session::{self, Request, Response};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 /// Chrome's documented per-message ceiling, applied in both directions.
 const MAX_MESSAGE: u32 = 1024 * 1024;
@@ -49,7 +50,15 @@ enum Incoming {
     Status,
     /// Register a ceremony. Fields mirror `Request::PasskeyBegin`.
     Begin(Box<BeginArgs>),
-    /// Poll for the answer.
+    /// Wait for the answer, and reply once.
+    ///
+    /// The waiting happens HERE, in a process the browser keeps alive for the
+    /// life of the port, rather than in the extension. An MV3 service worker is
+    /// torn down when it looks idle, and a poll loop inside one is torn down
+    /// with it — measured: the loop stopped after four polls, twenty-five
+    /// seconds before the human answered, and the page waited forever for a
+    /// ceremony that had already completed. One outstanding request also keeps
+    /// the worker alive, which polling did not.
     Collect { nonce: String },
     /// The browser gave up (timeout, or the page called abort).
     Cancel { nonce: String },
@@ -153,8 +162,8 @@ fn write_message(output: &mut impl Write, value: &Outgoing) -> Result<()> {
 }
 
 /// Translate one message and answer it.
-fn handle(incoming: Incoming) -> Outgoing {
-    match handle_inner(incoming) {
+fn handle(incoming: Incoming, output: &mut impl Write) -> Outgoing {
+    match handle_inner(incoming, output) {
         Ok(out) => out,
         Err(e) => Outgoing::Error {
             message: e.to_string(),
@@ -162,7 +171,7 @@ fn handle(incoming: Incoming) -> Outgoing {
     }
 }
 
-fn handle_inner(incoming: Incoming) -> Result<Outgoing> {
+fn handle_inner(incoming: Incoming, output: &mut impl Write) -> Result<Outgoing> {
     match incoming {
         Incoming::Status => match session::ask(&Request::Status)? {
             Response::Status(s) => Ok(Outgoing::Status {
@@ -199,32 +208,7 @@ fn handle_inner(incoming: Incoming) -> Result<Outgoing> {
             }
         }
 
-        Incoming::Collect { nonce } => match session::ask(&Request::PasskeyCollect { nonce })? {
-            Response::PasskeyWaiting => Ok(Outgoing::Waiting),
-            Response::PasskeyResult {
-                client_data_json,
-                credential_id,
-                authenticator_data,
-                signature,
-                user_handle,
-                attestation_object,
-                public_key_der,
-                prf_first,
-                prf_second,
-            } => Ok(Outgoing::Result {
-                client_data_json,
-                credential_id,
-                authenticator_data,
-                signature,
-                user_handle,
-                attestation_object,
-                public_key_der,
-                prf_first,
-                prf_second,
-            }),
-            Response::Error { message } => Ok(Outgoing::Error { message }),
-            other => bail!("unexpected reply to collect: {other:?}"),
-        },
+        Incoming::Collect { nonce } => collect_until_answered(&nonce, output),
 
         Incoming::Cancel { nonce } => {
             // The browser has stopped waiting, so take the prompt off the
@@ -243,6 +227,72 @@ fn handle_inner(incoming: Incoming) -> Result<Outgoing> {
     }
 }
 
+/// How long to wait for a human, and how often to ask the agent.
+///
+/// The agent expires a ceremony at 120 s and Chromium abandons the request at
+/// 180 s, so waiting a little under the agent's own ceiling means a lapsed
+/// ceremony is reported as an error rather than as silence.
+const WAIT_CEILING: Duration = Duration::from_secs(118);
+const WAIT_STEP: Duration = Duration::from_millis(350);
+
+/// How often to say "still waiting" while a human decides.
+///
+/// Not for the human's benefit — for the browser's. Chromium tears down an MV3
+/// service worker that has been idle for about thirty seconds, and a worker
+/// waiting on a native reply looks idle. Measured: the extension went silent
+/// mid-ceremony and the page waited forever for a signature the vault had
+/// already produced. A message on the port is activity, so one every twenty
+/// seconds keeps the worker alive for as long as the person is deciding.
+const HEARTBEAT: Duration = Duration::from_secs(20);
+
+/// Ask until there is an answer, sending a heartbeat while waiting.
+fn collect_until_answered(nonce: &str, output: &mut impl Write) -> Result<Outgoing> {
+    let started = Instant::now();
+    let mut last_beat = Instant::now();
+    loop {
+        match session::ask(&Request::PasskeyCollect {
+            nonce: nonce.to_string(),
+        })? {
+            Response::PasskeyWaiting => {}
+            Response::PasskeyResult {
+                client_data_json,
+                credential_id,
+                authenticator_data,
+                signature,
+                user_handle,
+                attestation_object,
+                public_key_der,
+                prf_first,
+                prf_second,
+            } => {
+                return Ok(Outgoing::Result {
+                    client_data_json,
+                    credential_id,
+                    authenticator_data,
+                    signature,
+                    user_handle,
+                    attestation_object,
+                    public_key_der,
+                    prf_first,
+                    prf_second,
+                })
+            }
+            Response::Error { message } => return Ok(Outgoing::Error { message }),
+            other => bail!("unexpected reply to collect: {other:?}"),
+        }
+        if started.elapsed() >= WAIT_CEILING {
+            return Ok(Outgoing::Error {
+                message: "Black-Bag was not answered in time".into(),
+            });
+        }
+        if last_beat.elapsed() >= HEARTBEAT {
+            write_message(output, &Outgoing::Waiting)?;
+            last_beat = Instant::now();
+        }
+        std::thread::sleep(WAIT_STEP);
+    }
+}
+
 /// Serve until the browser closes the port.
 pub fn serve() -> Result<()> {
     // Nothing secret passes through this process, but it is spawned by the
@@ -257,7 +307,7 @@ pub fn serve() -> Result<()> {
 
     while let Some(body) = read_message(&mut input)? {
         let reply = match serde_json::from_slice::<Incoming>(&body) {
-            Ok(incoming) => handle(incoming),
+            Ok(incoming) => handle(incoming, &mut output),
             Err(e) => Outgoing::Error {
                 message: format!("unintelligible message: {e}"),
             },
@@ -326,7 +376,7 @@ mod tests {
     #[test]
     fn nonsense_is_answered_with_an_error_rather_than_a_crash() {
         let reply = match serde_json::from_slice::<Incoming>(b"{\"type\":\"nope\"}") {
-            Ok(i) => handle(i),
+            Ok(i) => handle(i, &mut Vec::new()),
             Err(e) => Outgoing::Error {
                 message: format!("unintelligible message: {e}"),
             },
@@ -353,7 +403,7 @@ mod tests {
             prf_first_salt: None,
             prf_second_salt: None,
         };
-        let reply = handle(Incoming::Begin(Box::new(args)));
+        let reply = handle(Incoming::Begin(Box::new(args)), &mut Vec::new());
         let Outgoing::Error { message } = reply else {
             panic!("an unknown operation must be an error")
         };

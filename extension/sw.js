@@ -30,12 +30,6 @@
 
 const HOST = 'com.khephri.blackbag';
 
-// Chromium abandons a request at 180s. Poll a little faster than the agent's
-// own 120s ceremony expiry so a lapsed ceremony is reported rather than
-// silently pending.
-const POLL_MS = 700;
-const POLL_CEILING_MS = 115_000;
-
 // ── base64url, the encoding WebAuthn's JSON forms use ───────────────────────
 // Not plain base64: `+` and `/` would be re-encoded by the relying party's own
 // parser into something that no longer matches what was signed.
@@ -67,6 +61,8 @@ const b64urlFromHex = h => bytesToB64url(hexToBytes(h));
 
 // ── the native host ─────────────────────────────────────────────────────────
 
+// One-shot, for questions with no follow-up. Chromium starts a fresh host
+// process for every sendNativeMessage.
 function callHost(message) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendNativeMessage(HOST, message, reply => {
@@ -81,6 +77,55 @@ function callHost(message) {
       resolve(reply);
     });
   });
+}
+
+/**
+ * One host process for one ceremony.
+ *
+ * This is not an optimisation. Black-Bag binds a ceremony to the process that
+ * registered it, so that a human who approves a login approves it for the thing
+ * that asked, and some other local process cannot poll for the answer and take
+ * the signature. `sendNativeMessage` starts a NEW host process per message — so
+ * `begin` and `collect` arrived as two different peers, the agent refused to
+ * hand the answer to the second one, and every ceremony hung forever after
+ * being approved. The symptom was a page that waited and a vault that never
+ * gained a credential.
+ *
+ * A port keeps one process alive across both, and is closed the moment the
+ * ceremony ends, so nothing holds a channel to the agent between ceremonies.
+ */
+function openCeremonyPort() {
+  const port = chrome.runtime.connectNative(HOST);
+  const waiting = [];
+  let closed = null;
+
+  port.onMessage.addListener(msg => {
+    const next = waiting.shift();
+    if (next) next.resolve(msg);
+  });
+  port.onDisconnect.addListener(() => {
+    closed = new Error(chrome.runtime.lastError?.message ?? 'Black-Bag closed the connection');
+    while (waiting.length) waiting.shift().reject(closed);
+  });
+
+  return {
+    send(message) {
+      if (closed) return Promise.reject(closed);
+      return new Promise((resolve, reject) => {
+        waiting.push({ resolve, reject });
+        port.postMessage(message);
+      });
+    },
+    /// Await the next message without sending one — for the heartbeats the
+    /// host emits while a human decides.
+    next() {
+      if (closed) return Promise.reject(closed);
+      return new Promise((resolve, reject) => waiting.push({ resolve, reject }));
+    },
+    close() {
+      try { port.disconnect(); } catch { /* already gone */ }
+    },
+  };
 }
 
 // ── attachment ──────────────────────────────────────────────────────────────
@@ -125,27 +170,28 @@ async function detach() {
 /** Ceremonies Chromium has asked for and not yet cancelled. */
 const live = new Map(); // requestId -> {nonce, cancelled}
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
 /**
- * Wait for the human, in Black-Bag.
+ * Wait for the human.
  *
- * Polling rather than a push: the native host is a short-lived process spawned
- * per message, and a long-lived port that sat open for the life of the browser
- * would be a standing invitation to the agent socket for as long as the browser
- * ran.
+ * ONE outstanding request, not a poll loop. A poll loop lived here once and it
+ * did not survive: an MV3 service worker is torn down when it looks idle, and
+ * the loop went with it — measured, the polling stopped four requests in and
+ * twenty-five seconds before the person answered, so the page waited forever
+ * for a ceremony that had already completed. The waiting now happens in the
+ * native host, a process the browser keeps alive for the life of this port, and
+ * a single outstanding request is itself what keeps this worker alive.
  */
-async function awaitAnswer(requestId, nonce) {
-  const started = Date.now();
-  while (Date.now() - started < POLL_CEILING_MS) {
-    const entry = live.get(requestId);
-    if (!entry || entry.cancelled) throw new Error('the request was cancelled');
-    const reply = await callHost({ type: 'collect', nonce });
-    if (reply.type === 'result') return reply;
-    if (reply.type === 'error') throw new Error(reply.message);
-    await sleep(POLL_MS);
-  }
-  throw new Error('Black-Bag was not answered in time');
+async function awaitAnswer(port, requestId, nonce) {
+  let reply = await port.send({ type: 'collect', nonce });
+  // The host sends 'waiting' periodically while the person decides. Those are
+  // not the answer; they exist so this worker is not torn down for looking
+  // idle. Keep reading until the real one arrives.
+  while (reply.type === 'waiting') reply = await port.next();
+
+  const entry = live.get(requestId);
+  if (!entry || entry.cancelled) throw new Error('the request was cancelled');
+  if (reply.type === 'result') return reply;
+  throw new Error(reply.message ?? 'Black-Bag did not answer');
 }
 
 // NOTE: this extension does NOT build clientDataJSON, and must not start.
@@ -177,7 +223,9 @@ async function onCreate(info) {
 
   const wantPrf = !!details.extensions?.prf;
 
-  const begun = await callHost({
+  const port = openCeremonyPort();
+  try {
+  const begun = await port.send({
     type: 'begin',
     operation: 'create',
     origin: caller.origin,
@@ -193,7 +241,7 @@ async function onCreate(info) {
   if (begun.type === 'error') throw new Error(begun.message);
 
   live.set(requestId, { nonce: begun.nonce, cancelled: false });
-  const result = await awaitAnswer(requestId, begun.nonce);
+  const result = await awaitAnswer(port, requestId, begun.nonce);
 
   return {
     type: 'public-key',
@@ -216,6 +264,10 @@ async function onCreate(info) {
       ...(wantPrf ? { prf: { enabled: true } } : {}),
     },
   };
+  } finally {
+    // Nothing holds a channel to the agent between ceremonies.
+    port.close();
+  }
 }
 
 async function onGet(info) {
@@ -233,7 +285,9 @@ async function onGet(info) {
   // for the same credential and salt.
   const evalSalts = details.extensions?.prf?.eval;
 
-  const begun = await callHost({
+  const port = openCeremonyPort();
+  try {
+  const begun = await port.send({
     type: 'begin',
     operation: 'assert',
     origin: caller.origin,
@@ -248,7 +302,7 @@ async function onGet(info) {
   if (begun.type === 'error') throw new Error(begun.message);
 
   live.set(requestId, { nonce: begun.nonce, cancelled: false });
-  const result = await awaitAnswer(requestId, begun.nonce);
+  const result = await awaitAnswer(port, requestId, begun.nonce);
 
   const extensionResults = {};
   if (result.prf_first) {
@@ -273,6 +327,9 @@ async function onGet(info) {
     },
     clientExtensionResults: extensionResults,
   };
+  } finally {
+    port.close();
+  }
 }
 
 /**
@@ -286,7 +343,9 @@ async function onGet(info) {
 async function answer(info, work, complete) {
   try {
     const responseJson = JSON.stringify(await work(info));
+    console.warn('Black-Bag: completing', info.requestId, responseJson.length, 'bytes');
     await complete({ requestId: info.requestId, responseJson });
+    console.warn('Black-Bag: completed', info.requestId);
   } catch (e) {
     console.warn('Black-Bag:', e);
     await complete({

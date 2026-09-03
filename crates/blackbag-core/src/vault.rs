@@ -326,7 +326,36 @@ impl Vault {
     /// thing being proved here is that whoever is answering knows the
     /// passphrase, not that they can produce something shaped like one.
     ///
-    /// Used to prove a human is behind a passkey approval. See `consent.rs`.
+    /// Does this passphrase open **this open vault**?
+    ///
+    /// Checked against the header this handle is already holding — the one
+    /// whose data key will produce the signature — and never by re-reading the
+    /// path.
+    ///
+    /// Re-reading was the first version and it was exploitable. The proof and
+    /// the signature would have come from two independent reads of a file any
+    /// same-uid process can replace: swap in a throwaway vault built under a
+    /// passphrase you know, approve with it, swap the real file back, collect.
+    /// Worse, moving the *same* file back leaves the inode unchanged, so
+    /// [`FileStamp`] matches, `refresh()` reads nothing, and the real vault
+    /// signs with nobody the wiser. Proving something about a file is not
+    /// proving something about the key in this process's memory.
+    pub fn passphrase_matches(&self, passphrase: &[u8]) -> bool {
+        for recipient in &self.file.header.recipients {
+            let Recipient::Passphrase { argon, sealed_dek } = recipient else {
+                continue;
+            };
+            let Ok(kek) = crypto::derive_kek(passphrase, argon) else {
+                continue;
+            };
+            if crypto::open(kek.as_ref(), sealed_dek, AAD_RECIPIENT_PASSPHRASE).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Used before this vault is open — first-run checks and the like.
     pub fn passphrase_opens(path: &Path, passphrase: &[u8]) -> Result<bool> {
         let file = read_vault_file(path)?;
         for recipient in &file.header.recipients {
@@ -1513,5 +1542,56 @@ mod passkey_lookup_tests {
         assert!(vault.passkey_by_credential_id(b"aaa").is_none());
         assert!(vault.passkey_by_credential_id(b"aaaaa").is_none());
         assert!(vault.passkey_by_credential_id(b"").is_none());
+    }
+}
+
+#[cfg(test)]
+mod proof_binding_tests {
+    use super::*;
+    use crate::record::{Kind, Record};
+
+    /// The proof must be about the key that will sign, not about whatever file
+    /// currently sits at the path.
+    ///
+    /// Any process running as this user can replace the vault file. If the
+    /// passphrase check read that path while the signature came from the data
+    /// key already in memory, an attacker could stand a throwaway vault in
+    /// front of the check — one built under a passphrase they chose — approve
+    /// with it, and have the real vault sign. `passphrase_matches` closes that
+    /// by construction: it consults the header this handle is holding and
+    /// never touches the disk.
+    #[test]
+    fn a_passphrase_that_opens_a_planted_file_does_not_open_the_held_vault() {
+        Witness::isolate_for_tests();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vault.cbor");
+
+        Vault::init(&path, b"the real passphrase", 32_768).unwrap();
+        let mut vault = Vault::unlock(&path, b"the real passphrase").unwrap();
+        vault
+            .add_record(Record::new(Kind::Login, Some("kept".into())))
+            .unwrap();
+        vault.save().unwrap();
+
+        // The attacker plants a vault they can open, at the same path.
+        let decoy = dir.path().join("decoy.cbor");
+        Vault::init(&decoy, b"attacker chosen", 32_768).unwrap();
+        std::fs::copy(&decoy, &path).unwrap();
+
+        // Reading the path would now say yes to the attacker's passphrase...
+        assert!(
+            Vault::passphrase_opens(&path, b"attacker chosen").unwrap(),
+            "the planted file does open with the planted passphrase"
+        );
+        // ...and the open vault, which is the thing that signs, says no.
+        assert!(
+            !vault.passphrase_matches(b"attacker chosen"),
+            "a planted file must not supply the proof for the key in memory"
+        );
+        assert!(
+            vault.passphrase_matches(b"the real passphrase"),
+            "and the real passphrase still proves itself"
+        );
+        assert!(!vault.passphrase_matches(b""), "nor does an empty one");
     }
 }

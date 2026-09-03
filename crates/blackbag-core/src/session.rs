@@ -1288,14 +1288,15 @@ impl Agent {
                     self.publish()?;
                     return Ok(Response::Ok);
                 }
-                // The proof, and the whole reason this verb exists. Checked
-                // against the vault on disk rather than against anything this
-                // process is already holding, so an agent that has been
-                // unlocked for eleven hours is no help to a caller who does not
-                // know the passphrase.
+                // The proof, and the whole reason this verb exists.
+                //
+                // Checked against the OPEN vault — the very handle whose data
+                // key will produce the signature. An earlier version re-read
+                // the vault path, which sounded stronger and was exploitable:
+                // proof and signature came from two independent reads of a file
+                // any same-uid process can replace for the moment in between.
                 let proof_ok = !passphrase.is_empty()
-                    && Vault::passphrase_opens(&self.vault_path, passphrase.as_bytes())
-                        .unwrap_or(false);
+                    && self.opened()?.vault.passphrase_matches(passphrase.as_bytes());
                 let chosen = credential_id.as_deref().map(unhex).transpose()?;
                 self.consent
                     .approve(&nonce, chosen.as_deref(), proof_ok, Utc::now())?;
