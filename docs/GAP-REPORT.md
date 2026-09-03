@@ -95,7 +95,7 @@ Proven by running it, this session unless noted.
 | Clipboard: detached helper, `x-kde-passwordManagerHint`, timed clear | works | Omarchy's history records nothing |
 | Breach check, HIBP k-anonymity with decoy padding | works | matching happens in the agent |
 | Omarchy plugin + standalone Qt deck; management sheet; recovery from the deck | works | live on Hyprland |
-| **Passkeys, WebAuthn core** — ES256, COSE, `fmt: "none"`, authenticator data, PRF | works | verified by Python `cbor2` + `cryptography`, sharing no code |
+| **Passkeys, WebAuthn core** — ES256 and Ed25519, COSE (EC2 + OKP), `fmt: "none"`, authenticator data, PRF | works | ES256 verified by Python `cbor2` + `cryptography` and by `webauthn-rs`; Ed25519 verified end-to-end by `ed25519-dalek` and its COSE OKP key decoded by `webauthn-rs` — all sharing no code with ours |
 | **Passkeys, lane A (proxy)** — extension, native host, agent verbs, consent | works to the vault | real Brave ceremony minted credentials; see §4 for the one unwitnessed step |
 | Consent: frozen ceremony, master passphrase per signature, origin binding, expiry | works | live, and the bypass tests fail without it |
 
@@ -126,7 +126,7 @@ Ordered by how much of §3 it leaves unbuilt.
 | 3.1 | Signal API (`signalUnknownCredential` etc.) | missing |
 | 3.1 | Fallback to the browser's own path when the user declines | **done** — `^K` on the consent screen returns `NotAllowedError`, detaches for a minute so a hardware key can be reached, and re-attaches on an alarm; watched working in Brave |
 | 3.1 | `excludeCredentials`, `residentKey`, `userVerification` levels, `AbortSignal` | partial — allowCredentials and UV honoured; the rest not implemented |
-| 3.1 | Ed25519 (-8) and RS256 (-257) | missing — ES256 only |
+| 3.1 | Ed25519 (-8) and RS256 (-257) | **Ed25519 done** — minted on the CTAP lane when the relying party lists it in `pubKeyCredParams`, in its preference order; ES256 stays the default and the browser lane's pin (WebAuthn §5.4 has every RP accept it). RS256 (-257) not implemented (needs an RSA dependency, little real demand) |
 | 3.1 | **BE=1 and BS=1** | **done, D2** — BE=1 always; BS computed from a real backup and read live on every ceremony, so it turns off again when the copy is deleted |
 | 3.1 | `credProtect`, `credProps` | `credProps` yes; `credProtect` not persisted |
 | 3.2 | Virtual FIDO2 HID device over `/dev/uhid` | **done** — `black-bag key serve` presents the vault as a security key; CTAPHID + CTAP2 built and tested without a device, then driven end to end through the real kernel by an independent CTAP client and verified with `cryptography`. Needs the shipped udev rule + `uhid` module; `key doctor` diagnoses both |
@@ -177,8 +177,9 @@ open in the nested compositor I test in. **In your own Brave it is one click:**
    not. Setting BS=1 would tell relying parties something untrue in order to
    look like a synced passkey. I would rather be honest and be told I am wrong
    than quietly assert it.
-3. **Adopt `passkey-rs`?** It would bring Ed25519/RS256, `excludeCredentials`,
-   PRF and public-suffix handling that we would otherwise write. Against it: our
+3. **Adopt `passkey-rs`?** Ed25519, PRF and public-suffix handling are now
+   ours; it would still bring RS256, `excludeCredentials` and client-side
+   rules. Against it: our
    core is tested against an independent implementation, and `passkey-rs`'s
    authenticator would need our `CredentialStore` and `UserValidation` anyway.
    My inclination is to adopt it for the *client* rules and keep our

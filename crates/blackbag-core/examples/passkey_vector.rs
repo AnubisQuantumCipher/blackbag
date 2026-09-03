@@ -30,6 +30,7 @@ fn main() {
         // Not backed up: this vector is generated from nothing but the inputs
         // above, so it must not depend on the machine's backup state.
         backed_up: false,
+        algorithms: Vec::new(),
     })
     .expect("the ceremony must succeed");
 

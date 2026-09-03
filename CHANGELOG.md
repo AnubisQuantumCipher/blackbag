@@ -5,6 +5,24 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — Ed25519 (-8) passkeys
+
+- **The authenticator now mints Ed25519 credentials, not only ES256.** When a
+  relying party lists Ed25519 in `pubKeyCredParams`, it is minted in the relying
+  party's own preference order (WebAuthn §6.3.2 / CTAP 6.1); ES256 stays the
+  default and the browser lane's pin, since WebAuthn §5.4 has every relying party
+  accept it. Algorithm negotiation happens on the CTAP lane, where the requested
+  list is on the wire.
+- The core encodes a COSE OKP key (`kty=1`, `crv=6`, `alg=-8`) and an RFC 8410
+  SPKI, stores the 32-byte seed, and signs the raw 64-byte EdDSA signature —
+  dispatching on the credential's stored algorithm so ES256 and Ed25519
+  credentials coexist.
+- Verified by two implementations that share no code with ours: `ed25519-dalek`
+  verifies a full assertion under the returned public key, and `webauthn-rs`
+  decodes the COSE OKP key as well-formed EdDSA. Plus structural checks on the
+  COSE key and SPKI, a storage round trip, algorithm-selection ordering, and a
+  mismatched-key-at-load guard.
+
 ### Security — adversarial review, eight findings fixed
 
 A multi-agent adversarial review swept every security surface — vault crypto,

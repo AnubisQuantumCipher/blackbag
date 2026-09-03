@@ -43,6 +43,7 @@
 //! constant zero.
 
 use anyhow::{anyhow, bail, Context, Result};
+use ed25519_dalek::Signer as _;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{DerSignature, SigningKey};
 use p256::pkcs8::EncodePublicKey;
@@ -54,10 +55,20 @@ use crate::secmem::SecretBuf;
 
 /// COSE algorithm identifier for ECDSA over P-256 with SHA-256.
 ///
-/// The only algorithm this provider mints. Every relying party accepts it —
-/// WebAuthn Level 3 §5.4 tells them to include it — so supporting exactly one
-/// algorithm well beats supporting three of them approximately.
+/// The default, and the browser lane's pin. Every relying party accepts it —
+/// WebAuthn Level 3 §5.4 tells them to include it — so a credential minted
+/// under it is never rejected for its algorithm. When a relying party lists no
+/// algorithm, or lists this one, this is what gets minted.
 pub const ALG_ES256: i32 = -7;
+
+/// COSE algorithm identifier for EdDSA over Curve25519 (Ed25519).
+///
+/// Offered alongside ES256 so a relying party that lists it — or a CTAP
+/// conformance client that negotiates algorithms over the virtual key — is
+/// served in its own preferred order rather than refused. ES256 stays the
+/// default: this is minted only when the relying party asks for it ahead of,
+/// or instead of, ES256. See [`choose_algorithm`].
+pub const ALG_ED25519: i32 = -8;
 
 /// The field a passkey's private key is stored under.
 pub const PRIVATE_KEY_FIELD: &str = "private_key";
@@ -98,8 +109,10 @@ pub struct PasskeyConfig {
     pub user_name: Option<String>,
     /// Display name, when supplied.
     pub user_display_name: Option<String>,
-    /// COSE algorithm. Always [`ALG_ES256`] for credentials this mints, but
-    /// stored rather than assumed so an imported credential can say otherwise.
+    /// COSE algorithm: [`ALG_ES256`] or [`ALG_ED25519`] for credentials this
+    /// mints (chosen from the relying party's `pubKeyCredParams`), stored rather
+    /// than assumed so the signer knows how to sign and an imported credential
+    /// can say otherwise.
     pub algorithm: i32,
     /// Whether this credential carries a PRF seed.
     pub prf: bool,
@@ -127,6 +140,10 @@ pub struct NewCredential {
     /// False for anything created now: a backup taken before this moment
     /// cannot contain it.
     pub backed_up: bool,
+    /// The relying party's requested COSE algorithms (`pubKeyCredParams`), most
+    /// preferred first. The first one this authenticator supports is minted;
+    /// an empty list means ES256. See [`choose_algorithm`].
+    pub algorithms: Vec<i32>,
 }
 
 impl PasskeyConfig {
@@ -329,7 +346,9 @@ pub struct Created {
 /// What an assertion hands back.
 pub struct Asserted {
     pub authenticator_data: Vec<u8>,
-    /// DER-encoded ECDSA signature, which is what WebAuthn specifies for ES256.
+    /// The signature in the encoding WebAuthn specifies for the credential's
+    /// algorithm: a DER-encoded ECDSA signature for ES256, the raw 64-byte
+    /// signature for Ed25519.
     pub signature: Vec<u8>,
     pub user_handle: Vec<u8>,
 }
@@ -349,6 +368,7 @@ impl Credential {
             user_verified,
             with_prf,
             backed_up,
+            algorithms,
         } = req;
         let rp_id = rp_id.as_str();
         if rp_id.trim().is_empty() {
@@ -358,8 +378,9 @@ impl Credential {
             bail!("a WebAuthn user handle is 1-64 bytes");
         }
 
-        let signing = random_signing_key()?;
-        let verifying = *signing.verifying_key();
+        // Which algorithm to mint, honouring the relying party's preference
+        // order. ES256 unless it asked for Ed25519 ahead of, or instead of, it.
+        let algorithm = choose_algorithm(&algorithms)?;
 
         // 32 random bytes. WebAuthn Level 3 §4 permits either >=16 random bytes
         // with >=100 bits of entropy, or a key-wrapped credential source; this
@@ -377,6 +398,44 @@ impl Credential {
             false => None,
         };
 
+        // The COSE public key (goes in authenticator data), the SPKI DER
+        // (Chromium wants it on the browser lane), and the private key that
+        // goes straight into locked memory — one shape per algorithm. The
+        // stored key is a PKCS#8 document for ES256 and the raw 32-byte seed
+        // for Ed25519 (which is its canonical private encoding).
+        let (cose, public_key_der, stored_key): (Vec<u8>, Vec<u8>, SecretBuf) = match algorithm {
+            ALG_ED25519 => {
+                let mut seed = Zeroizing::new([0u8; 32]);
+                os_random(seed.as_mut())?;
+                let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+                let public = signing.verifying_key().to_bytes();
+                (
+                    cose_key_ed25519(&public),
+                    ed25519_spki(&public),
+                    // `seed` IS the key material `SigningKey::from_bytes` took.
+                    SecretBuf::new(seed.as_ref()),
+                )
+            }
+            // ES256 — the default and the only other supported algorithm.
+            _ => {
+                let signing = random_signing_key()?;
+                let verifying = *signing.verifying_key();
+                use p256::pkcs8::EncodePrivateKey;
+                let der = signing
+                    .to_pkcs8_der()
+                    .context("failed to encode the passkey private key")?;
+                (
+                    cose_key_es256(&verifying),
+                    verifying
+                        .to_public_key_der()
+                        .context("failed to encode the passkey public key as SPKI DER")?
+                        .as_bytes()
+                        .to_vec(),
+                    SecretBuf::new(der.as_bytes()),
+                )
+            }
+        };
+
         let config = PasskeyConfig {
             credential_id: credential_id.to_vec(),
             rp_id: rp_id.to_ascii_lowercase(),
@@ -384,11 +443,10 @@ impl Credential {
             user_handle,
             user_name,
             user_display_name,
-            algorithm: ALG_ES256,
+            algorithm,
             prf: with_prf,
         };
 
-        let cose = cose_key_es256(&verifying);
         let authenticator_data = authenticator_data(
             &config.rp_id,
             base_flags(user_verified, backed_up) | flags::AT,
@@ -396,25 +454,9 @@ impl Credential {
         );
         let attestation_object = attestation_object_none(&authenticator_data)?;
 
-        let public_key_der = verifying
-            .to_public_key_der()
-            .context("failed to encode the passkey public key as SPKI DER")?
-            .as_bytes()
-            .to_vec();
-
-        // The PKCS#8 encoding goes straight into locked memory and the
-        // intermediate is wiped: this is the byte string that IS the passkey.
-        let pkcs8 = {
-            use p256::pkcs8::EncodePrivateKey;
-            let der = signing
-                .to_pkcs8_der()
-                .context("failed to encode the passkey private key")?;
-            SecretBuf::new(der.as_bytes())
-        };
-
         Ok((
             Created {
-                credential: Credential { config, key: pkcs8 },
+                credential: Credential { config, key: stored_key },
                 attestation_object,
                 authenticator_data,
                 public_key_der,
@@ -424,13 +466,16 @@ impl Credential {
     }
 
     /// Reconstitute a stored credential.
-    pub fn from_stored(config: PasskeyConfig, pkcs8: &[u8]) -> Result<Self> {
-        // Parse once here so a corrupt key is an error at load rather than a
-        // panic at signing time.
-        signing_key_from(pkcs8)?;
+    ///
+    /// `key_bytes` is a PKCS#8 document for ES256, the raw 32-byte seed for
+    /// Ed25519 — [`Credential::create`] wrote whichever the algorithm calls for.
+    pub fn from_stored(config: PasskeyConfig, key_bytes: &[u8]) -> Result<Self> {
+        // Parse once here so a corrupt or algorithm-mismatched key is an error
+        // at load rather than a panic at signing time.
+        validate_stored_key(config.algorithm, key_bytes)?;
         Ok(Self {
             config,
-            key: SecretBuf::new(pkcs8),
+            key: SecretBuf::new(key_bytes),
         })
     }
 
@@ -508,12 +553,11 @@ impl Credential {
         signed.extend_from_slice(&authenticator_data);
         signed.extend_from_slice(client_data_hash);
 
-        let signing = signing_key_from(self.key.as_slice())?;
-        let signature: DerSignature = signing.sign(&signed);
+        let signature = sign_with(self.config.algorithm, self.key.as_slice(), &signed)?;
 
         Ok(Asserted {
             authenticator_data,
-            signature: signature.as_bytes().to_vec(),
+            signature,
             user_handle: self.config.user_handle.clone(),
         })
     }
@@ -641,6 +685,103 @@ fn attestation_object_none(authenticator_data: &[u8]) -> Result<Vec<u8>> {
 /// Keys are emitted in canonical order — 1, 3, -1, -2, -3 — because a relying
 /// party that hashes the credential public key gets a different answer if the
 /// map is serialised differently on a later run.
+/// Pick the algorithm to mint, honouring the relying party's preference order.
+///
+/// `algorithms` is the COSE identifiers from `pubKeyCredParams`, most-preferred
+/// first; the first one this authenticator supports wins (WebAuthn §6.3.2 /
+/// CTAP 2.1 §6.1.2). An empty list means ES256 — the browser lane pins it and
+/// WebAuthn §5.4 has every relying party include it, so it is always accepted.
+/// A non-empty list with nothing supported is refused, so the caller can answer
+/// the relying party rather than mint a key it will reject.
+fn choose_algorithm(algorithms: &[i32]) -> Result<i32> {
+    if algorithms.is_empty() {
+        return Ok(ALG_ES256);
+    }
+    algorithms
+        .iter()
+        .copied()
+        .find(|a| *a == ALG_ES256 || *a == ALG_ED25519)
+        .ok_or_else(|| {
+            anyhow!(
+                "no supported COSE algorithm in {algorithms:?}; this \
+                 authenticator offers ES256 (-7) and Ed25519 (-8)"
+            )
+        })
+}
+
+/// Sign `message` with a stored passkey key, in the encoding WebAuthn expects
+/// for its algorithm: a DER ECDSA signature for ES256, the raw 64-byte
+/// signature for Ed25519.
+fn sign_with(algorithm: i32, stored_key: &[u8], message: &[u8]) -> Result<Vec<u8>> {
+    match algorithm {
+        ALG_ED25519 => {
+            let seed: [u8; 32] = stored_key
+                .try_into()
+                .map_err(|_| anyhow!("a stored Ed25519 seed is 32 bytes"))?;
+            let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+            let signature: ed25519_dalek::Signature = signing.sign(message);
+            Ok(signature.to_bytes().to_vec())
+        }
+        ALG_ES256 => {
+            let signing = signing_key_from(stored_key)?;
+            let signature: DerSignature = signing.sign(message);
+            Ok(signature.as_bytes().to_vec())
+        }
+        other => bail!("cannot sign for unsupported COSE algorithm {other}"),
+    }
+}
+
+/// Confirm a stored key matches its declared algorithm and is loadable.
+fn validate_stored_key(algorithm: i32, key_bytes: &[u8]) -> Result<()> {
+    match algorithm {
+        ALG_ED25519 => {
+            let _: [u8; 32] = key_bytes
+                .try_into()
+                .map_err(|_| anyhow!("a stored Ed25519 seed is 32 bytes"))?;
+            Ok(())
+        }
+        ALG_ES256 => {
+            signing_key_from(key_bytes)?;
+            Ok(())
+        }
+        other => bail!("stored passkey uses unsupported COSE algorithm {other}"),
+    }
+}
+
+/// COSE_Key for an Ed25519 public key: an OKP key (RFC 9053 §2.1 / RFC 8152),
+/// `kty=1` (OKP), `alg=-8` (EdDSA), `crv=6` (Ed25519), `x` the 32-byte public
+/// key. Canonical key order — 1, 3, -1, -2 — for the same reason ES256's is.
+fn cose_key_ed25519(public_key: &[u8; 32]) -> Vec<u8> {
+    use ciborium::value::Value;
+    let value = Value::Map(vec![
+        // kty: OKP
+        (Value::Integer(1.into()), Value::Integer(1.into())),
+        // alg: EdDSA
+        (Value::Integer(3.into()), Value::Integer(ALG_ED25519.into())),
+        // crv: Ed25519
+        (Value::Integer((-1).into()), Value::Integer(6.into())),
+        // x: the public key
+        (Value::Integer((-2).into()), Value::Bytes(public_key.to_vec())),
+    ]);
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&value, &mut out).expect("a COSE key always encodes");
+    out
+}
+
+/// SubjectPublicKeyInfo DER for an Ed25519 key (RFC 8410 §4): a fixed 12-byte
+/// prefix — SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING (unused=0) } —
+/// then the 32-byte public key. Built by hand so the `pkcs8` feature is not
+/// needed just to spell a constant.
+fn ed25519_spki(public_key: &[u8; 32]) -> Vec<u8> {
+    const PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    let mut out = Vec::with_capacity(PREFIX.len() + public_key.len());
+    out.extend_from_slice(&PREFIX);
+    out.extend_from_slice(public_key);
+    out
+}
+
 fn cose_key_es256(key: &p256::ecdsa::VerifyingKey) -> Vec<u8> {
     use ciborium::value::Value;
 
@@ -798,6 +939,7 @@ mod tests {
             user_verified: true,
             with_prf: true,
             backed_up,
+            algorithms: vec![ALG_ES256],
         })
         .unwrap()
     }
@@ -813,6 +955,7 @@ mod tests {
             user_verified: true,
             with_prf: false,
             backed_up: false,
+            algorithms: vec![ALG_ES256],
         }
     }
 
@@ -838,6 +981,150 @@ mod tests {
         verifying
             .verify(&signed, &sig)
             .expect("the relying party must be able to verify what we signed");
+    }
+
+    /// The Ed25519 counterpart: an assertion an EdDSA relying party can verify,
+    /// checked with an independent Ed25519 verifier against the public key the
+    /// ceremony returned — the exact check a relying party performs.
+    #[test]
+    fn an_ed25519_assertion_verifies_under_the_returned_public_key() {
+        use ed25519_dalek::Verifier;
+
+        let (created, _) =
+            Credential::create(NewCredential { algorithms: vec![ALG_ED25519], ..a_request() })
+                .unwrap();
+        assert_eq!(created.credential.config.algorithm, ALG_ED25519);
+
+        let client_data = br#"{"type":"webauthn.get","challenge":"abc","origin":"https://example.com"}"#;
+        let asserted = created
+            .credential
+            .assert("https://example.com", client_data, true, false)
+            .unwrap();
+        assert_eq!(asserted.signature.len(), 64, "Ed25519 signatures are 64 raw bytes");
+
+        let mut signed = asserted.authenticator_data.clone();
+        signed.extend_from_slice(&Sha256::digest(client_data));
+
+        // SPKI for Ed25519 is the 12-byte prefix then the 32-byte key.
+        assert_eq!(created.public_key_der.len(), 44);
+        let pk: [u8; 32] = created.public_key_der[12..44].try_into().unwrap();
+        let verifying = ed25519_dalek::VerifyingKey::from_bytes(&pk).unwrap();
+        let sig = ed25519_dalek::Signature::from_slice(&asserted.signature).unwrap();
+        verifying
+            .verify(&signed, &sig)
+            .expect("an EdDSA relying party must be able to verify what we signed");
+    }
+
+    /// The attested credential data advertises an OKP COSE key whose public
+    /// point is the one the SPKI carries — so authData and SPKI agree.
+    #[test]
+    fn an_ed25519_credential_advertises_an_okp_cose_key() {
+        use ciborium::value::Value;
+
+        let (created, _) =
+            Credential::create(NewCredential { algorithms: vec![ALG_ED25519], ..a_request() })
+                .unwrap();
+
+        // rpIdHash(32) flags(1) counter(4) aaguid(16) credIdLen(2) credId, then COSE.
+        let ad = &created.authenticator_data;
+        let mut i = 37 + 16;
+        let cred_id_len = ((ad[i] as usize) << 8) | ad[i + 1] as usize;
+        i += 2 + cred_id_len;
+        let Value::Map(entries) = ciborium::de::from_reader::<Value, _>(&ad[i..]).unwrap() else {
+            panic!("COSE key is a map");
+        };
+        let get = |k: i128| {
+            entries
+                .iter()
+                .find(|(key, _)| matches!(key, Value::Integer(n) if i128::from(*n) == k))
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get(1), Some(Value::Integer(1.into())), "kty OKP");
+        assert_eq!(get(3), Some(Value::Integer(ALG_ED25519.into())), "alg EdDSA");
+        assert_eq!(get(-1), Some(Value::Integer(6.into())), "crv Ed25519");
+        let Some(Value::Bytes(x)) = get(-2) else {
+            panic!("x is a byte string");
+        };
+        assert_eq!(x.as_slice(), &created.public_key_der[12..44], "COSE x == SPKI key");
+    }
+
+    /// A stored Ed25519 credential (the raw seed, not a PKCS#8 doc) reloads and
+    /// still signs verifiably.
+    #[test]
+    fn an_ed25519_credential_round_trips_through_storage() {
+        use ed25519_dalek::Verifier;
+
+        let (created, _) =
+            Credential::create(NewCredential { algorithms: vec![ALG_ED25519], ..a_request() })
+                .unwrap();
+        let stored = created.credential.private_key().to_vec();
+        assert_eq!(stored.len(), 32, "an Ed25519 key stores as its 32-byte seed");
+
+        let reloaded =
+            Credential::from_stored(created.credential.config.clone(), &stored).unwrap();
+        let client_data = br#"{"type":"webauthn.get","challenge":"z","origin":"https://example.com"}"#;
+        let asserted = reloaded
+            .assert("https://example.com", client_data, true, false)
+            .unwrap();
+
+        let mut signed = asserted.authenticator_data.clone();
+        signed.extend_from_slice(&Sha256::digest(client_data));
+        let pk: [u8; 32] = created.public_key_der[12..44].try_into().unwrap();
+        ed25519_dalek::VerifyingKey::from_bytes(&pk)
+            .unwrap()
+            .verify(&signed, &ed25519_dalek::Signature::from_slice(&asserted.signature).unwrap())
+            .expect("a reloaded Ed25519 key must still sign verifiably");
+    }
+
+    /// A stored key whose bytes do not match its declared algorithm is refused
+    /// at load, not at signing time.
+    #[test]
+    fn a_mismatched_stored_key_is_refused_at_load() {
+        let (es256, _) = a_credential();
+        // An ES256 record's PKCS#8 bytes are not a 32-byte Ed25519 seed.
+        let mut config = es256.credential.config.clone();
+        config.algorithm = ALG_ED25519;
+        assert!(Credential::from_stored(config, es256.credential.private_key()).is_err());
+    }
+
+    #[test]
+    fn choose_algorithm_honours_relying_party_order_and_defaults_to_es256() {
+        // Empty list → ES256 (the browser lane, and WebAuthn's always-accepted).
+        assert_eq!(choose_algorithm(&[]).unwrap(), ALG_ES256);
+        // First supported wins, in the relying party's order.
+        assert_eq!(choose_algorithm(&[ALG_ES256, ALG_ED25519]).unwrap(), ALG_ES256);
+        assert_eq!(choose_algorithm(&[ALG_ED25519, ALG_ES256]).unwrap(), ALG_ED25519);
+        assert_eq!(choose_algorithm(&[ALG_ED25519]).unwrap(), ALG_ED25519);
+        // Unknown algorithms are skipped to the first supported one.
+        assert_eq!(choose_algorithm(&[-257, -8, -7]).unwrap(), ALG_ED25519);
+        // Nothing supported → refused, so the caller can answer the RP.
+        assert!(choose_algorithm(&[-257, -37]).is_err());
+    }
+
+    #[test]
+    fn create_mints_the_algorithm_the_relying_party_preferred() {
+        let es = Credential::create(NewCredential {
+            algorithms: vec![ALG_ES256, ALG_ED25519],
+            ..a_request()
+        })
+        .unwrap()
+        .0;
+        assert_eq!(es.credential.config.algorithm, ALG_ES256);
+
+        let ed = Credential::create(NewCredential {
+            algorithms: vec![ALG_ED25519, ALG_ES256],
+            ..a_request()
+        })
+        .unwrap()
+        .0;
+        assert_eq!(ed.credential.config.algorithm, ALG_ED25519);
+
+        // An algorithm set this authenticator cannot serve is refused.
+        assert!(Credential::create(NewCredential {
+            algorithms: vec![-257],
+            ..a_request()
+        })
+        .is_err());
     }
 
     #[test]

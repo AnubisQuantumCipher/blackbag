@@ -157,6 +157,10 @@ pub struct Ceremony {
     pub user_handle: Option<Vec<u8>>,
     pub user_name: Option<String>,
     pub user_display_name: Option<String>,
+    /// Create-only: the relying party's requested COSE algorithms
+    /// (`pubKeyCredParams`), most preferred first. Frozen with the rest of the
+    /// ceremony; empty means ES256, and the first supported one is minted.
+    pub algorithms: Vec<i32>,
     /// Whether the relying party asked for the PRF extension.
     pub want_prf: bool,
     /// PRF salts, exactly as the relying party supplied them. Frozen with the
@@ -572,6 +576,7 @@ mod tests {
             user_handle: None,
             user_name: Some("ada".into()),
             user_display_name: None,
+            algorithms: Vec::new(),
             want_prf: false,
             prf_first_salt: None,
             prf_second_salt: None,

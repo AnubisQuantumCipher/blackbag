@@ -18,7 +18,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use blackbag_core::passkey::{Credential, NewCredential};
+use blackbag_core::passkey::{Credential, NewCredential, ALG_ED25519};
 use webauthn_rs::prelude::*;
 
 const RP_ID: &str = "example.com";
@@ -44,6 +44,10 @@ fn webauthn() -> Webauthn {
 /// Register a credential of ours with a real relying party, and hand back
 /// what it stored plus the credential that can sign for it.
 fn register(w: &Webauthn, backed_up: bool) -> (Passkey, Credential) {
+    register_with(w, backed_up, Vec::new())
+}
+
+fn register_with(w: &Webauthn, backed_up: bool, algorithms: Vec<i32>) -> (Passkey, Credential) {
     let (challenge, state) = w
         .start_passkey_registration(Uuid::new_v4(), "ada", "Ada Lovelace", None)
         .unwrap();
@@ -62,6 +66,7 @@ fn register(w: &Webauthn, backed_up: bool) -> (Passkey, Credential) {
         user_verified: true,
         with_prf: false,
         backed_up,
+        algorithms,
     })
     .expect("our ceremony must succeed");
 
@@ -237,6 +242,7 @@ fn a_registration_for_another_relying_party_is_rejected() {
         user_verified: true,
         with_prf: false,
         backed_up: false,
+        algorithms: Vec::new(),
     })
     .unwrap();
 
@@ -277,6 +283,7 @@ fn a_registration_over_the_wrong_challenge_is_rejected() {
         user_verified: true,
         with_prf: false,
         backed_up: false,
+        algorithms: Vec::new(),
     })
     .unwrap();
 
@@ -296,5 +303,62 @@ fn a_registration_over_the_wrong_challenge_is_rejected() {
     assert!(
         w.finish_passkey_registration(&response, &state).is_err(),
         "the challenge binds the ceremony; without that check it is not a ceremony"
+    );
+}
+
+/// A real relying party parses the Ed25519 credential we mint.
+///
+/// `webauthn-rs`'s default passkey policy requests ES256/RS256, not EdDSA, so
+/// it declines an Ed25519 credential — but only *after* decoding the
+/// attestation object and the COSE OKP key and reading its algorithm. A
+/// malformed OKP key would fail earlier and differently (a CBOR or
+/// `COSEKeyEDDSA*` error); reaching `CredentialAlteredAlgFromRequest` proves an
+/// independent library reads our Ed25519 encoding as well-formed EdDSA and
+/// objects only on its own algorithm policy. Our Ed25519 *signatures* are
+/// verified end-to-end by an independent `ed25519-dalek` verifier in
+/// `passkey.rs`; this is the second-implementation check on the encoding.
+#[test]
+fn a_real_relying_party_reads_our_ed25519_cose_key_as_well_formed_eddsa() {
+    let w = webauthn();
+    let (challenge, state) = w
+        .start_passkey_registration(Uuid::new_v4(), "ada", "Ada Lovelace", None)
+        .unwrap();
+    let user_handle = challenge.public_key.user.id.clone().into();
+    let challenge_bytes: Vec<u8> = challenge.public_key.challenge.clone().into();
+
+    let (created, _) = Credential::create(NewCredential {
+        rp_id: RP_ID.into(),
+        rp_name: Some("Example".into()),
+        user_handle,
+        user_name: Some("ada".into()),
+        user_display_name: Some("Ada Lovelace".into()),
+        user_verified: true,
+        with_prf: false,
+        backed_up: false,
+        algorithms: vec![ALG_ED25519],
+    })
+    .expect("our ceremony must succeed");
+
+    let id = B64.encode(&created.credential.config.credential_id);
+    let response: RegisterPublicKeyCredential = serde_json::from_value(serde_json::json!({
+        "id": id,
+        "rawId": id,
+        "type": "public-key",
+        "extensions": {},
+        "response": {
+            "attestationObject": B64.encode(&created.attestation_object),
+            "clientDataJSON": B64.encode(client_data("webauthn.create", &challenge_bytes)),
+        },
+    }))
+    .unwrap();
+
+    let err = w
+        .finish_passkey_registration(&response, &state)
+        .expect_err("the default policy did not request EdDSA");
+    // The objection is the algorithm policy, reached only after a clean decode —
+    // not a malformation of the key or attestation.
+    assert!(
+        format!("{err:?}").contains("CredentialAlteredAlgFromRequest"),
+        "expected an algorithm-policy rejection after a clean decode, got {err:?}"
     );
 }

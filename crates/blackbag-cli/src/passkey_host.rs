@@ -221,6 +221,10 @@ fn handle_inner(incoming: Incoming, output: &mut impl Write) -> Result<Outgoing>
                 user_handle: args.user_handle,
                 user_name: args.user_name,
                 user_display_name: args.user_display_name,
+                // The browser lane pins ES256 (WebAuthn Level 3 §5.4 has every
+                // relying party accept it); algorithm negotiation lives on the
+                // CTAP lane, where the requested list is on the wire.
+                algorithms: Vec::new(),
                 want_prf: args.want_prf,
                 prf_first_salt: args.prf_first_salt,
                 prf_second_salt: args.prf_second_salt,

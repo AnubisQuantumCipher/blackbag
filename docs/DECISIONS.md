@@ -178,8 +178,12 @@ evidence that our ES256 and PRF path is right; a real relying party accepting
 our ceremonies is stronger evidence than agreeing byte-for-byte with another
 authenticator, which would only show that two implementations made the same
 choices. The Python cross-check already covers the byte layout and the PRF
-derivation independently. If Ed25519 or RS256 land, this is worth revisiting —
-there the question really is "does someone else produce the same bytes".
+derivation independently. **Ed25519 (-8) has since landed** — minted on the CTAP
+lane in the relying party's preference order, its signatures verified
+end-to-end by `ed25519-dalek` and its COSE OKP key decoded by `webauthn-rs`,
+both sharing no code with ours. RS256 (-257) is still worth revisiting the
+same way if it lands — there the question really is "does someone else produce
+the same bytes".
 
 ## D4 — Build order, and what an approval actually is
 

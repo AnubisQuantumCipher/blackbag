@@ -1518,6 +1518,7 @@ mod tests {
             user_verified: true,
             with_prf: false,
             backed_up: false,
+            algorithms: Vec::new(),
         })
         .unwrap();
         let mut passkey = Record::new(Kind::Passkey, Some(created.credential.config.describe()));
@@ -1609,6 +1610,7 @@ mod tests {
             user_verified: true,
             with_prf: false,
             backed_up: false,
+            algorithms: Vec::new(),
         })
         .unwrap();
         let mut pk = Record::new(Kind::Passkey, Some("example.com".into()));

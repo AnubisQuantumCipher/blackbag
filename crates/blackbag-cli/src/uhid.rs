@@ -454,6 +454,10 @@ impl Backend for AgentBackend {
             // which this authenticator does not implement. Asking for a seed
             // we could never hand back would leave a credential carrying one
             // that nothing can reach.
+            // The relying party's requested COSE algorithms, in preference
+            // order (i64 from the CBOR, narrowed to the i32 the agent speaks),
+            // so the CTAP lane can negotiate Ed25519 as well as ES256.
+            algorithms: req.algorithms.iter().map(|a| *a as i32).collect(),
             want_prf: false,
             prf_first_salt: None,
             prf_second_salt: None,
@@ -483,6 +487,7 @@ impl Backend for AgentBackend {
             user_handle: None,
             user_name: None,
             user_display_name: None,
+            algorithms: Vec::new(),
             want_prf: false,
             prf_first_salt: None,
             prf_second_salt: None,

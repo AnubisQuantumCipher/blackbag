@@ -236,6 +236,10 @@ pub enum Request {
         user_name: Option<String>,
         #[serde(default)]
         user_display_name: Option<String>,
+        /// Create-only: the relying party's `pubKeyCredParams` COSE algorithm
+        /// ids, most preferred first. Empty (or absent) means ES256.
+        #[serde(default)]
+        algorithms: Vec<i32>,
         #[serde(default)]
         want_prf: bool,
         /// PRF salts as the relying party supplied them, hex-encoded. The
@@ -1754,6 +1758,7 @@ impl Agent {
                 user_handle,
                 user_name,
                 user_display_name,
+                algorithms,
                 want_prf,
                 prf_first_salt,
                 prf_second_salt,
@@ -1872,6 +1877,7 @@ impl Agent {
                     user_handle: user_handle.as_deref().map(unhex).transpose()?,
                     user_name,
                     user_display_name,
+                    algorithms,
                     want_prf,
                     prf_first_salt: prf_first_salt.as_deref().map(unhex).transpose()?,
                     prf_second_salt: prf_second_salt.as_deref().map(unhex).transpose()?,
@@ -2463,6 +2469,9 @@ impl Agent {
                                 // becomes backed up at the next
                                 // `black-bag backup`, and says so from then on.
                                 backed_up: false,
+                                // Honour the relying party's requested
+                                // algorithms; empty (the browser lane) is ES256.
+                                algorithms: ceremony.algorithms.clone(),
                             })?;
 
                         let mut record = crate::record::Record::new(
@@ -3792,6 +3801,7 @@ mod passkey_agent_tests {
                 user_handle: Some(hex(b"user-handle")),
                 user_name: Some("ada".into()),
                 user_display_name: Some("Ada".into()),
+                algorithms: Vec::new(),
                 want_prf: true,
                 prf_first_salt: Some(hex(&[0x11; 32])),
                 prf_second_salt: None,
@@ -4108,6 +4118,7 @@ mod passkey_agent_tests {
                     user_handle: Some(hex(b"user-handle")),
                     user_name: Some("ada".into()),
                     user_display_name: Some("Ada".into()),
+                    algorithms: Vec::new(),
                     want_prf: false,
                     prf_first_salt: None,
                     prf_second_salt: None,
@@ -4203,6 +4214,7 @@ mod passkey_agent_tests {
                     user_handle: Some(hex(b"u")),
                     user_name: None,
                     user_display_name: None,
+                    algorithms: Vec::new(),
                     want_prf: false,
                     prf_first_salt: None,
                     prf_second_salt: None,
@@ -4256,6 +4268,7 @@ mod passkey_agent_tests {
                     user_handle: Some(hex(b"u")),
                     user_name: None,
                     user_display_name: None,
+                    algorithms: Vec::new(),
                     want_prf: false,
                     prf_first_salt: None,
                     prf_second_salt: None,
@@ -4585,6 +4598,7 @@ mod passkey_reveal_tests {
                 user_handle: Some(hex(b"u")),
                 user_name: Some("ada".into()),
                 user_display_name: None,
+                algorithms: Vec::new(),
                 want_prf: true,
                 prf_first_salt: None,
                 prf_second_salt: None,
