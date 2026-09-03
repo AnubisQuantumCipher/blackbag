@@ -305,11 +305,14 @@ impl Desk {
     }
 
     /// What the deck should show, oldest first.
-    pub fn summaries(&mut self, now: DateTime<Utc>) -> Vec<Summary> {
-        self.expire(now);
+    ///
+    /// A pure read: it filters lapsed ceremonies out of the answer rather than
+    /// marking them refused, so that publishing a status document never mutates
+    /// the desk. Expiry proper happens on the paths that can act on it.
+    pub fn summaries(&self, now: DateTime<Utc>) -> Vec<Summary> {
         self.pending
             .iter()
-            .filter(|c| c.state == State::AwaitingHuman)
+            .filter(|c| c.state == State::AwaitingHuman && !c.is_expired(now))
             .map(|c| c.summary())
             .collect()
     }
@@ -450,15 +453,17 @@ mod tests {
 
         assert!(desk.is_waiting(N1));
 
-        // `is_waiting` reads current state and does not itself advance the
-        // clock; expiry happens the next time the desk is asked something with
-        // a time in hand, which is exactly when it matters.
+        // `summaries` is a pure read — publishing a status document must not
+        // mutate the desk — so a lapsed ceremony is filtered out of what the
+        // deck sees before anything has marked it refused.
         let after = at(CEREMONY_TTL_SECS + 1);
         assert!(desk.summaries(after).is_empty(), "expired ones leave the screen");
-        assert!(!desk.is_waiting(N1), "and stop being answerable");
 
+        // Expiry proper happens on a path that can act on it, and then it is
+        // refused rather than answerable.
         let done = desk.take_answered(N1, after).unwrap();
         assert!(matches!(done.state, State::Refused { .. }));
+        assert!(!desk.is_waiting(N1), "and it is gone from the desk");
     }
 
     #[test]

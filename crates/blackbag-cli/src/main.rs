@@ -266,6 +266,22 @@ enum AgentCommand {
     Status,
     /// Stop the agent.
     Stop,
+    /// Passkey ceremonies waiting for an answer, as JSON.
+    PasskeyQueue,
+    /// Approve a waiting passkey ceremony.
+    ///
+    /// This is what the deck calls when you press APPROVE. It is deliberately
+    /// available from the command line too, and deliberately useless there
+    /// without the nonce the deck is showing you.
+    PasskeyApprove {
+        nonce: String,
+        /// Which credential to sign with, hex, when the request offers more
+        /// than one.
+        #[arg(long)]
+        credential: Option<String>,
+    },
+    /// Refuse a waiting passkey ceremony.
+    PasskeyRefuse { nonce: String },
     /// Non-secret record metadata from the unlocked agent, as JSON.
     ///
     /// This is what the cockpit reads. It carries titles, tags, attributes and
@@ -802,6 +818,40 @@ fn cmd_agent(
             Response::Error { message } => bail!("{message}"),
             _ => bail!("unexpected reply"),
         },
+        AgentCommand::PasskeyQueue => match session::ask(&Request::PasskeyQueue)? {
+            Response::PasskeyQueue { pending } => {
+                println!("{}", serde_json::to_string_pretty(&pending)?);
+                Ok(())
+            }
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
+
+        AgentCommand::PasskeyApprove { nonce, credential } => {
+            match session::ask(&Request::PasskeyApprove {
+                nonce,
+                credential_id: credential,
+            })? {
+                Response::Ok => {
+                    println!("Approved.");
+                    Ok(())
+                }
+                Response::Error { message } => bail!("{message}"),
+                other => bail!("unexpected reply: {other:?}"),
+            }
+        }
+
+        AgentCommand::PasskeyRefuse { nonce } => {
+            match session::ask(&Request::PasskeyRefuse { nonce })? {
+                Response::Ok => {
+                    println!("Refused.");
+                    Ok(())
+                }
+                Response::Error { message } => bail!("{message}"),
+                other => bail!("unexpected reply: {other:?}"),
+            }
+        }
+
         AgentCommand::Stop => match session::ask(&Request::Shutdown)? {
             Response::Ok => {
                 println!("Agent stopped.");
@@ -1352,6 +1402,7 @@ fn agent_session_view() -> SessionView {
             max_session_secs: status.max_session_secs,
             last_lock_reason: status.last_lock_reason.map(|r| r.as_str().to_string()),
             sleep_watch: status.sleep_watch,
+            pending_passkeys: status.pending_passkeys,
         },
         _ => SessionView::default(),
     }

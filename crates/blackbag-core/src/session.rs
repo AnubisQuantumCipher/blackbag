@@ -573,6 +573,11 @@ pub struct AgentStatus {
     /// Whether the agent is subscribed to host sleep and session-lock events.
     #[serde(default)]
     pub sleep_watch: Option<String>,
+    /// Passkey ceremonies waiting for a human. Carried here so that the CLI,
+    /// which also publishes status.json, republishes the queue instead of
+    /// blanking a prompt the agent is currently showing.
+    #[serde(default)]
+    pub pending_passkeys: Vec<crate::consent::Summary>,
     pub record_count: usize,
     pub counts_by_kind: Vec<(String, usize)>,
     pub rollback_suspected: bool,
@@ -1417,6 +1422,7 @@ impl Agent {
                     max_session_secs,
                     last_lock_reason: self.last_lock_reason,
                     sleep_watch,
+                    pending_passkeys: self.consent.summaries(Utc::now()),
                     record_count: open.vault.records().len(),
                     counts_by_kind: open
                         .vault
@@ -1436,6 +1442,8 @@ impl Agent {
                 max_session_secs,
                 last_lock_reason: self.last_lock_reason,
                 sleep_watch,
+                // A locked agent holds no ceremonies: lock() clears the desk.
+                pending_passkeys: Vec::new(),
                 record_count: 0,
                 counts_by_kind: Vec::new(),
                 rollback_suspected: false,
@@ -1456,6 +1464,7 @@ impl Agent {
             max_session_secs: snapshot.max_session_secs,
             last_lock_reason: snapshot.last_lock_reason.map(|r| r.as_str().to_string()),
             sleep_watch: snapshot.sleep_watch.clone(),
+            pending_passkeys: snapshot.pending_passkeys.clone(),
         };
         let status = Status::probe(
             &self.vault_path,
@@ -1641,6 +1650,7 @@ mod tests {
             max_session_secs: DEFAULT_MAX_SESSION_SECS,
             last_lock_reason: Some(LockReason::Idle),
             sleep_watch: None,
+            pending_passkeys: Vec::new(),
             record_count: 1,
             counts_by_kind: vec![("login".into(), 1)],
             rollback_suspected: false,
@@ -1664,6 +1674,28 @@ mod tests {
                 candidates: Vec::new(),
             },
             Response::Breach(crate::breach::Report::default()),
+            Response::PasskeyRegistered {
+                nonce: "0123456789abcdef0123456789abcdef".into(),
+                choices: vec![crate::consent::Choice {
+                    record_id: "r1".into(),
+                    credential_id: vec![0xaa, 0xbb],
+                    label: "ada at example.com".into(),
+                }],
+            },
+            Response::PasskeyWaiting,
+            Response::PasskeyResult {
+                credential_id: "aabb".into(),
+                authenticator_data: "00".into(),
+                signature: "3045".into(),
+                user_handle: "7f".into(),
+                attestation_object: Some("a3".into()),
+                public_key_der: Some("3059".into()),
+                prf_first: Some("11".into()),
+                prf_second: None,
+            },
+            Response::PasskeyQueue {
+                pending: Vec::new(),
+            },
             Response::Ok,
             Response::Error {
                 message: "nope".into(),

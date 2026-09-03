@@ -234,6 +234,18 @@ pub struct SessionView {
     /// What the agent's host-event watcher reports about itself.
     #[serde(default)]
     pub sleep_watch: Option<String>,
+    /// Passkey ceremonies waiting for a human right now.
+    ///
+    /// Published rather than polled so the deck — which already watches this
+    /// file — puts the prompt on screen the moment a browser asks, without a
+    /// timer that would either waste wakeups or add latency to a login.
+    ///
+    /// These carry an origin and an account name. That is metadata of the same
+    /// order as the record list the agent socket already serves to the same
+    /// caller, and the file is 0600 in a 0700 directory. No key material and
+    /// no client data goes here.
+    #[serde(default)]
+    pub pending_passkeys: Vec<crate::consent::Summary>,
 }
 
 
