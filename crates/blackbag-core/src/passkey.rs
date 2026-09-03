@@ -162,16 +162,79 @@ pub fn rp_id_is_valid_for_origin(rp_id: &str, origin: &str) -> bool {
         return false;
     };
     let rp = rp_id.trim_end_matches('.').to_ascii_lowercase();
-    if rp.is_empty() {
+    is_registrable_domain_suffix_of_or_equal_to(&rp, &host)
+}
+
+/// HTML's "is a registrable domain suffix of or is equal to", which WebAuthn
+/// Level 3 §5.1.3 step 8 defers to for deciding whether a page may claim a
+/// relying-party id.
+///
+/// ## Why the public suffix list is not optional here
+///
+/// Without it, a label-boundary suffix check accepts `rp_id = "com"` for
+/// `https://example.com`, and the credential minted under it is then assertable
+/// to **every** `https` origin. `co.uk` and `github.io` are the same hole with
+/// a second label. Measured on this code before the list was added: all three
+/// returned true.
+///
+/// A browser does this check before dispatching, so lane A never showed it.
+/// That is precisely the reason to do it here: the injection lane intercepts
+/// `navigator.credentials` *before* the browser's own check runs, and a
+/// non-browser caller has no check in front of it at all. This function is the
+/// only thing standing behind either.
+///
+/// ## The algorithm, step for step
+///
+/// 1. Empty suffix — false.
+/// 2. Equal to the host — **true, before any list is consulted.** A page may
+///    always claim its own effective domain, even a single-label intranet name
+///    the list has never heard of.
+/// 3. Must match at a label boundary.
+/// 4. The suffix must not itself be a public suffix (`com`, `co.uk`).
+/// 5. The suffix must not reach *into* the host's public suffix, which is what
+///    stops `foo.bar` being claimed under a wildcard entry like
+///    `*.compute.amazonaws.com`.
+fn is_registrable_domain_suffix_of_or_equal_to(host_suffix: &str, original_host: &str) -> bool {
+    if host_suffix.is_empty() || original_host.is_empty() {
         return false;
     }
-    if host == rp {
+    // Step 2. Equality wins outright: this is the effective domain itself.
+    if host_suffix == original_host {
         return true;
     }
-    // A registrable-domain suffix, and the match must land on a label boundary.
-    host.strip_suffix(&rp)
-        .and_then(|prefix| prefix.strip_suffix('.'))
-        .is_some_and(|prefix| !prefix.is_empty())
+    // Step 3. `.` + suffix must end the host, so `notexample.com` cannot claim
+    // `example.com`.
+    if !original_host.ends_with(&format!(".{host_suffix}")) {
+        return false;
+    }
+    // Step 4. A bare public suffix has no registrable domain, which is exactly
+    // what the provider reports when it cannot derive an eTLD+1.
+    use public_suffix::EffectiveTLDProvider;
+    if public_suffix::DEFAULT_PROVIDER
+        .effective_tld_plus_one(host_suffix)
+        .is_err()
+    {
+        return false;
+    }
+    // Step 5. The suffix must sit strictly outside the host's public suffix.
+    match public_suffix_of(original_host) {
+        Some(ps) => ps != host_suffix && !ps.ends_with(&format!(".{host_suffix}")),
+        // No derivable public suffix for the host: nothing to reach into.
+        None => true,
+    }
+}
+
+/// The public suffix of `host`, derived from its eTLD+1.
+///
+/// The provider hands back the registrable domain; the public suffix is that
+/// with its first label removed. When there is no registrable domain, the host
+/// is at or inside its own public suffix, so it is its own answer.
+fn public_suffix_of(host: &str) -> Option<String> {
+    use public_suffix::EffectiveTLDProvider;
+    match public_suffix::DEFAULT_PROVIDER.effective_tld_plus_one(host) {
+        Ok(etld1) => etld1.split_once('.').map(|(_, rest)| rest.to_string()),
+        Err(_) => Some(host.to_string()),
+    }
 }
 
 /// The host of an `https://` (or `http://localhost`) origin, lowercased.
@@ -193,6 +256,16 @@ fn origin_host(origin: &str) -> Option<String> {
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     if host.is_empty() {
+        return None;
+    }
+    // An IP literal is not a domain, and WebAuthn's relying-party id is a
+    // domain: §5.1.3 requires the effective domain to be a valid domain
+    // string. Browsers refuse a passkey to an IP origin; so does this. Left in
+    // place it would also confuse the public suffix list, which reads
+    // `127.0.0.1` as a host under the TLD `1`.
+    if host.parse::<std::net::IpAddr>().is_ok()
+        || (host.starts_with('[') && host.ends_with(']'))
+    {
         return None;
     }
     match scheme.to_ascii_lowercase().as_str() {
@@ -791,6 +864,66 @@ mod tests {
         assert!(!rp_id_is_valid_for_origin(
             "example.com",
             "https://evil.test@example.com"
+        ));
+    }
+
+    /// The hole a label-boundary check alone leaves open.
+    ///
+    /// Before the public suffix list was consulted, every assertion in the
+    /// first block below returned `true`: a page on `example.com` could mint a
+    /// credential scoped to `com`, and that credential was then assertable to
+    /// every `https` origin there is. Browsers run this check before
+    /// dispatching, which is why lane A never showed it — and is exactly why
+    /// it has to be here, since the injection lane intercepts before the
+    /// browser's check and a non-browser caller has none at all.
+    #[test]
+    fn a_public_suffix_cannot_be_claimed_as_a_relying_party() {
+        // A bare public suffix, one and two labels, and a private one.
+        assert!(!rp_id_is_valid_for_origin("com", "https://example.com"));
+        assert!(!rp_id_is_valid_for_origin("co.uk", "https://bank.co.uk"));
+        assert!(!rp_id_is_valid_for_origin("github.io", "https://someone.github.io"));
+        assert!(!rp_id_is_valid_for_origin("amazonaws.com", "https://s3.amazonaws.com"));
+
+        // And the ordinary cases still work, one and several labels deep.
+        assert!(rp_id_is_valid_for_origin("example.com", "https://login.example.com"));
+        assert!(rp_id_is_valid_for_origin("example.co.uk", "https://a.b.example.co.uk"));
+    }
+
+    /// Equality is decided before the list is consulted, per the HTML
+    /// algorithm's step 2. A page may always claim its own effective domain —
+    /// including a single-label intranet name no public suffix list has heard
+    /// of, which would otherwise be refused.
+    #[test]
+    fn a_host_may_always_claim_itself() {
+        assert!(rp_id_is_valid_for_origin("localhost", "http://localhost"));
+        assert!(rp_id_is_valid_for_origin("app.localhost", "http://app.localhost"));
+        // But a subdomain may not claim the bare development host, which has
+        // no registrable domain under it.
+        assert!(!rp_id_is_valid_for_origin("localhost", "http://app.localhost"));
+    }
+
+    /// A relying-party id is a domain. An IP literal is not one, and left
+    /// alone it also confuses the public suffix list, which reads `127.0.0.1`
+    /// as a host under the TLD `1`.
+    #[test]
+    fn an_ip_address_is_not_a_relying_party() {
+        assert!(!rp_id_is_valid_for_origin("192.168.1.5", "https://192.168.1.5"));
+        assert!(!rp_id_is_valid_for_origin("127.0.0.1", "https://127.0.0.1:8443"));
+        assert!(!rp_id_is_valid_for_origin("::1", "https://[::1]"));
+        assert!(!rp_id_is_valid_for_origin("1", "https://127.0.0.1"));
+    }
+
+    /// The wildcard case, which is what step 5 of the algorithm exists for.
+    ///
+    /// The list carries `*.compute.amazonaws.com`, so for a host under it the
+    /// public suffix reaches further than the registrable domain does. A
+    /// suffix that lands *inside* that must be refused even though it is a
+    /// clean label-boundary match.
+    #[test]
+    fn a_suffix_may_not_reach_into_the_hosts_public_suffix() {
+        assert!(!rp_id_is_valid_for_origin(
+            "compute.amazonaws.com",
+            "https://ec2-1-2-3-4.eu-west-1.compute.amazonaws.com"
         ));
     }
 

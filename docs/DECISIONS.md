@@ -92,6 +92,33 @@ unsigned WebAuthn form with no `pinUvAuth` — so it cannot serve lane B's CTAP2
 Borrow what is cheap: `passkey-types` for the WebAuthn JSON and CTAP2 types,
 `public-suffix` and `RpIdValidator`, and `CollectedClientData`.
 
+### `public-suffix`: done, and it was not cosmetic
+
+`public-suffix` 0.1.3 (from the same `passkey-rs` repository, MIT OR Apache-2.0,
+no transitive dependencies) is now a real dependency of `blackbag-core`.
+
+It closed a hole. The previous check was a label-boundary suffix match, which
+accepted `rp_id = "com"` for `https://example.com` — measured, not theorised —
+and a credential minted under it would have been assertable to every `https`
+origin there is. `co.uk` and `github.io` were the same hole with a second
+label. `rp_id_is_valid_for_origin` now implements HTML's *is a registrable
+domain suffix of or is equal to* in full, including step 5, which stops a
+suffix reaching into a wildcard public suffix such as `*.compute.amazonaws.com`.
+
+Two consequences worth stating:
+
+- **Equality still wins before the list is consulted**, per step 2, so a page
+  may claim its own effective domain even when that is a single-label intranet
+  name no list has heard of.
+- **IP literals are refused as origins.** WebAuthn's relying-party id is a
+  domain and browsers refuse a passkey to an IP; left alone, an IP would also
+  confuse the list, which reads `127.0.0.1` as a host under the TLD `1`.
+
+A browser runs this check before dispatching, which is why lane A never
+exposed it. That is exactly the argument for doing it here: the injection lane
+intercepts `navigator.credentials` *before* the browser's check, and a
+non-browser caller has no check in front of it at all.
+
 Add `passkey-authenticator` as a **dev-dependency** and differential-test our
 ES256 + PRF path against it in CI: same inputs, both outputs verify under
 `webauthn-rs`, same `authData` layout, same PRF bytes. Ed25519 and RS256 are

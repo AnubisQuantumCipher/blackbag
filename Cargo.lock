@@ -200,6 +200,7 @@ dependencies = [
  "ml-kem",
  "p256",
  "proptest",
+ "public-suffix",
  "rand 0.8.8",
  "rand_core 0.6.4",
  "serde",
@@ -1254,6 +1255,12 @@ dependencies = [
  "tempfile",
  "unarray",
 ]
+
+[[package]]
+name = "public-suffix"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51315bca45305dd8aa64b831b33e71abac528ca8058c0651346a39b8d3009498"
 
 [[package]]
 name = "quick-error"
