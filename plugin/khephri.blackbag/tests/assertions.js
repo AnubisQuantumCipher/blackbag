@@ -472,5 +472,33 @@ eq(originMarkup("https://<b>evil</b>.test", DIM, BRIGHT).indexOf("&lt;b&gt;") > 
 eq(core("https://x&y.test"), "x&amp;y.test", "an ampersand is escaped");
 
 
+// ── access: approvals, and reading the record of them ────────────────────────
+
+// The wire names come from Rust's `Capability::as_str`, and a mismatch here
+// would silently render a raw enum name in the one panel a person consults
+// before deciding whether to withdraw an approval.
+eq(capabilityPhrase("reveal"), "may read it", "reveal reads plainly");
+eq(capabilityPhrase("copy"), "may put it on the clipboard",
+   "copy names the clipboard, which is the whole reason it is separate");
+eq(capabilityPhrase("ssh-sign"), "may sign with the key", "ssh-sign reads plainly");
+eq(capabilityPhrase("secret-service"), "may serve it over the Secret Service",
+   "secret-service reads plainly");
+eq(capabilityPhrase("something-new"), "something-new",
+   "an unknown capability shows its own name rather than vanishing");
+
+eq(decisionIsAdverse("refused"), true, "a refusal is worth noticing");
+eq(decisionIsAdverse("blocked"), true, "so is a block");
+eq(decisionIsAdverse("revoked"), true, "so is a withdrawal");
+eq(decisionIsAdverse("lapsed"), true, "so is an expiry");
+eq(decisionIsAdverse("approved"), false, "an approval is not");
+eq(decisionIsAdverse("remembered"), false, "nor is one already given");
+
+eq(auditStamp("2026-09-03T21:04:07Z"), "21:04:07", "a plain UTC stamp");
+eq(auditStamp("2026-09-03T21:04:07.123456Z"), "21:04:07", "fractional seconds are dropped");
+eq(auditStamp("2026-09-03T21:04:07+01:00"), "21:04:07", "so is a positive offset");
+eq(auditStamp("2026-09-03T21:04:07-05:00"), "21:04:07", "and a negative one");
+eq(auditStamp(""), "", "nothing in, nothing out");
+eq(auditStamp(undefined), "", "and an absent field does not print 'undefined'");
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

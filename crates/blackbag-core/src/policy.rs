@@ -41,7 +41,10 @@ use std::collections::HashSet;
 
 /// What a caller wants to do with an item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+// Kebab, so the wire name and `as_str` — which is what the audit log writes —
+// are the same string. Two spellings of one capability is exactly the drift
+// that makes a log hard to trust.
+#[serde(rename_all = "kebab-case")]
 pub enum Capability {
     /// Read a secret field's value.
     Reveal,
@@ -239,6 +242,37 @@ impl Approvals {
 
 #[cfg(test)]
 mod tests {
+    /// One capability, one spelling.
+    ///
+    /// `as_str` is what the audit log writes and what the deck's JSON tests
+    /// hard-code; serde is what crosses the socket. If those ever disagree,
+    /// the same grant is two different things depending on where it is read,
+    /// and a log stops being worth keeping.
+    #[test]
+    fn the_wire_name_and_the_written_name_are_the_same_string() {
+        use super::Capability::*;
+        for c in [Reveal, Copy, SshSign, SecretService] {
+            let json = serde_json::to_string(&c).unwrap();
+            assert_eq!(
+                json.trim_matches('"'),
+                c.as_str(),
+                "{c:?} is spelled two ways"
+            );
+        }
+    }
+
+    /// The names the deck's `capabilityPhrase` switch is written against.
+    /// A rename here without a rename there would print a raw enum name in
+    /// the one panel someone consults before withdrawing an approval.
+    #[test]
+    fn the_capability_names_are_the_ones_the_deck_knows() {
+        use super::Capability::*;
+        assert_eq!(Reveal.as_str(), "reveal");
+        assert_eq!(Copy.as_str(), "copy");
+        assert_eq!(SshSign.as_str(), "ssh-sign");
+        assert_eq!(SecretService.as_str(), "secret-service");
+    }
+
     use super::*;
 
     fn client(name: &str) -> ClientKey {

@@ -356,6 +356,9 @@ enum AgentCommand {
         sink: Option<Sink>,
         #[arg(long, default_value_t = 30)]
         clear_after: u64,
+        /// Read the approval passphrase from stdin. See `reveal --approve`.
+        #[arg(long)]
+        approve: bool,
     },
     /// Create a record from a JSON draft read on stdin.
     ///
@@ -925,7 +928,10 @@ fn cmd_agent(
         AgentCommand::Revoke { client, item } => {
             match session::ask(&Request::Revoke { client, item })? {
                 Response::Added { count } => {
-                    println!("Withdrew {count} approval(s).");
+                    println!(
+                        "Withdrew {count} {}.",
+                        if count == 1 { "approval" } else { "approvals" }
+                    );
                     Ok(())
                 }
                 Response::Error { message } => bail!("{message}"),
@@ -1035,7 +1041,13 @@ fn cmd_agent(
             clear_after,
             approve,
         } => {
-            let value = reveal_with_approval(&id.to_string(), &field, approve)?;
+            // Where it is going decides which approval is needed: the
+            // clipboard is readable by everything else in the session.
+            let capability = match sink {
+                Sink::Clipboard => blackbag_core::policy::Capability::Copy,
+                _ => blackbag_core::policy::Capability::Reveal,
+            };
+            let value = reveal_with_approval(&id.to_string(), &field, capability, approve)?;
             // `value` arrives wrapped, so it is wiped when this scope ends
             // however the emit path returns.
             tty::emit_secret(&value, &field, sink, clear_after)?;
@@ -1043,7 +1055,12 @@ fn cmd_agent(
         }
 
         AgentCommand::Show { id, field, approve } => {
-            let value = reveal_with_approval(&id.to_string(), &field, approve)?;
+            let value = reveal_with_approval(
+                &id.to_string(),
+                &field,
+                blackbag_core::policy::Capability::Reveal,
+                approve,
+            )?;
             use std::io::Write;
             let mut out = std::io::stdout();
             out.write_all(value.as_bytes())?;
@@ -1127,8 +1144,25 @@ fn cmd_agent(
             id,
             sink,
             clear_after,
+            approve,
         } => {
-            match session::ask(&Request::TotpCode { id: id.to_string() })? {
+            // Gated like any other secret read. A live second-factor code is a
+            // credential for the next thirty seconds, and a process quietly
+            // collecting them is the thing the policy exists to stop.
+            // Same split as `reveal`: where it is going decides what has to
+            // be approved.
+            let capability = match sink {
+                Some(Sink::Clipboard) => blackbag_core::policy::Capability::Copy,
+                _ => blackbag_core::policy::Capability::Reveal,
+            };
+            let reply = with_approval(&id.to_string(), approve, |passphrase| {
+                session::ask(&Request::TotpCode {
+                    id: id.to_string(),
+                    capability: Some(capability),
+                    passphrase,
+                })
+            })?;
+            match reply {
                 Response::Totp {
                     code,
                     ttl_secs,
@@ -1552,18 +1586,41 @@ impl std::fmt::Display for ApprovalRequired {
 
 impl std::error::Error for ApprovalRequired {}
 
-fn reveal_with_approval(id: &str, field: &str, approve: bool) -> Result<Zeroizing<String>> {
-    let ask = |passphrase: Option<Zeroizing<String>>| {
-        session::ask(&Request::Reveal {
-            id: id.to_string(),
-            field: field.to_string(),
-            passphrase,
-        })
-    };
-
-    match ask(None)? {
+fn reveal_with_approval(
+    id: &str,
+    field: &str,
+    capability: blackbag_core::policy::Capability,
+    approve: bool,
+) -> Result<Zeroizing<String>> {
+    match with_approval(
+        id,
+        approve,
+        |passphrase| {
+            session::ask(&Request::Reveal {
+                id: id.to_string(),
+                field: field.to_string(),
+                capability: Some(capability),
+                passphrase,
+            })
+        },
+    )? {
         Response::Secret { value } => Ok(value),
         Response::Error { message } => bail!("{message}"),
+        _ => bail!("unexpected reply"),
+    }
+}
+
+/// Run a request that the agent may answer with "a human must approve this
+/// first", ask for the master passphrase once, and run it again.
+///
+/// Shared by every gated verb rather than written per verb: the prompt, the
+/// no-terminal exit code and the wording are security-relevant, and three
+/// copies of them would drift.
+fn with_approval<F>(id: &str, approve: bool, ask: F) -> Result<Response>
+where
+    F: Fn(Option<Zeroizing<String>>) -> Result<Response>,
+{
+    match ask(None)? {
         Response::ApprovalRequired {
             title,
             client,
@@ -1598,13 +1655,9 @@ fn reveal_with_approval(id: &str, field: &str, approve: bool) -> Result<Zeroizin
                 .with_context(|| {
                     format!("{who} is not approved to read {field} of {what}")
                 })?;
-            match ask(Some(passphrase))? {
-                Response::Secret { value } => Ok(value),
-                Response::Error { message } => bail!("{message}"),
-                _ => bail!("unexpected reply"),
-            }
+            ask(Some(passphrase))
         }
-        _ => bail!("unexpected reply"),
+        other => Ok(other),
     }
 }
 
@@ -1622,7 +1675,11 @@ fn cmd_audit(args: AuditArgs) -> Result<()> {
     if args.verify {
         match log.verify(None)? {
             Verdict::Intact { entries, head } => {
-                println!("intact · {entries} entr(ies) · head {}", &head[..16.min(head.len())]);
+                println!(
+                    "intact · {entries} {} · head {}",
+                    if entries == 1 { "entry" } else { "entries" },
+                    &head[..16.min(head.len())]
+                );
                 Ok(())
             }
             Verdict::Broken { at, why } => {
@@ -1655,7 +1712,9 @@ fn cmd_audit(args: AuditArgs) -> Result<()> {
                 );
             }
         }
-        if entries.is_empty() {
+        // Not on the JSON stream: a reader parsing one object per line should
+        // never have to skip a sentence.
+        if entries.is_empty() && !args.json {
             println!("Nothing recorded yet.");
         }
         Ok(())

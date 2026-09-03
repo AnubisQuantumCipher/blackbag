@@ -53,6 +53,15 @@ jobs:
       - name: Model.js assertions
         run: plugin/khephri.blackbag/tests/run.sh
 
+      # Invariants about the QML that no type checker can see. Each rule is
+      # there because breaking it caused a real failure — see the comments in
+      # the file, which name the failure each one prevents.
+      - name: Deck structural invariants
+        run: python3 plugin/khephri.blackbag/tests/structure.py
+
+      - name: Extension encoding assertions
+        run: node extension/tests/encoding.test.js
+
       # Cockpit.qml, Editor.qml and Model.js are one surface with two hosts.
       # This is what stops a fix landing in the plugin and never reaching the
       # application, which is the drift this repository has already been bitten

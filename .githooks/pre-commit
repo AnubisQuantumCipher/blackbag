@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Keep secrets out of this repository.
+#
+# This is not box-ticking. A crates.io token was published in six releases of
+# this project before anyone noticed, and the way it happened — a real value
+# sitting in a file that looked like configuration — is exactly what a scan on
+# the staged diff catches and a code review does not.
+#
+# Enable it once per clone:
+#   git config core.hooksPath .githooks
+set -uo pipefail
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[[ -z "$staged" ]] && exit 0
+fail=0
+say() { printf '  ! %s\n' "$*" >&2; fail=1; }
+
+# gitleaks when it is installed, because it knows far more patterns than the
+# fallback below and is the tool this project's documentation names.
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks protect --staged --redact --no-banner; then
+    echo "pre-commit: gitleaks found something staged. Nothing was committed." >&2
+    exit 1
+  fi
+else
+  echo "pre-commit: gitleaks is not installed; running the built-in scan only." >&2
+fi
+
+# The built-in scan runs either way: it knows this project specifically, and a
+# machine without gitleaks must not be a machine without a check.
+while IFS= read -r f; do
+  case "$f" in
+    # A vault, a key or a signature has no business in version control, whatever
+    # it is called. .gitignore already covers these; this catches a `git add -f`.
+    *.cbor|*.key|*.qsig|*.bag) say "$f is key or vault material" ;;
+  esac
+
+  git show ":$f" 2>/dev/null | grep -nE \
+    -e 'BEGIN [A-Z ]*PRIVATE KEY' \
+    -e 'cio[A-Za-z0-9]{32,}' \
+    -e 'gh[pousr]_[A-Za-z0-9]{36,}' \
+    -e 'AKIA[0-9A-Z]{16}' \
+    -e 'xox[baprs]-[A-Za-z0-9-]{10,}' \
+    | while IFS= read -r hit; do
+        printf '  ! %s:%s\n' "$f" "${hit%%:*}" >&2
+      done
+
+  if git show ":$f" 2>/dev/null | grep -qE \
+      -e 'BEGIN [A-Z ]*PRIVATE KEY' \
+      -e 'cio[A-Za-z0-9]{32,}' \
+      -e 'gh[pousr]_[A-Za-z0-9]{36,}' \
+      -e 'AKIA[0-9A-Z]{16}' \
+      -e 'xox[baprs]-[A-Za-z0-9-]{10,}'; then
+    fail=1
+  fi
+done <<< "$staged"
+
+if [[ $fail -ne 0 ]]; then
+  echo "pre-commit: that looks like a secret. Nothing was committed." >&2
+  echo "            If it is a false positive, commit with --no-verify and say why." >&2
+  exit 1
+fi
+exit 0

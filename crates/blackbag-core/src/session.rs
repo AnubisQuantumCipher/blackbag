@@ -129,6 +129,14 @@ pub enum Request {
     Reveal {
         id: String,
         field: String,
+        /// What the caller intends to do with it.
+        ///
+        /// Approving "show this on screen for ten seconds" is not approving
+        /// "put this on the clipboard", where every other process in the
+        /// session can read it. They are different exposures, so they are
+        /// different questions and each is asked once.
+        #[serde(default)]
+        capability: Option<crate::policy::Capability>,
         #[serde(default)]
         passphrase: Option<Zeroizing<String>>,
     },
@@ -150,7 +158,20 @@ pub enum Request {
     /// It must never be written to status.json — see hygiene.rs.
     Hygiene,
     /// Current TOTP code and its remaining validity.
-    TotpCode { id: String },
+    ///
+    /// Gated like any other secret read: a live second-factor code is a
+    /// credential, and a process quietly harvesting them every thirty seconds
+    /// is exactly the thing the approval policy exists to stop.
+    TotpCode {
+        id: String,
+        /// Where the code is going. The clipboard is a different exposure
+        /// from the card on screen — every other process in the session can
+        /// read it — so it is a different approval, exactly as for `Reveal`.
+        #[serde(default)]
+        capability: Option<crate::policy::Capability>,
+        #[serde(default)]
+        passphrase: Option<Zeroizing<String>>,
+    },
     /// The five-character SHA-1 prefixes of every password-like field, so a
     /// caller can fetch the matching Pwned Passwords buckets. The full hash
     /// never leaves the agent.
@@ -1144,6 +1165,7 @@ impl Agent {
             Request::Reveal {
                 id,
                 field,
+                capability,
                 passphrase,
             } => {
                 use crate::policy::{Capability, ClientKey, Verdict};
@@ -1176,7 +1198,14 @@ impl Agent {
 
                 // Decided BEFORE the vault is touched, so a refusal cannot be
                 // distinguished from a miss by how long it took.
-                let verdict = self.approvals.consider(&client, &id.to_string(), Capability::Reveal);
+                let capability = capability.unwrap_or(Capability::Reveal);
+                let verdict = self.approvals.consider(&client, &id.to_string(), capability);
+
+                // Built once and used by every outcome. "approved · password"
+                // does not say whether what was approved was a glance at the
+                // screen or a copy onto a clipboard every other process can
+                // read, and those are not the same thing to have said yes to.
+                let detail = format!("{field} ({})", capability.as_str());
 
                 let allowed = match verdict {
                     Verdict::Remembered => {
@@ -1184,7 +1213,7 @@ impl Agent {
                             crate::audit::Surface::Socket,
                             crate::audit::Decision::Remembered,
                             &id.to_string(),
-                            Some(&field),
+                            Some(&detail),
                         );
                         true
                     }
@@ -1193,7 +1222,7 @@ impl Agent {
                             crate::audit::Surface::Socket,
                             crate::audit::Decision::Blocked,
                             &id.to_string(),
-                            Some(&field),
+                            Some(&detail),
                         );
                         bail!("{why}");
                     }
@@ -1205,13 +1234,12 @@ impl Agent {
                             if !pass.is_empty()
                                 && self.opened()?.vault.passphrase_matches(pass.as_bytes()) =>
                         {
-                            self.approvals
-                                .grant(&client, &id.to_string(), Capability::Reveal);
+                            self.approvals.grant(&client, &id.to_string(), capability);
                             self.record_audit(
                                 crate::audit::Surface::Socket,
                                 crate::audit::Decision::Approved,
                                 &id.to_string(),
-                                Some(&field),
+                                Some(&detail),
                             );
                             true
                         }
@@ -1220,7 +1248,7 @@ impl Agent {
                                 crate::audit::Surface::Socket,
                                 crate::audit::Decision::Refused,
                                 &id.to_string(),
-                                Some(&field),
+                                Some(&detail),
                             );
                             bail!("that is not the vault passphrase");
                         }
@@ -1255,8 +1283,68 @@ impl Agent {
                 })
             }
 
-            Request::TotpCode { id } => {
+            Request::TotpCode {
+                id,
+                capability,
+                passphrase,
+            } => {
+                use crate::policy::{Capability, ClientKey, Verdict};
+
+                let capability = capability.unwrap_or(Capability::Reveal);
                 let id: Uuid = id.parse().context("invalid record id")?;
+                let program = self.peer.and_then(|p| PeerId::program(p.pid));
+                let client = ClientKey::for_peer(
+                    program.as_deref(),
+                    self.peer.map(|p| p.pid).unwrap_or(0),
+                );
+
+                let detail = format!("totp ({})", capability.as_str());
+                match self.approvals.consider(&client, &id.to_string(), capability) {
+                    Verdict::Remembered => {}
+                    Verdict::Blocked(why) => {
+                        self.record_audit(
+                            crate::audit::Surface::Socket,
+                            crate::audit::Decision::Blocked,
+                            &id.to_string(),
+                            Some(&detail),
+                        );
+                        bail!("{why}");
+                    }
+                    Verdict::MustAsk => match &passphrase {
+                        Some(pass)
+                            if !pass.is_empty()
+                                && self.opened()?.vault.passphrase_matches(pass.as_bytes()) =>
+                        {
+                            self.approvals.grant(&client, &id.to_string(), capability);
+                            self.record_audit(
+                                crate::audit::Surface::Socket,
+                                crate::audit::Decision::Approved,
+                                &id.to_string(),
+                                Some(&detail),
+                            );
+                        }
+                        Some(_) => {
+                            self.record_audit(
+                                crate::audit::Surface::Socket,
+                                crate::audit::Decision::Refused,
+                                &id.to_string(),
+                                Some(&detail),
+                            );
+                            bail!("that is not the vault passphrase");
+                        }
+                        None => {
+                            let title =
+                                self.opened()?.vault.get(id).and_then(|r| r.title.clone());
+                            return Ok(Response::ApprovalRequired {
+                                item: id.to_string(),
+                                title,
+                                field: "totp".into(),
+                                client: program,
+                            });
+                        }
+                    },
+                }
+
                 let open = self.opened()?;
                 let record = open
                     .vault
@@ -1533,11 +1621,16 @@ impl Agent {
                     }
                     None => self.approvals.revoke_client(&key),
                 };
+                // Subject is WHOSE approvals went, so the line reads the same
+                // way as every other: who did it, to what, and how much.
                 self.record_audit(
                     crate::audit::Surface::Socket,
                     crate::audit::Decision::Revoked,
-                    &format!("revoke:{client}"),
-                    Some(&n.to_string()),
+                    &client,
+                    Some(&format!(
+                        "{n} {} withdrawn",
+                        if n == 1 { "approval" } else { "approvals" }
+                    )),
                 );
                 self.publish()?;
                 Ok(Response::Added { count: n })
@@ -2630,6 +2723,7 @@ mod tests {
     #[test]
     fn requests_roundtrip_as_json_lines() {
         let request = Request::Reveal {
+            capability: None,
             id: "1234".into(),
             field: "password".into(),
             passphrase: None,
@@ -3047,6 +3141,7 @@ mod passkey_reveal_tests {
             let reply = ask_at(
                 &sock,
                 &Request::Reveal {
+                    capability: None,
                     id: id.clone(),
                     field: field.into(),
                     passphrase: None,
@@ -3263,12 +3358,61 @@ mod reveal_policy_tests {
         }
     }
 
+    fn add_totp(sock: &Path) -> String {
+        let draft = RecordDraft {
+            kind: Kind::Totp.as_str().into(),
+            title: Some("Bank 2FA".into()),
+            totp: Some(TotpDraft {
+                // RFC 4648 base32 of b"12345678901234567890", the RFC 6238
+                // test key.
+                secret_base32: Some(Zeroizing::new("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".into())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match ask_at(sock, &Request::Add { draft }).unwrap() {
+            Response::Saved { id } => id,
+            other => panic!("{other:?}"),
+        }
+    }
+
     fn reveal(sock: &Path, id: &str, pass: Option<&str>) -> Response {
+        reveal_as(sock, id, crate::policy::Capability::Reveal, pass)
+    }
+
+    fn reveal_as(
+        sock: &Path,
+        id: &str,
+        capability: crate::policy::Capability,
+        pass: Option<&str>,
+    ) -> Response {
         ask_at(
             sock,
             &Request::Reveal {
                 id: id.into(),
                 field: "password".into(),
+                capability: Some(capability),
+                passphrase: pass.map(|p| Zeroizing::new(p.to_string())),
+            },
+        )
+        .unwrap()
+    }
+
+    fn totp_code(sock: &Path, id: &str, pass: Option<&str>) -> Response {
+        totp_code_as(sock, id, crate::policy::Capability::Reveal, pass)
+    }
+
+    fn totp_code_as(
+        sock: &Path,
+        id: &str,
+        capability: crate::policy::Capability,
+        pass: Option<&str>,
+    ) -> Response {
+        ask_at(
+            sock,
+            &Request::TotpCode {
+                id: id.into(),
+                capability: Some(capability),
                 passphrase: pass.map(|p| Zeroizing::new(p.to_string())),
             },
         )
@@ -3335,6 +3479,80 @@ mod reveal_policy_tests {
         assert!(
             matches!(reveal(&sock, &id, None), Response::ApprovalRequired { .. }),
             "an approval must not survive the lock it was granted under"
+        );
+    }
+
+    /// Showing a secret on screen and putting it on the clipboard are not the
+    /// same exposure, so they are not the same approval.
+    ///
+    /// The clipboard is readable by every other process in the session and
+    /// outlives the glance; a value on screen does not. Approving one must not
+    /// silently approve the other.
+    #[test]
+    fn approving_show_does_not_approve_copy() {
+        use crate::policy::Capability;
+
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = add_login(&sock);
+
+        reveal_as(&sock, &id, Capability::Reveal, Some(PASS));
+        assert!(matches!(
+            reveal_as(&sock, &id, Capability::Reveal, None),
+            Response::Secret { .. }
+        ));
+
+        assert!(
+            matches!(
+                reveal_as(&sock, &id, Capability::Copy, None),
+                Response::ApprovalRequired { .. }
+            ),
+            "the clipboard is a different exposure and must be asked for separately"
+        );
+
+        // And the other way round, so neither direction leaks into the other.
+        reveal_as(&sock, &id, Capability::Copy, Some(PASS));
+        assert!(matches!(
+            reveal_as(&sock, &id, Capability::Copy, None),
+            Response::Secret { .. }
+        ));
+    }
+
+    /// A live second-factor code is a credential, not a display value.
+    #[test]
+    fn a_totp_code_needs_approval_too() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = add_totp(&sock);
+
+        match totp_code(&sock, &id, None) {
+            Response::ApprovalRequired { field, .. } => assert_eq!(field, "totp"),
+            other => panic!("a code was served without approval: {other:?}"),
+        }
+        match totp_code(&sock, &id, Some("not it")) {
+            Response::Error { message } => assert!(message.contains("not the vault passphrase")),
+            other => panic!("{other:?}"),
+        }
+        match totp_code(&sock, &id, Some(PASS)) {
+            Response::Totp { code, .. } => assert_eq!(code.len(), 6),
+            other => panic!("{other:?}"),
+        }
+        // Remembered, so the deck can keep the code ticking without asking
+        // again every thirty seconds.
+        assert!(matches!(
+            totp_code(&sock, &id, None),
+            Response::Totp { .. }
+        ));
+
+        // A code on the clipboard is readable by everything else in the
+        // session for as long as it sits there. Showing one in a card is not
+        // the same act, so showing it does not license copying it.
+        assert!(
+            matches!(
+                totp_code_as(&sock, &id, crate::policy::Capability::Copy, None),
+                Response::ApprovalRequired { .. }
+            ),
+            "putting a code on the clipboard is a separate question"
         );
     }
 

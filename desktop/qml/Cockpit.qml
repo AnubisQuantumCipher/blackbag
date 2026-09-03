@@ -52,6 +52,12 @@ Item {
   property int revealSecondsLeft: 0
 
   property var totpState: null   // { id, code, ttl, step, at }
+  /// The record whose code the agent will not serve until it is approved.
+  ///
+  /// Held rather than acted on: the card polls every step, and a prompt that
+  /// appeared because the cursor moved would be a prompt people learn to
+  /// dismiss without reading. The ask happens when the owner asks for it.
+  property string totpNeedsApproval: ""
 
   // Hygiene carries per-field handles and record titles, so it is as sensitive
   // as the record list itself: it comes over the agent socket, lives only in
@@ -185,6 +191,12 @@ Item {
   readonly property var visibleRecords:
     Model.sortRecords(Model.filterRecords(root.records, root.filterKind, root.searchText))
   // Never render a code under a record it was not fetched for.
+  /// True when the selected record's code is behind an approval nobody has
+  /// given yet.
+  readonly property bool totpBlocked:
+    root.selectedRecord !== null && root.selectedRecord !== undefined
+      && root.totpNeedsApproval === String(root.selectedRecord.id)
+
   readonly property var liveTotp:
     (root.totpState && root.selectedRecord
      && String(root.totpState.id) === String(root.selectedRecord.id))
@@ -248,6 +260,9 @@ Item {
     root.revealedFor = ""
     root.revealSecondsLeft = 0
     root.totpState = null
+    // Locking forgets every approval, so the deck must forget that it was ever
+    // told no — otherwise it would keep suppressing the ask after a re-unlock.
+    root.totpNeedsApproval = ""
     root.showPendingId = ""
     root.showPendingField = ""
     root.totpPendingId = ""
@@ -295,8 +310,16 @@ Item {
 
     if (pending.length === 0) {
       // The ceremony was answered, expired, or the vault locked underneath it.
+      //
+      // ONLY the passkey sheet. A line here once also tore down the record
+      // approval sheet, which has nothing to do with ceremonies: the agent
+      // republishes status on every state change, so any refresh — including
+      // the deck's own thirty-second safety net — cancelled an approval
+      // somebody was part-way through. The sheet vanished mid-passphrase and
+      // the rest of it went to the deck as shortcuts, which opened the record
+      // editor and typed the remainder of a MASTER PASSPHRASE into a record
+      // field. Nothing about a passkey queue may reach across to this sheet.
       if (consentSheet.open_) consentSheet.standDown()
-    if (root.pendingApproval !== null) root.cancelApproval()
       return
     }
     var next = pending[0]
@@ -483,10 +506,21 @@ Item {
     }
     var p = root.pendingApproval
     approveProcess.kind = p.kind
-    approveProcess.command = p.kind === "copy"
-      ? ["black-bag", "agent", "reveal", p.id, p.field, "--approve",
-         "--to", "clipboard", "--clear-after", String(root.clipboardClearSec)]
-      : ["black-bag", "agent", "show", p.id, p.field, "--approve"]
+    // `totp` is not a readable field — the stored secret is binary — so both
+    // the copy and the plain ask go through the TOTP verb, which returns the
+    // current code rather than the shared secret.
+    var isTotp = String(p.field) === "totp"
+    if (p.kind === "totp") {
+      approveProcess.command = ["black-bag", "agent", "totp", p.id, "--approve"]
+    } else if (p.kind === "copy") {
+      approveProcess.command = isTotp
+        ? ["black-bag", "agent", "totp", p.id, "--approve",
+           "--to", "clipboard", "--clear-after", String(root.clipboardClearSec)]
+        : ["black-bag", "agent", "reveal", p.id, p.field, "--approve",
+           "--to", "clipboard", "--clear-after", String(root.clipboardClearSec)]
+    } else {
+      approveProcess.command = ["black-bag", "agent", "show", p.id, p.field, "--approve"]
+    }
     if (p.kind === "show") {
       root.showPendingId = p.id
       root.showPendingField = p.field
@@ -542,6 +576,9 @@ Item {
 
   function fetchTotp(record) {
     if (!record || !record.has_totp) return
+    // Already asked and told no. Re-asking every step would fill the audit log
+    // with the same unanswered question.
+    if (root.totpNeedsApproval === String(record.id)) return
     // One fetch at a time: overwriting the pending id mid-flight would stamp
     // the FIRST record's code with the SECOND record's id. But the second
     // request cannot simply be dropped either — nothing re-issued it, so
@@ -933,6 +970,15 @@ Item {
         return
       }
       root.actionNote = approveProcess.kind === "copy" && err.length > 0 ? err : root.actionNote
+      if (approveProcess.kind === "totp") {
+        // The card's own approval, so the card's own poll can have it now.
+        // A clipboard approval is a different grant and deliberately does not
+        // land here: it would leave the card showing a code nobody approved
+        // it to show.
+        root.totpNeedsApproval = ""
+        var rec = root.selectedRecord
+        Qt.callLater(function () { if (rec) root.fetchTotp(rec) })
+      }
       root.cancelApproval()
     }
   }
@@ -996,6 +1042,13 @@ Item {
             root.fetchTotp(root.selectedRecord)
         })
       }
+      if (root.isApprovalRequired(code)) {
+        // Not a failure and not a prompt: the card says so, and offers the
+        // ask as something to press.
+        root.totpNeedsApproval = root.totpPendingId
+        root.totpState = null
+        return
+      }
       if (code !== 0) {
         root.totpState = null
         var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
@@ -1008,6 +1061,7 @@ Item {
         try {
           var parsed = JSON.parse(String(this.text || "{}"))
           if (parsed.code === undefined) return
+          if (root.totpNeedsApproval === root.totpPendingId) root.totpNeedsApproval = ""
           root.totpState = {
             id: root.totpPendingId,
             code: String(parsed.code),
@@ -1232,6 +1286,13 @@ Item {
           root.beginAdd(); event.accepted = true
         } else if (event.key === Qt.Key_E && event.modifiers === Qt.NoModifier) {
           root.beginEdit(); event.accepted = true
+        } else if (event.key === Qt.Key_T && event.modifiers === Qt.NoModifier
+                   && root.totpBlocked) {
+          // The card's APPROVE, from the keyboard. Without this the only way
+          // to let the card show a code is a pointer, and pointer injection
+          // is not something every session has.
+          root.askApproval("totp", root.selectedRecord, "totp")
+          event.accepted = true
         } else if (event.key === Qt.Key_Delete
                    || (event.key === Qt.Key_D && (event.modifiers & Qt.ControlModifier))) {
           root.requestDelete(); event.accepted = true
@@ -2367,7 +2428,9 @@ Item {
                       spacing: 0
                       Text {
                         text: root.liveTotp ? root.liveTotp.code : "······"
-                        color: root.liveTotp ? Color.foreground : Util.alpha(Color.foreground, 0.3)
+                        color: root.liveTotp ? Color.foreground
+                             : (root.totpBlocked ? Util.alpha(Color.urgent, 0.55)
+                                                 : Util.alpha(Color.foreground, 0.3))
                         font.family: metric.font.family
                         font.pixelSize: metric.font.display
                         font.bold: true
@@ -2376,13 +2439,16 @@ Item {
                       }
                       Text {
                         text: {
-                          if (!root.liveTotp)
+                          if (!root.liveTotp) {
+                            if (root.totpBlocked) return "needs your approval once"
                             return totpProcess.running ? "fetching…" : "unavailable"
+                          }
                           var elapsed = (root.nowMs - root.liveTotp.at) / 1000
                           var remaining = Math.max(0, Math.round(root.liveTotp.ttl - elapsed))
                           return remaining + "s · step " + root.liveTotp.step + "s"
                         }
-                        color: Util.alpha(Color.foreground, 0.5)
+                        color: root.totpBlocked && !root.liveTotp
+                          ? Util.alpha(Color.urgent, 0.8) : Util.alpha(Color.foreground, 0.5)
                         font.family: metric.font.family
                         font.pixelSize: metric.font.caption
                         renderType: Text.NativeRendering
@@ -2390,10 +2456,15 @@ Item {
                     }
 
                     ActionButton {
-                      label: "COPY"
-                      tone: Color.accent
-                      enabledAction: root.liveTotp !== null
-                      onActivated: root.copyField(root.selectedRecord, "totp")
+                      label: root.totpBlocked && !root.liveTotp ? "APPROVE" : "COPY"
+                      tone: root.totpBlocked && !root.liveTotp ? Color.urgent : Color.accent
+                      enabledAction: root.liveTotp !== null || root.totpBlocked
+                      onActivated: {
+                        if (root.totpBlocked && !root.liveTotp)
+                          root.askApproval("totp", root.selectedRecord, "totp")
+                        else
+                          root.copyField(root.selectedRecord, "totp")
+                      }
                     }
                   }
                 }
@@ -2726,8 +2797,13 @@ Item {
           Item { Layout.fillWidth: true }
 
           Text {
+            // `t` is listed only when there is something for it to do: a
+            // chord advertised everywhere and live nowhere is worse than one
+            // that appears when it applies.
             text: root.unlocked
-              ? "n new · e edit · del remove · / search · ↑↓ move · ⏎ copy · ⇧⏎ show · ^B breaches · ^L lock · esc close"
+              ? ("n new · e edit · del remove · / search · ↑↓ move · ⏎ copy · ⇧⏎ show"
+                 + (root.totpBlocked ? " · t approve the code" : "")
+                 + " · ^B breaches · ^L lock · esc close")
               : "⏎ unlock · esc close"
             color: Util.alpha(Color.foreground, 0.55)
             font.family: metric.font.family
@@ -3080,7 +3156,10 @@ Item {
             Text {
               Layout.fillWidth: true
               text: root.pendingApproval
-                ? String(root.pendingApproval.field) + " of " + String(root.pendingApproval.title)
+                ? (String(root.pendingApproval.field) === "totp"
+                     ? "the current code for " + String(root.pendingApproval.title)
+                     : String(root.pendingApproval.field) + " of "
+                       + String(root.pendingApproval.title))
                 : ""
               color: Color.accent
               font.family: metric.font.family
@@ -3092,9 +3171,16 @@ Item {
             }
             Text {
               Layout.fillWidth: true
-              text: root.pendingApproval && root.pendingApproval.kind === "copy"
-                ? "onto the clipboard, cleared after " + root.clipboardClearSec + "s"
-                : "on screen, for " + root.revealSeconds + "s"
+              text: {
+                if (!root.pendingApproval) return ""
+                if (root.pendingApproval.kind === "copy")
+                  return "onto the clipboard, cleared after " + root.clipboardClearSec + "s"
+                // A code is shown in its card and rolls on its own; it is not
+                // held on screen for a countdown the way a password is.
+                if (root.pendingApproval.kind === "totp")
+                  return "in the card above, refreshed each step until the vault locks"
+                return "on screen, for " + root.revealSeconds + "s"
+              }
               color: Util.alpha(Color.foreground, 0.55)
               font.family: metric.font.family
               font.pixelSize: metric.font.caption
@@ -3106,9 +3192,11 @@ Item {
 
         Text {
           Layout.fillWidth: true
-          text: "The vault is already open. This is asked once per program and "
-              + "field, and remembered until the vault locks — because the "
-              + "socket cannot tell this deck from anything else running as you."
+          text: "The vault is already open. This is asked once per program, "
+              + "field and use — reading it and putting it on the clipboard are "
+              + "different questions — and remembered until the vault locks, "
+              + "because the socket cannot tell this deck from anything else "
+              + "running as you."
           color: Util.alpha(Color.foreground, 0.5)
           font.family: metric.font.family
           font.pixelSize: metric.font.caption
@@ -3183,6 +3271,8 @@ Item {
       homeDir: root.homeDir
       status: root.status
       settings: root.settings
+      // So a grant reads as "Bank" and not as a UUID.
+      records: root.records
 
       onChanged: {
         // The vault moved under us: re-read both the file's posture and the

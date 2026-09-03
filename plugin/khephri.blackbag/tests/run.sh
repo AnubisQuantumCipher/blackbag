@@ -13,3 +13,7 @@ trap 'rm -f "$out"' EXIT
 sed 's/^\.pragma library//' ../Model.js > "$out"
 cat assertions.js >> "$out"
 node "$out"
+
+# The structural invariants run alongside the unit assertions: both are
+# "the deck's logic", and a split that has to be remembered gets forgotten.
+python3 ./structure.py

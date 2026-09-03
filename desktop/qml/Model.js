@@ -1191,3 +1191,47 @@ function originMarkup(origin, dim, bright) {
   return span(scheme, dim) + span(lead, dim) + span(core, bright)
        + span(port, dim) + span(tail, dim)
 }
+
+// ── access: approvals and the record of them ─────────────────────────────────
+
+/// What a capability lets a program do, in words rather than in its wire name.
+///
+/// The distinction between REVEAL and COPY is the one that matters and is the
+/// one a bare enum name hides: a value on screen goes away when you look away,
+/// and a value on the clipboard is readable by everything else in the session
+/// until it is cleared.
+function capabilityPhrase(capability) {
+  switch (String(capability)) {
+    case "reveal":         return "may read it"
+    case "copy":           return "may put it on the clipboard"
+    case "ssh-sign":       return "may sign with the key"
+    case "secret-service": return "may serve it over the Secret Service"
+    default:               return String(capability)
+  }
+}
+
+/// True for a decision that is worth noticing — a refusal, a block, or a
+/// withdrawal. Used only to colour a line, never to decide anything.
+function decisionIsAdverse(decision) {
+  var d = String(decision)
+  return d === "refused" || d === "blocked" || d === "revoked" || d === "lapsed"
+}
+
+/// `2026-09-03T21:04:07.123456Z` as `21:04:07`.
+///
+/// The date is dropped deliberately: this list is the last fourteen decisions,
+/// which on a machine in use are all from the last few minutes, and a date on
+/// every line would crowd out the part that is read.
+function auditStamp(at) {
+  var text = String(at === undefined || at === null ? "" : at)
+  var t = text.indexOf("T")
+  if (t < 0) return text
+  var rest = text.slice(t + 1)
+  // Trim the zone and any fractional seconds: HH:MM:SS is what is left.
+  var cut = rest.length
+  for (var i = 0; i < rest.length; i++) {
+    var c = rest.charAt(i)
+    if (c === "." || c === "Z" || c === "+" || (c === "-" && i > 0)) { cut = i; break }
+  }
+  return rest.slice(0, cut)
+}

@@ -52,6 +52,7 @@ Item {
     { key: "import",     label: "IMPORT",        hint: "from six other managers" },
     { key: "export",     label: "EXPORT",        hint: "plaintext, deliberately" },
     { key: "generate",   label: "GENERATE",      hint: "with honest entropy" },
+    { key: "access",     label: "ACCESS",        hint: "who reads what · the log" },
     { key: "settings",   label: "SETTINGS",      hint: "how this deck behaves" }
   ]
   property string section: "passphrase"
@@ -65,6 +66,7 @@ Item {
       case "import":     return manage.importPreview.length === 0 ? "preview" : "import"
       case "export":     return "export"
       case "generate":   return "generate"
+      case "access":     return "refresh"
       default:           return ""
     }
   }
@@ -101,6 +103,28 @@ Item {
   property string generatedNote: ""
 
   readonly property int minLength: 12
+
+  // ── access ─────────────────────────────────────────────────────────────────
+  /// Every approval in force right now, as the agent reports them.
+  property var grants: []
+  property bool lockdown: false
+  /// The most recent decisions, oldest first, and what the chain says.
+  property var history: []
+  property string chainVerdict: ""
+  property bool chainOk: false
+  /// Two-step, like every other irreversible verb in this sheet.
+  property string revokeClientArmed: ""
+  /// Which grant the keyboard is on. -1 is "none picked yet".
+  ///
+  /// The panel is reachable without a pointer on purpose: a security control
+  /// you can only work with a mouse is one that does not get used in the
+  /// moment it is needed.
+  property int grantCursor: -1
+  property bool lockdownArmed: false
+  /// Record titles, so a grant reads as a name and not a UUID. Supplied by
+  /// the deck, which already holds the list.
+  property var records: []
+
   readonly property var recipients: Model.recipientRows(manage.status)
   readonly property var revocable: Model.revocableRecipients(manage.status)
 
@@ -110,6 +134,8 @@ Item {
     manage.noteText = ""
     manage.busy = false
     manage.revokeArmed = ""
+    manage.revokeClientArmed = ""
+    manage.lockdownArmed = false
     manage.exportArmed = false
     manage.importPreview = ""
     manage.generated = ""
@@ -120,6 +146,7 @@ Item {
     manage.exportPath = (manage.homeDir.length > 0 ? manage.homeDir : "~") + "/black-bag-export.json"
     manage.clear()
     manage.open_ = true
+    if (manage.section === "access") manage.loadAccess()
     Qt.callLater(function () { manage.forceActiveFocus() })
   }
 
@@ -146,6 +173,7 @@ Item {
   function anyProcessRunning() {
     return rekeyProcess.running || keyAddProcess.running || keyRemoveProcess.running
         || importProcess.running || exportProcess.running || genProcess.running
+        || revokeProcess.running || lockdownProcess.running
   }
 
   function go(which) {
@@ -153,7 +181,13 @@ Item {
     manage.errorText = ""
     manage.noteText = ""
     manage.revokeArmed = ""
+    manage.revokeClientArmed = ""
+    manage.lockdownArmed = false
+    manage.grantCursor = -1
     manage.exportArmed = false
+    // Stale approvals are worse than none: this panel is read to decide
+    // whether to withdraw something, so it re-reads every time it is opened.
+    if (which === "access") manage.loadAccess()
   }
 
   // Index of the section on screen, so the rail can number itself and the
@@ -185,8 +219,183 @@ Item {
         break
       case "export":     manage.runExport(); break
       case "generate":   manage.generate(); break
+      case "access":     manage.loadAccess(); break
       // Settings apply as they are edited; there is nothing to commit.
       case "settings":   break
+    }
+  }
+
+  // ── access ─────────────────────────────────────────────────────────────────
+
+  /// Re-read the whole picture: what is approved, what happened, and whether
+  /// the record of it still hangs together.
+  function moveGrant(delta) {
+    var n = manage.grants.length
+    if (n === 0) { manage.grantCursor = -1; return }
+    manage.revokeClientArmed = ""
+    manage.grantCursor = manage.grantCursor < 0
+      ? (delta > 0 ? 0 : n - 1)
+      : (manage.grantCursor + delta + n) % n
+  }
+
+  /// Revoke whatever the cursor is on, two-step like the pointer path.
+  function revokePicked() {
+    if (manage.grantCursor < 0 || manage.grantCursor >= manage.grants.length) return
+    manage.revokeClient(String(manage.grants[manage.grantCursor].client))
+  }
+
+  function loadAccess() {
+    if (approvalsProcess.running || auditProcess.running || chainProcess.running) return
+    manage.errorText = ""
+    approvalsProcess.running = true
+    auditProcess.running = true
+    chainProcess.running = true
+  }
+
+  /// The record's title if the deck knows it, and the id otherwise. Never a
+  /// silent blank: a grant whose subject cannot be named still has to be
+  /// revocable.
+  function nameOf(itemId) {
+    for (var i = 0; i < manage.records.length; i++) {
+      var r = manage.records[i]
+      if (String(r.id) === String(itemId))
+        return String(r.title && String(r.title).length > 0 ? r.title : itemId)
+    }
+    return String(itemId)
+  }
+
+  function revokeClient(client) {
+    if (manage.busy) return
+    if (manage.revokeClientArmed !== client) {
+      manage.revokeClientArmed = client
+      manage.errorText = ""
+      manage.noteText = ""
+      return
+    }
+    manage.revokeClientArmed = ""
+    manage.busy = true
+    revokeProcess.command = ["black-bag", "agent", "revoke", client]
+    revokeProcess.running = true
+  }
+
+  function toggleLockdown() {
+    if (manage.busy) return
+    // Turning it ON is immediate — denying everything is never the dangerous
+    // direction. Turning it OFF is the one that widens access, so that is the
+    // one that asks twice.
+    if (manage.lockdown && !manage.lockdownArmed) {
+      manage.lockdownArmed = true
+      manage.errorText = ""
+      manage.noteText = ""
+      return
+    }
+    manage.lockdownArmed = false
+    manage.busy = true
+    lockdownProcess.command = manage.lockdown
+      ? ["black-bag", "agent", "lockdown", "--off"]
+      : ["black-bag", "agent", "lockdown"]
+    lockdownProcess.running = true
+  }
+
+  Process {
+    id: approvalsProcess
+    running: false
+    command: ["black-bag", "agent", "approvals"]
+    stderr: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(String(this.text || "{}"))
+          manage.grants = parsed.granted || []
+          manage.lockdown = parsed.lockdown === true
+          // A cursor pointing past the end of a freshly loaded list would
+          // revoke nothing, or the wrong thing.
+          if (manage.grantCursor >= manage.grants.length)
+            manage.grantCursor = manage.grants.length - 1
+        } catch (e) {
+          manage.grants = []
+        }
+      }
+    }
+    onExited: function (code) {
+      if (code !== 0) {
+        manage.grants = []
+        var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+        // A locked vault has no approvals to report, and saying so is not an
+        // error worth colouring red.
+        manage.errorText = err.indexOf("locked") >= 0 ? "" : err
+      }
+    }
+  }
+
+  Process {
+    id: auditProcess
+    running: false
+    command: ["black-bag", "audit", "--tail", "14", "--json"]
+    stderr: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var rows = []
+        var lines = String(this.text || "").split("\n")
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i].trim()
+          if (line.length === 0) continue
+          try { rows.push(JSON.parse(line)) } catch (e) { /* skip a torn line */ }
+        }
+        manage.history = rows.reverse()   // newest first, which is what is read
+      }
+    }
+  }
+
+  Process {
+    id: chainProcess
+    running: false
+    command: ["black-bag", "audit", "--verify"]
+    stderr: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: manage.chainVerdict = String(this.text || "").trim()
+    }
+    onExited: function (code) {
+      manage.chainOk = code === 0
+      if (code !== 0) {
+        var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+        // The failure IS the finding here, so it is shown in the panel rather
+        // than as a transient error line.
+        manage.chainVerdict = err.length > 0 ? err : "the record does not hold"
+      }
+    }
+  }
+
+  Process {
+    id: revokeProcess
+    running: false
+    stderr: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: function (code) {
+      manage.busy = false
+      var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+      if (code !== 0) { manage.errorText = err.length > 0 ? err : "revoke failed"; return }
+      manage.noteText = String(this.stdout.text || "withdrawn").trim()
+      manage.loadAccess()
+    }
+  }
+
+  Process {
+    id: lockdownProcess
+    running: false
+    stderr: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: function (code) {
+      manage.busy = false
+      var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+      if (code !== 0) { manage.errorText = err.length > 0 ? err : "lockdown failed"; return }
+      // The engine's own sentence, which is careful about what lifting it does
+      // and does not restore. Repeated rather than paraphrased.
+      manage.noteText = String(this.stdout.text || "").trim()
+      manage.loadAccess()
     }
   }
 
@@ -502,7 +711,11 @@ Item {
     enabled: manage.open_
     context: Qt.WindowShortcut
     onActivated: {
+      // Every armed act backs out before the sheet does, so Esc is always
+      // "undo the dangerous thing I just armed" first and "close" second.
       if (manage.revokeArmed.length > 0) { manage.revokeArmed = ""; return }
+      if (manage.revokeClientArmed.length > 0) { manage.revokeClientArmed = ""; return }
+      if (manage.lockdownArmed) { manage.lockdownArmed = false; return }
       if (manage.exportArmed) { manage.exportArmed = false; return }
       manage.dismiss()
     }
@@ -538,6 +751,37 @@ Item {
     enabled: manage.open_
     context: Qt.WindowShortcut
     onActivated: manage.step(-1)
+  }
+
+  // ACCESS is driven from the keyboard like the rest of the deck. Plain keys
+  // are safe here and nowhere else in this sheet: it is the one section with
+  // no text fields, so nothing has a caret for a bare keystroke to belong to.
+  Shortcut {
+    sequences: ["Down"]
+    enabled: manage.open_ && manage.section === "access" && !manage.busy
+    context: Qt.WindowShortcut
+    onActivated: manage.moveGrant(1)
+  }
+  Shortcut {
+    sequences: ["Up"]
+    enabled: manage.open_ && manage.section === "access" && !manage.busy
+    context: Qt.WindowShortcut
+    onActivated: manage.moveGrant(-1)
+  }
+  Shortcut {
+    sequences: ["Del", "Backspace"]
+    enabled: manage.open_ && manage.section === "access" && !manage.busy
+             && manage.grantCursor >= 0
+    context: Qt.WindowShortcut
+    onActivated: manage.revokePicked()
+  }
+  // The switch you want when something is wrong, on a key you can find
+  // without looking for a button.
+  Shortcut {
+    sequences: ["Ctrl+D"]
+    enabled: manage.open_ && manage.section === "access" && !manage.busy
+    context: Qt.WindowShortcut
+    onActivated: manage.toggleLockdown()
   }
 
   // Ctrl+Return runs the section's primary verb, the way it already does in
@@ -1100,6 +1344,280 @@ Item {
             }
           }
 
+          // ── ACCESS ────────────────────────────────────────────────────────
+          ColumnLayout {
+            Layout.fillWidth: true
+            spacing: metric.space(10)
+            visible: manage.section === "access"
+
+            Blurb {
+              text: "Every program that asks this vault for a secret is asked about once, "
+                  + "per record and per use, and the answer costs your passphrase. What was "
+                  + "answered YES is listed here until the vault locks. Withdraw any of it."
+            }
+
+            // Lockdown first: it is the switch you want when something is
+            // wrong, and hunting for it at that moment is the wrong time.
+            Rectangle {
+              Layout.fillWidth: true
+              implicitHeight: lockRow.implicitHeight + metric.space(20)
+              radius: metric.cornerRadius
+              color: manage.lockdown ? Util.alpha(Color.urgent, 0.10)
+                                     : Util.alpha(Color.foreground, 0.04)
+              border.width: Math.max(1, metric.spacing.hairline)
+              border.color: manage.lockdown ? Util.alpha(Color.urgent, 0.6)
+                                            : Util.alpha(Color.muted, 0.4)
+              RowLayout {
+                id: lockRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.margins: metric.space(12)
+                spacing: metric.space(10)
+                ColumnLayout {
+                  Layout.fillWidth: true
+                  spacing: 0
+                  Text {
+                    text: manage.lockdown ? "LOCKDOWN IS ON" : "LOCKDOWN IS OFF"
+                    color: manage.lockdown ? Color.urgent : Color.foreground
+                    font.family: metric.font.family
+                    font.pixelSize: metric.font.caption
+                    font.bold: true
+                    textFormat: Text.PlainText
+                    renderType: Text.NativeRendering
+                  }
+                  Text {
+                    Layout.fillWidth: true
+                    text: manage.lockdown
+                      ? "Every program is denied, including ones you approved and ones you trust."
+                      : "Programs may ask, and each first ask needs your passphrase."
+                    color: Util.alpha(Color.foreground, 0.5)
+                    font.family: metric.font.family
+                    font.pixelSize: metric.font.caption
+                    wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                    textFormat: Text.PlainText
+                    renderType: Text.NativeRendering
+                  }
+                }
+                SheetButton {
+                  label: manage.lockdown
+                    ? (manage.lockdownArmed ? "SURE?" : "LIFT IT")
+                    : "DENY EVERYTHING"
+                  tone: manage.lockdown ? Color.accent : Color.urgent
+                  enabledAction: !manage.busy
+                  tappable: !manage.busy
+                  onActivated: manage.toggleLockdown()
+                }
+              }
+            }
+
+            Text {
+              Layout.fillWidth: true
+              visible: manage.lockdownArmed
+              text: "lifting lockdown lets the programs you approved before it read "
+                  + "again · blanket trust stays cleared · do it again to confirm"
+              color: Color.urgent
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
+              wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+              textFormat: Text.PlainText
+              renderType: Text.NativeRendering
+            }
+
+            SectionLabel { text: "APPROVED NOW — " + manage.grants.length }
+
+            Text {
+              Layout.fillWidth: true
+              visible: manage.grants.length === 0
+              text: "Nothing is approved. Either nothing has asked, or the vault is locked — "
+                  + "locking forgets every approval, which is the point of locking."
+              color: Util.alpha(Color.foreground, 0.5)
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
+              wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+              textFormat: Text.PlainText
+              renderType: Text.NativeRendering
+            }
+
+            Repeater {
+              model: manage.grants
+              delegate: Rectangle {
+                required property var modelData
+                required property int index
+                readonly property bool picked: manage.grantCursor === index
+                readonly property bool armed:
+                  manage.revokeClientArmed === String(modelData.client)
+                Layout.fillWidth: true
+                implicitHeight: grantRow.implicitHeight + metric.space(16)
+                radius: metric.cornerRadius
+                color: picked ? Util.alpha(Color.accent, 0.10)
+                              : Util.alpha(Color.foreground, 0.04)
+                border.width: Math.max(1, metric.spacing.hairline) * (picked ? 2 : 1)
+                border.color: armed ? Util.alpha(Color.urgent, 0.6)
+                            : (picked ? Color.accent : Util.alpha(Color.muted, 0.4))
+                RowLayout {
+                  id: grantRow
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.margins: metric.space(12)
+                  spacing: metric.space(10)
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    Text {
+                      text: String(modelData.client)
+                      color: Color.foreground
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
+                      font.bold: true
+                      textFormat: Text.PlainText
+                      renderType: Text.NativeRendering
+                    }
+                    Text {
+                      Layout.fillWidth: true
+                      text: Model.capabilityPhrase(String(modelData.capability))
+                          + " · " + manage.nameOf(modelData.item)
+                      color: Util.alpha(Color.foreground, 0.5)
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
+                      wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                      textFormat: Text.PlainText
+                      renderType: Text.NativeRendering
+                    }
+                  }
+                  SheetButton {
+                    label: parent.parent.armed ? "SURE?" : "REVOKE"
+                    tone: Color.urgent
+                    enabledAction: !manage.busy
+                    tappable: !manage.busy
+                    onActivated: {
+                      // Bring the keyboard with it, so the highlight never
+                      // disagrees with what a press would act on.
+                      manage.grantCursor = parent.parent.index
+                      manage.revokeClient(String(modelData.client))
+                    }
+                  }
+                }
+              }
+            }
+
+            Text {
+              Layout.fillWidth: true
+              visible: manage.revokeClientArmed.length > 0
+              // "press REVOKE again" was wrong the moment the panel grew a
+              // keyboard: the same act is `del`. Name the effect, not the
+              // button.
+              text: "this withdraws EVERYTHING \"" + manage.revokeClientArmed
+                  + "\" is approved for, not just the line you picked · "
+                  + "do it again to confirm · esc backs out"
+              color: Color.urgent
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
+              wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+              textFormat: Text.PlainText
+              renderType: Text.NativeRendering
+            }
+
+            SectionLabel { text: "WHAT HAPPENED" }
+
+            // The chain verdict, stated as what was checked rather than as a
+            // reassuring word. A broken chain is the loudest thing this sheet
+            // can say, so it says it in red and does not soften it.
+            Text {
+              Layout.fillWidth: true
+              text: manage.chainVerdict.length > 0 ? manage.chainVerdict : "not checked yet"
+              color: manage.chainVerdict.length === 0
+                ? Util.alpha(Color.foreground, 0.4)
+                : (manage.chainOk ? Util.alpha(Color.accent, 0.9) : Color.urgent)
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
+              wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+              textFormat: Text.PlainText
+              renderType: Text.NativeRendering
+            }
+
+            Repeater {
+              model: manage.history
+              delegate: RowLayout {
+                required property var modelData
+                Layout.fillWidth: true
+                spacing: metric.space(8)
+                Text {
+                  text: Model.auditStamp(modelData.at)
+                  color: Util.alpha(Color.foreground, 0.4)
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
+                  textFormat: Text.PlainText
+                  renderType: Text.NativeRendering
+                }
+                Text {
+                  Layout.preferredWidth: metric.space(76)
+                  text: String(modelData.decision || "")
+                  color: Model.decisionIsAdverse(String(modelData.decision || ""))
+                    ? Color.urgent : Util.alpha(Color.accent, 0.9)
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
+                  font.bold: true
+                  textFormat: Text.PlainText
+                  renderType: Text.NativeRendering
+                }
+                Text {
+                  Layout.fillWidth: true
+                  text: String((modelData.who && modelData.who.program) || "unidentified")
+                      + " · " + manage.nameOf(modelData.subject)
+                      + (modelData.detail ? " · " + String(modelData.detail) : "")
+                  color: Util.alpha(Color.foreground, 0.6)
+                  font.family: metric.font.family
+                  font.pixelSize: metric.font.caption
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  renderType: Text.NativeRendering
+                }
+              }
+            }
+
+            Text {
+              Layout.fillWidth: true
+              visible: manage.history.length === 0
+              text: "Nothing recorded yet."
+              color: Util.alpha(Color.foreground, 0.5)
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
+              textFormat: Text.PlainText
+              renderType: Text.NativeRendering
+            }
+
+            Blurb {
+              text: "The record is a hash chain on disk, appended to by the agent and read "
+                  + "here from the file rather than asked of the agent — a history you can "
+                  + "only get by asking the thing being audited is not much of a history. "
+                  + "It survives locking, and `black-bag audit --verify` says the same thing "
+                  + "from a terminal."
+              tone: Util.alpha(Color.foreground, 0.5)
+            }
+
+            RowLayout {
+              Layout.fillWidth: true
+              Text {
+                text: "\u2191\u2193 pick  ·  del revoke  ·  ^D lockdown  ·  ^\u23ce refresh"
+                color: Util.alpha(Color.foreground, 0.4)
+                font.family: metric.font.family
+                font.pixelSize: metric.font.caption
+                textFormat: Text.PlainText
+                renderType: Text.NativeRendering
+              }
+              Item { Layout.fillWidth: true }
+              SheetButton {
+                label: "REFRESH"
+                tone: Util.alpha(Color.foreground, 0.7)
+                enabledAction: !manage.busy
+                tappable: !manage.busy
+                onActivated: manage.loadAccess()
+              }
+            }
+          }
+
           // ── SETTINGS ──────────────────────────────────────────────────────
           ColumnLayout {
             Layout.fillWidth: true
@@ -1169,7 +1687,9 @@ Item {
       }
       Item { Layout.fillWidth: manage.errorText.length === 0 && manage.noteText.length === 0 }
       Text {
-        text: "^1-^6 section  ·  ^\u2191\u2193 move"
+        // Derived, not spelled out: a seventh section was added and this line
+        // went on advertising six.
+        text: "^1-^" + manage.sections.length + " section  ·  ^\u2191\u2193 move"
              + (manage.primaryLabel.length > 0
                 ? "  ·  ^\u23ce " + manage.primaryLabel : "")
              + "  ·  esc close"

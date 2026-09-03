@@ -27,6 +27,19 @@ change that quietly widens a claim is a regression even if the code is correct.
 5. **Comments state constraints the code cannot show.** Not what the next line
    does, not why a change was made, not who made it.
 
+## First, once per clone
+
+```sh
+git config core.hooksPath .githooks
+```
+
+That enables the pre-commit secret scan. It is not box-ticking: a crates.io
+token was published in six releases of this project before anyone noticed, and
+it got there as an ordinary-looking line in an ordinary-looking file. The hook
+uses `gitleaks` when it is installed and falls back to a smaller built-in scan
+when it is not, so a machine without `gitleaks` is not a machine without a
+check.
+
 ## Building and testing
 
 ```sh
@@ -34,11 +47,18 @@ cargo build --release
 cargo test --workspace              # must pass
 cargo build --release 2>&1 | grep -c warning   # must be 0
 
-plugin/khephri.blackbag/tests/run.sh           # QML logic assertions (node)
+plugin/khephri.blackbag/tests/run.sh           # QML assertions + structural invariants
+node extension/tests/encoding.test.js          # browser-extension encoding
+python3 desktop/port-from-plugin.py --check    # the two QML hosts agree
 qmllint -I ~/.local/share/omarchy/shell -I /usr/lib/qt6/qml plugin/khephri.blackbag/*.qml
 ```
 
-All four must be clean before a pull request.
+All of them must be clean before a pull request.
+
+`tests/structure.py`, which `run.sh` runs, holds invariants about the QML that
+no type checker can see — each one is there because breaking it caused a real
+failure, and each says which failure in a comment. Add to it when you find the
+next one.
 
 ## Testing the QML surfaces
 

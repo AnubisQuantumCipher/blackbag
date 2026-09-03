@@ -40,7 +40,9 @@ pub const GENESIS: &str = "00000000000000000000000000000000000000000000000000000
 
 /// Which surface an approach came through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+// Kebab, so the JSON name and `as_str` — which is what the human-readable log
+// prints and what the digest is computed over — are one string, not two.
+#[serde(rename_all = "kebab-case")]
 pub enum Surface {
     /// The agent socket: the deck, the CLI, anything speaking the protocol.
     Socket,
@@ -323,6 +325,39 @@ pub fn reject_secret_looking(detail: &str) -> Result<()> {
         bail!("audit detail is too long to be a field name; refusing to write it");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::{Decision, Surface};
+
+    /// Same contract as `policy::Capability`: what the digest is computed over
+    /// and what crosses the wire must be one string. The digest uses
+    /// `as_str`, so a serde name that drifted would make two readers of the
+    /// same log disagree about what it says.
+    #[test]
+    fn every_name_has_exactly_one_spelling() {
+        for s in [
+            Surface::Socket,
+            Surface::Passkey,
+            Surface::SecretService,
+            Surface::SshAgent,
+        ] {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json.trim_matches('"'), s.as_str(), "{s:?} is spelled two ways");
+        }
+        for d in [
+            Decision::Approved,
+            Decision::Refused,
+            Decision::Remembered,
+            Decision::Blocked,
+            Decision::Lapsed,
+            Decision::Revoked,
+        ] {
+            let json = serde_json::to_string(&d).unwrap();
+            assert_eq!(json.trim_matches('"'), d.as_str(), "{d:?} is spelled two ways");
+        }
+    }
 }
 
 #[cfg(test)]
