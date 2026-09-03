@@ -5,6 +5,39 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — the vault as the freedesktop Secret Service
+
+- **`black-bag secretservice serve`** is a full `org.freedesktop.secrets` D-Bus
+  provider (Service, Collection, Item, Session interfaces), so applications
+  using libsecret — browsers, mail clients, `secret-tool` — store and fetch
+  their secrets in the vault. Verified against real `secret-tool`: `store`,
+  `search`, and a lookup all work end to end, the lookup returning the exact
+  secret after a GUI approval.
+- **Both session encryptions:** `plain` and
+  `dh-ietf1024-sha256-aes128-cbc-pkcs7`. The DH exchange (1024-bit MODP group,
+  HKDF-SHA256, AES-128-CBC) is in `blackbag_core::secretservice::session`, with
+  a full two-party round-trip test and an HKDF vector; the over-the-bus
+  negotiation was confirmed with `busctl` (a 128-byte service key comes back).
+- **Consent-gated reads, through the deck.** Reading an item raises the deck's
+  approval sheet ("an app wants a stored secret") and costs the master
+  passphrase, remembered until the vault locks — the `Reveal` model, keyed under
+  one fixed `secret-service` identity so the deck's grant and the D-Bus daemon's
+  read meet. Storing needs no approval: it is the application's own secret.
+- **`black-bag secretservice doctor`** reports whether Black-Bag can own the bus
+  name and, when something else (gnome-keyring) holds it, the exact steps to
+  hand it over. `packaging/org.freedesktop.secrets.service` is the D-Bus
+  activation file for going live.
+
+### Security — a door for apps' own secrets, not for your passwords
+
+- The Secret Service exposes and mutates **only items it created** (vault records
+  it tags). Your logins, TOTP seeds, SSH keys and passkeys are never reachable
+  or overwritable through it — an application asking for `service=myapp` cannot
+  read or clobber your bank password.
+- Only one process may own `org.freedesktop.secrets`; Black-Bag never wrests it
+  from a running gnome-keyring. Every test above ran on a private, isolated
+  D-Bus — the live session bus and its keyring were left untouched.
+
 ### Added — an SSH agent backed by the vault
 
 - **`black-bag ssh serve`** binds `$SSH_AUTH_SOCK` and serves the vault's SSH

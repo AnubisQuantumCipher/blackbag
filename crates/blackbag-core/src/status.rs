@@ -251,6 +251,8 @@ pub struct SessionView {
     /// comment, no key material.
     #[serde(default)]
     pub pending_ssh: Vec<crate::session::SshPendingView>,
+    #[serde(default)]
+    pub pending_secret: Vec<crate::session::SecretPendingView>,
 }
 
 

@@ -35,6 +35,8 @@ ciborium.workspace = true
 ml-kem.workspace = true
 serde_bytes.workspace = true
 wl-clipboard-rs = "0.9"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 
 [dev-dependencies]
 tempfile.workspace = true

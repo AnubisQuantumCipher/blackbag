@@ -379,6 +379,31 @@ Item {
     }
   }
 
+  /// Put a Secret Service read approval on screen when one is waiting — the
+  /// same shape as the SSH prompt, for the same reason: a background daemon
+  /// (the D-Bus service) cannot prompt, so the vault publishes the pending item
+  /// and the deck raises its approval sheet.
+  function syncSecretApproval(parsed) {
+    if (root.pendingApproval !== null || consentSheet.open_) return
+    var pending = parsed && parsed.session && parsed.session.pending_secret
+      ? parsed.session.pending_secret : []
+    if (root.secretDismissed.length > 0) {
+      var live = pending.map(function (p) { return String(p.id) })
+      root.secretDismissed = root.secretDismissed.filter(function (id) {
+        return live.indexOf(id) >= 0
+      })
+    }
+    if (pending.length === 0) return
+    if (!(parsed.session && parsed.session.unlocked)) return
+    for (var i = 0; i < pending.length; i++) {
+      var id = String(pending[i].id)
+      if (root.secretDismissed.indexOf(id) < 0) {
+        root.askSecretApproval(id, String(pending[i].label || ""))
+        return
+      }
+    }
+  }
+
   function applyStatus(raw) {
     try {
       var parsed = JSON.parse(String(raw || ""))
@@ -394,6 +419,7 @@ Item {
       root.lastSessionUnlocked = nowUnlocked
       root.syncConsent(parsed)
       root.syncSshApproval(parsed)
+      root.syncSecretApproval(parsed)
       if (nowUnlocked && !wasUnlocked) {
         // Only when the deck is actually on screen. An unlock from the CLI
         // used to fill this overlay's record list while it was hidden, and
@@ -518,6 +544,9 @@ Item {
   /// key leaves the pending list — the daemon clears it on timeout — so a fresh
   /// request later raises the prompt again rather than being suppressed for good.
   property var sshDismissed: []
+  /// Secret Service item ids the user dismissed without approving, kept only
+  /// until the item leaves the pending list.
+  property var secretDismissed: []
   property string approvalPassphrase: ""
   property string approvalError: ""
 
@@ -561,11 +590,29 @@ Item {
 
   /// Take the sheet down because the user backed out. For an SSH prompt this
   /// also remembers the dismissal so it does not spring straight back.
+  /// The Secret Service variant of askApproval: an application wants to read a
+  /// stored secret. The item is a vault record id; the field is fixed.
+  function askSecretApproval(id, label) {
+    root.pendingApproval = {
+      kind: "secret-service", id: id, field: "secret-service",
+      title: label.length > 0 ? label : id,
+      itemId: id
+    }
+    root.approvalPassphrase = ""
+    root.approvalError = ""
+    Qt.callLater(function () { approvalField.forceActiveFocus() })
+  }
+
   function cancelApproval() {
     if (root.pendingApproval && root.pendingApproval.kind === "ssh") {
       var fp = String(root.pendingApproval.fingerprint)
       if (root.sshDismissed.indexOf(fp) < 0)
         root.sshDismissed = root.sshDismissed.concat([fp])
+    }
+    if (root.pendingApproval && root.pendingApproval.kind === "secret-service") {
+      var sid = String(root.pendingApproval.itemId)
+      if (root.secretDismissed.indexOf(sid) < 0)
+        root.secretDismissed = root.secretDismissed.concat([sid])
     }
     root.clearApproval()
   }
@@ -593,6 +640,8 @@ Item {
     } else if (p.kind === "ssh") {
       // The item IS the fingerprint; the CLI reads the passphrase on stdin.
       approveProcess.command = ["black-bag", "ssh", "approve", p.fingerprint]
+    } else if (p.kind === "secret-service") {
+      approveProcess.command = ["black-bag", "secretservice", "approve", p.itemId]
     } else {
       approveProcess.command = ["black-bag", "agent", "show", p.id, p.field, "--approve"]
     }
@@ -3226,7 +3275,9 @@ Item {
 
         Text {
           text: root.pendingApproval && root.pendingApproval.kind === "ssh"
-            ? "APPROVE AN SSH SIGNATURE" : "APPROVE THIS READ"
+            ? "APPROVE AN SSH SIGNATURE"
+            : (root.pendingApproval && root.pendingApproval.kind === "secret-service"
+               ? "AN APP WANTS A STORED SECRET" : "APPROVE THIS READ")
           color: Util.alpha(Color.foreground, 0.5)
           font.family: metric.font.family
           font.pixelSize: metric.font.caption
@@ -3254,6 +3305,8 @@ Item {
                 if (!root.pendingApproval) return ""
                 if (root.pendingApproval.kind === "ssh")
                   return "sign with " + String(root.pendingApproval.title)
+                if (root.pendingApproval.kind === "secret-service")
+                  return "read " + String(root.pendingApproval.title)
                 if (String(root.pendingApproval.field) === "totp")
                   return "the current code for " + String(root.pendingApproval.title)
                 return String(root.pendingApproval.field) + " of "
@@ -3280,6 +3333,8 @@ Item {
                 if (root.pendingApproval.kind === "ssh")
                   return root.pendingApproval.fingerprint
                      + " · a program asked ssh to authenticate somewhere"
+                if (root.pendingApproval.kind === "secret-service")
+                  return "an application stored this in the vault and is asking to read it back"
                 return "on screen, for " + root.revealSeconds + "s"
               }
               color: Util.alpha(Color.foreground, 0.55)
@@ -3298,6 +3353,10 @@ Item {
             + "Check the fingerprint above against the key you meant to use — it "
             + "is what a server records. SSH itself decides which host you reach; "
             + "Black-Bag only proves the key is yours."
+            : root.pendingApproval && root.pendingApproval.kind === "secret-service"
+            ? "An application is reading a secret it stored in the vault through the "
+            + "Secret Service. Approving is remembered until the vault locks. Only "
+            + "items stored this way are reachable here — never your logins or passkeys."
             : "The vault is already open. This is asked once per program, "
             + "field and use — reading it and putting it on the clipboard are "
             + "different questions — and remembered until the vault locks, "

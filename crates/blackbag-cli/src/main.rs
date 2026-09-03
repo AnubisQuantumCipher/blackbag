@@ -3,6 +3,7 @@
 mod passkey_host;
 mod uhid;
 mod ssh_agent;
+mod secretservice;
 mod clipboard;
 mod import;
 mod tty;
@@ -67,6 +68,10 @@ enum Command {
     /// The SSH keys in this vault, and the agent that serves them.
     #[command(subcommand)]
     Ssh(SshCommand),
+    /// The freedesktop Secret Service (org.freedesktop.secrets), backed by the
+    /// vault. Applications using libsecret store and fetch secrets here.
+    #[command(subcommand)]
+    Secretservice(SecretServiceCommand),
     /// Present this vault as a virtual FIDO2 security key.
     ///
     /// Every browser and every application already knows how to talk to a
@@ -447,6 +452,20 @@ struct AuditArgs {
 }
 
 #[derive(Subcommand)]
+enum SecretServiceCommand {
+    /// Run the service: take org.freedesktop.secrets and serve the vault's items.
+    Serve,
+    /// Say whether this machine can host the Secret Service, and what is in the
+    /// way — with the exact steps to hand it over from gnome-keyring.
+    Doctor,
+    /// Approve reading one item (passphrase on stdin). What the deck runs.
+    Approve {
+        /// The item id, as shown in the prompt.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum SshCommand {
     /// Mint a new Ed25519 SSH key in the vault and print its public line.
     Generate {
@@ -627,6 +646,9 @@ fn run(hardening: harden::HardenReport) -> Result<()> {
         Command::Ssh(SshCommand::List) => ssh_agent::list(),
         Command::Ssh(SshCommand::Serve { bind }) => ssh_agent::serve(bind),
         Command::Ssh(SshCommand::Approve { fingerprint }) => ssh_agent::approve(&fingerprint),
+        Command::Secretservice(SecretServiceCommand::Serve) => secretservice::serve(),
+        Command::Secretservice(SecretServiceCommand::Doctor) => secretservice::doctor(),
+        Command::Secretservice(SecretServiceCommand::Approve { id }) => secretservice::approve(&id),
         Command::Doctor(args) => cmd_doctor(&path, args, hardening),
         Command::Status(args) => cmd_status(&path, args, hardening),
         Command::Gen(cmd) => cmd_gen(cmd),
@@ -1988,6 +2010,7 @@ fn agent_session_view() -> SessionView {
             sleep_watch: status.sleep_watch,
             pending_passkeys: status.pending_passkeys,
             pending_ssh: status.pending_ssh,
+            pending_secret: status.pending_secret,
         },
         _ => SessionView::default(),
     }

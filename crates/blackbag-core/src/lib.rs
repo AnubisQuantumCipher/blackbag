@@ -19,6 +19,7 @@ pub mod passkey;
 pub mod policy;
 pub mod record;
 pub mod secmem;
+pub mod secretservice;
 pub mod session;
 pub mod sleepwatch;
 pub mod ssh;

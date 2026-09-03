@@ -32,6 +32,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::record::{Kind, Record, Secret, TotpAlgorithm, TotpConfig};
 use crate::status::{self, HostPosture, SessionView, Status};
 use crate::vault::{UnlockMethod, Vault};
+use crate::secretservice::{SECRET_SERVICE_CLIENT, SECRET_SERVICE_FIELD, SECRET_SERVICE_TAG};
 
 /// Default idle timeout. Long enough to work, short enough that a walked-away
 /// desk does not stay unlocked.
@@ -319,6 +320,42 @@ pub enum Request {
     /// gives up waiting, so a prompt does not linger on screen for a sign that
     /// `ssh` has already stopped waiting for.
     SshDismiss { fingerprint: String },
+
+    /// The Secret Service items the vault holds — those created THROUGH the
+    /// Secret Service, not your ordinary records. Metadata only: id, label,
+    /// attributes, timestamps. No secret values.
+    SecretList,
+    /// Read one Secret Service item's value. Gated by the per-item
+    /// `SecretService` approval, remembered until lock — the `Reveal` model.
+    SecretGet {
+        id: String,
+        #[serde(default)]
+        passphrase: Option<Zeroizing<String>>,
+    },
+    /// Create or replace a Secret Service item.
+    ///
+    /// Not gated: this is an application storing its OWN secret, which denies
+    /// you nothing and reads nothing back. `id` empty creates; a known id
+    /// replaces the value and attributes of that item.
+    SecretPut {
+        #[serde(default)]
+        id: String,
+        label: String,
+        attributes: Vec<(String, String)>,
+        secret: Zeroizing<String>,
+    },
+    /// Delete a Secret Service item.
+    SecretDelete { id: String },
+    /// Approve reading a Secret Service item, with the passphrase. What the
+    /// deck calls when a person answers the prompt.
+    SecretApprove {
+        id: String,
+        #[serde(default)]
+        passphrase: Zeroizing<String>,
+    },
+    /// Drop a pending Secret Service approval without granting it. The daemon
+    /// calls it when the client has stopped waiting.
+    SecretDismiss { id: String },
     /// Stop the agent.
     Shutdown,
 }
@@ -336,6 +373,8 @@ pub enum Response {
     Secret { value: Zeroizing<String> },
     /// The SSH keys the vault holds.
     SshIdentities { keys: Vec<SshIdentityView> },
+    /// The Secret Service items the vault holds.
+    SecretItems { items: Vec<SecretItemView> },
     /// An SSH signature blob, hex. Not secret — it is what goes on the wire to
     /// the server — but returned only after the key was approved.
     SshSignature { blob: String },
@@ -755,6 +794,8 @@ pub struct AgentStatus {
     pub pending_passkeys: Vec<crate::consent::Summary>,
     #[serde(default)]
     pub pending_ssh: Vec<SshPendingView>,
+    #[serde(default)]
+    pub pending_secret: Vec<SecretPendingView>,
     pub record_count: usize,
     pub counts_by_kind: Vec<(String, usize)>,
     pub rollback_suspected: bool,
@@ -762,9 +803,27 @@ pub struct AgentStatus {
 
 /// A record as the cockpit sees it: everything except the secret bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretItemView {
+    /// The vault record id backing this item.
+    pub id: String,
+    pub label: String,
+    /// The application's lookup attributes, verbatim.
+    pub attributes: Vec<(String, String)>,
+    pub created: i64,
+    pub modified: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SshPendingView {
     pub fingerprint: String,
     pub comment: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SecretPendingView {
+    /// The item id (vault record id).
+    pub id: String,
+    pub label: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -925,6 +984,8 @@ pub struct Agent {
     /// them. Cleared on grant, and emptied whenever the vault locks — a locked
     /// vault holds no pending anything.
     ssh_pending: Vec<SshPendingView>,
+    /// Secret Service reads waiting for a first-use approval.
+    secret_pending: Vec<SecretPendingView>,
 }
 
 struct OpenVault {
@@ -964,6 +1025,7 @@ impl Agent {
             audit_path: None,
             backup_log_path: crate::backup::Log::default_path().ok(),
             ssh_pending: Vec::new(),
+            secret_pending: Vec::new(),
         }
     }
 
@@ -1136,6 +1198,7 @@ impl Agent {
         // A pending SSH approval is a question about the session that is
         // ending; it must not survive to be answered after a lock.
         self.ssh_pending.clear();
+        self.secret_pending.clear();
         if self.open.take().is_some() {
             self.last_lock_reason = Some(reason);
         }
@@ -1159,6 +1222,19 @@ impl Agent {
 
     fn clear_ssh_pending(&mut self, fingerprint: &str) {
         self.ssh_pending.retain(|p| p.fingerprint != fingerprint);
+    }
+
+    fn note_secret_pending(&mut self, id: &str, label: &str) {
+        if !self.secret_pending.iter().any(|p| p.id == id) {
+            self.secret_pending.push(SecretPendingView {
+                id: id.to_string(),
+                label: label.to_string(),
+            });
+        }
+    }
+
+    fn clear_secret_pending(&mut self, id: &str) {
+        self.secret_pending.retain(|p| p.id != id);
     }
 
     /// Apply any host event the watcher delivered since the last pass.
@@ -2049,6 +2125,210 @@ impl Agent {
                 Ok(Response::Ok)
             }
 
+            Request::SecretList => {
+                let open = self.opened()?;
+                let items = open
+                    .vault
+                    .records()
+                    .iter()
+                    .filter(|r| r.tags.iter().any(|t| t == SECRET_SERVICE_TAG))
+                    .map(|r| SecretItemView {
+                        id: r.id.to_string(),
+                        label: r.title.clone().unwrap_or_default(),
+                        attributes: r.attributes.clone(),
+                        created: r.created_at.timestamp(),
+                        modified: r.updated_at.timestamp(),
+                    })
+                    .collect();
+                Ok(Response::SecretItems { items })
+            }
+
+            Request::SecretGet { id, passphrase } => {
+                use crate::policy::{Capability, ClientKey, Verdict};
+
+                let uuid: Uuid = id.parse().context("invalid item id")?;
+                // Must be one of OUR items, not an arbitrary vault record: the
+                // Secret Service never serves your ordinary logins.
+                let is_item = self
+                    .opened()?
+                    .vault
+                    .get(uuid)
+                    .is_some_and(|r| r.tags.iter().any(|t| t == SECRET_SERVICE_TAG));
+                if !is_item {
+                    bail!("no Secret Service item with that id");
+                }
+
+                // Same fixed identity the deck grants under — see SecretApprove.
+                let client = ClientKey::of(Some(SECRET_SERVICE_CLIENT));
+                let program = self.peer.and_then(|p| PeerId::program(p.pid));
+                let detail = "secret-service";
+                match self.approvals.consider(&client, &id, Capability::SecretService) {
+                    Verdict::Remembered => {}
+                    Verdict::Blocked(why) => {
+                        self.record_audit(
+                            crate::audit::Surface::SecretService,
+                            crate::audit::Decision::Blocked,
+                            &id,
+                            Some(detail),
+                        );
+                        bail!("{why}");
+                    }
+                    Verdict::MustAsk => match &passphrase {
+                        Some(p)
+                            if !p.is_empty()
+                                && self.opened()?.vault.passphrase_matches(p.as_bytes()) =>
+                        {
+                            self.approvals.grant(&client, &id, Capability::SecretService);
+                            self.record_audit(
+                                crate::audit::Surface::SecretService,
+                                crate::audit::Decision::Approved,
+                                &id,
+                                Some(detail),
+                            );
+                        }
+                        Some(_) => {
+                            self.record_audit(
+                                crate::audit::Surface::SecretService,
+                                crate::audit::Decision::Refused,
+                                &id,
+                                Some(detail),
+                            );
+                            bail!("that is not the vault passphrase");
+                        }
+                        None => {
+                            let title =
+                                self.opened()?.vault.get(uuid).and_then(|r| r.title.clone());
+                            self.note_secret_pending(&id, title.as_deref().unwrap_or(""));
+                            self.publish()?;
+                            return Ok(Response::ApprovalRequired {
+                                item: id,
+                                title,
+                                field: "secret-service".into(),
+                                client: program,
+                            });
+                        }
+                    },
+                }
+
+                let open = self.opened()?;
+                let record = open.vault.get(uuid).ok_or_else(|| anyhow!("item gone"))?;
+                let secret = record
+                    .field(SECRET_SERVICE_FIELD)
+                    .ok_or_else(|| anyhow!("that item has no stored value"))?;
+                let value = secret.expose_str()?;
+                self.record_audit(
+                    crate::audit::Surface::SecretService,
+                    crate::audit::Decision::Remembered,
+                    &id,
+                    Some(detail),
+                );
+                Ok(Response::Secret { value })
+            }
+
+            Request::SecretPut {
+                id,
+                label,
+                attributes,
+                secret,
+            } => {
+                let _guard = crate::vault::open_lock(&self.vault_path)?;
+                let open = self.opened()?;
+                let saved_id = if id.is_empty() {
+                    // A fresh item. Kind::Api is the closest existing kind for
+                    // "an application's stored secret".
+                    let mut record =
+                        crate::record::Record::new(crate::record::Kind::Api, Some(label));
+                    record.tags.push(SECRET_SERVICE_TAG.to_string());
+                    record.attributes = attributes;
+                    record.set_field(
+                        SECRET_SERVICE_FIELD,
+                        crate::record::Secret::new(secret.as_bytes()),
+                    );
+                    let new_id = record.id;
+                    open.vault.add_record(record)?;
+                    new_id
+                } else {
+                    let uuid: Uuid = id.parse().context("invalid item id")?;
+                    let record = open
+                        .vault
+                        .get_mut(uuid)
+                        .filter(|r| r.tags.iter().any(|t| t == SECRET_SERVICE_TAG))
+                        .ok_or_else(|| anyhow!("no Secret Service item with that id"))?;
+                    record.title = Some(label);
+                    record.attributes = attributes;
+                    record.set_field(
+                        SECRET_SERVICE_FIELD,
+                        crate::record::Secret::new(secret.as_bytes()),
+                    );
+                    uuid
+                };
+                open.vault.save()?;
+                self.publish()?;
+                Ok(Response::Saved {
+                    id: saved_id.to_string(),
+                })
+            }
+
+            Request::SecretDelete { id } => {
+                let uuid: Uuid = id.parse().context("invalid item id")?;
+                let _guard = crate::vault::open_lock(&self.vault_path)?;
+                let open = self.opened()?;
+                let is_item = open
+                    .vault
+                    .get(uuid)
+                    .is_some_and(|r| r.tags.iter().any(|t| t == SECRET_SERVICE_TAG));
+                if !is_item {
+                    bail!("no Secret Service item with that id");
+                }
+                open.vault.remove_record(uuid)?;
+                open.vault.save()?;
+                self.publish()?;
+                Ok(Response::Ok)
+            }
+
+            Request::SecretApprove { id, passphrase } => {
+                use crate::policy::{Capability, ClientKey};
+                let uuid: Uuid = id.parse().context("invalid item id")?;
+                let is_item = self
+                    .opened()?
+                    .vault
+                    .get(uuid)
+                    .is_some_and(|r| r.tags.iter().any(|t| t == SECRET_SERVICE_TAG));
+                if !is_item {
+                    bail!("no Secret Service item with that id");
+                }
+                if passphrase.is_empty()
+                    || !self.opened()?.vault.passphrase_matches(passphrase.as_bytes())
+                {
+                    self.record_audit(
+                        crate::audit::Surface::SecretService,
+                        crate::audit::Decision::Refused,
+                        &id,
+                        Some("secret-service"),
+                    );
+                    bail!("that is not the vault passphrase");
+                }
+                // One fixed client identity, like the SSH agent: the deck
+                // approves and the D-Bus daemon reads — two processes, one grant.
+                let client = ClientKey::of(Some(SECRET_SERVICE_CLIENT));
+                self.approvals.grant(&client, &id, Capability::SecretService);
+                self.clear_secret_pending(&id);
+                self.record_audit(
+                    crate::audit::Surface::SecretService,
+                    crate::audit::Decision::Approved,
+                    &id,
+                    Some("secret-service"),
+                );
+                self.publish()?;
+                Ok(Response::Ok)
+            }
+
+            Request::SecretDismiss { id } => {
+                self.clear_secret_pending(&id);
+                self.publish()?;
+                Ok(Response::Ok)
+            }
+
             Request::PasskeyCollect { nonce } => {
                 use crate::consent::{Operation, State};
 
@@ -2335,6 +2615,7 @@ impl Agent {
                     sleep_watch,
                     pending_passkeys: self.consent.summaries(Utc::now()),
                     pending_ssh: self.ssh_pending.clone(),
+                    pending_secret: self.secret_pending.clone(),
                     record_count: open.vault.records().len(),
                     counts_by_kind: open
                         .vault
@@ -2357,6 +2638,7 @@ impl Agent {
                 // A locked agent holds no ceremonies: lock() clears the desk.
                 pending_passkeys: Vec::new(),
                 pending_ssh: Vec::new(),
+                pending_secret: Vec::new(),
                 record_count: 0,
                 counts_by_kind: Vec::new(),
                 rollback_suspected: false,
@@ -2379,6 +2661,7 @@ impl Agent {
             sleep_watch: snapshot.sleep_watch.clone(),
             pending_passkeys: snapshot.pending_passkeys.clone(),
             pending_ssh: snapshot.pending_ssh.clone(),
+            pending_secret: snapshot.pending_secret.clone(),
         };
         let status = Status::probe(
             &self.vault_path,
@@ -2839,6 +3122,7 @@ mod tests {
             sleep_watch: None,
             pending_passkeys: Vec::new(),
             pending_ssh: Vec::new(),
+            pending_secret: Vec::new(),
             record_count: 1,
             counts_by_kind: vec![("login".into(), 1)],
             rollback_suspected: false,
@@ -4549,6 +4833,121 @@ mod reveal_policy_tests {
         let vk = VerifyingKey::from_bytes(&pk).unwrap();
         vk.verify(data, &Signature::from_slice(&raw).unwrap())
             .expect("the SSH signature must verify under the listed key");
+    }
+
+    /// The Secret Service verbs, end to end: store an item, list it, read it
+    /// (first read prompts, then is remembered), and delete it.
+    #[test]
+    fn secret_service_items_store_list_read_and_delete() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+
+        // An application stores its own secret. No approval — it denies nothing.
+        let id = match ask_at(
+            &sock,
+            &Request::SecretPut {
+                id: String::new(),
+                label: "Chrome Safe Storage".into(),
+                attributes: vec![("application".into(), "chrome".into())],
+                secret: Zeroizing::new("app-secret-value".into()),
+            },
+        )
+        .unwrap()
+        {
+            Response::Saved { id } => id,
+            other => panic!("{other:?}"),
+        };
+
+        // It lists, with its attributes and label, and no secret value.
+        match ask_at(&sock, &Request::SecretList).unwrap() {
+            Response::SecretItems { items } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].id, id);
+                assert_eq!(items[0].label, "Chrome Safe Storage");
+                assert_eq!(items[0].attributes, vec![("application".to_string(), "chrome".to_string())]);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let get = |pass: Option<&str>| {
+            ask_at(
+                &sock,
+                &Request::SecretGet {
+                    id: id.clone(),
+                    passphrase: pass.map(|p| Zeroizing::new(p.to_string())),
+                },
+            )
+            .unwrap()
+        };
+
+        // Reading DOES prompt on first use.
+        match get(None) {
+            Response::ApprovalRequired { item, .. } => assert_eq!(item, id),
+            other => panic!("a Secret Service read must be approved first: {other:?}"),
+        }
+        // Wrong passphrase approves nothing.
+        assert!(matches!(get(Some("nope")), Response::Error { .. }));
+        // The passphrase approves, and the value comes back.
+        match get(Some(PASS)) {
+            Response::Secret { value } => assert_eq!(&*value, "app-secret-value"),
+            other => panic!("{other:?}"),
+        }
+        // Remembered.
+        assert!(matches!(get(None), Response::Secret { .. }));
+
+        // Replace the value.
+        match ask_at(
+            &sock,
+            &Request::SecretPut {
+                id: id.clone(),
+                label: "Chrome Safe Storage".into(),
+                attributes: vec![("application".into(), "chrome".into())],
+                secret: Zeroizing::new("rotated-value".into()),
+            },
+        )
+        .unwrap()
+        {
+            Response::Saved { id: same } => assert_eq!(same, id),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            ask_at(&sock, &Request::SecretList).unwrap(),
+            Response::SecretItems { items } if items.len() == 1
+        ));
+
+        // Delete it.
+        assert!(matches!(
+            ask_at(&sock, &Request::SecretDelete { id: id.clone() }).unwrap(),
+            Response::Ok
+        ));
+        match ask_at(&sock, &Request::SecretList).unwrap() {
+            Response::SecretItems { items } => assert!(items.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The Secret Service door never opens your ordinary records: only items it
+    /// created carry the tag, and a read of anything else is refused.
+    #[test]
+    fn the_secret_service_never_serves_an_ordinary_login() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let login = add_login(&sock);
+        // The login is not in the item list.
+        match ask_at(&sock, &Request::SecretList).unwrap() {
+            Response::SecretItems { items } => assert!(items.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // And it cannot be read through the Secret Service door.
+        match ask_at(
+            &sock,
+            &Request::SecretGet { id: login, passphrase: Some(Zeroizing::new(PASS.into())) },
+        )
+        .unwrap()
+        {
+            Response::Error { message } => assert!(message.contains("no Secret Service item")),
+            other => panic!("an ordinary login must not be reachable here: {other:?}"),
+        }
     }
 
     /// Locking forgets an SSH approval, exactly as it forgets a Reveal.

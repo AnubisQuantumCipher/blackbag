@@ -188,7 +188,13 @@ CXF, then packaging.
 
 - Socket stays `0600`; `SO_PEERCRED` supplies client identity.
 - **Per-item first-use approval** for `Reveal`, the Secret Service and the SSH
-  agent, remembered until lock or revoke. **SSH agent: done** — `black-bag ssh
+  agent, remembered until lock or revoke. **Secret Service: done** — a full
+  `org.freedesktop.secrets` D-Bus provider (`black-bag secretservice serve`)
+  exposing a single `default` collection of items it created (never your
+  ordinary logins), with `plain` and DH-AES sessions, and reads gated by
+  `Capability::SecretService` through the deck. It cannot own the bus name while
+  gnome-keyring does; `secretservice doctor` reports the conflict and the swap.
+  **SSH agent: done** — `black-bag ssh
   serve` is the daemon, keyed under a fixed `ssh-agent` client identity so the
   deck's approval (a different process) and the daemon's signing meet at one
   grant; the first use of a key raises the deck's approval sheet and costs the

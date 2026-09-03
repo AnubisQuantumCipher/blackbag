@@ -238,6 +238,9 @@ black-bag ssh generate --comment me@host   # mint an Ed25519 SSH key in the vaul
 black-bag ssh list                   # the public keys, as authorized_keys lines
 black-bag ssh serve                  # run the SSH agent; export the SSH_AUTH_SOCK it prints
 
+black-bag secretservice doctor       # can Black-Bag host org.freedesktop.secrets here?
+black-bag secretservice serve        # be the Secret Service; apps store/fetch via libsecret
+
 black-bag agent breach --online      # k-anonymity check against Pwned Passwords
 black-bag import --from bitwarden.json --format bitwarden --dry-run
 black-bag export --to out.csv --format keepassxc --plaintext-ok
