@@ -157,6 +157,13 @@ pub struct Ceremony {
     /// would have received it. This is blast-radius reduction and not a
     /// boundary: anything that can reach the socket can also spawn a process.
     pub owner: Option<String>,
+    /// The program that asked, for the person answering to read.
+    ///
+    /// A hostile process can name itself anything and may be unreadable
+    /// entirely, so this is not a control — it is context. Its value is that a
+    /// prompt substituted by something else no longer looks identical to the
+    /// one the browser raised.
+    pub requester: Option<String>,
     pub registered_at: DateTime<Utc>,
     /// Failed proofs so far. A ceremony is refused outright after
     /// [`MAX_PROOF_ATTEMPTS`], so this is not an oracle to guess against.
@@ -199,6 +206,7 @@ impl Ceremony {
                 .user_name
                 .clone()
                 .or_else(|| self.choices.first().map(|c| c.label.clone())),
+            requester: self.requester.clone(),
             choices: self.choices.clone(),
             want_prf: self.want_prf,
             expires_at: self.expires_at(),
@@ -220,6 +228,10 @@ pub struct Summary {
     pub rp_id: String,
     pub rp_name: Option<String>,
     pub account: Option<String>,
+    /// What asked. `None` means the agent could not tell, which is itself
+    /// worth showing rather than hiding.
+    #[serde(default)]
+    pub requester: Option<String>,
     pub choices: Vec<Choice>,
     /// Whether the relying party also asked for a PRF value.
     ///
@@ -484,6 +496,7 @@ mod tests {
             prf_first_salt: None,
             prf_second_salt: None,
             owner: None,
+            requester: Some("brave".into()),
             registered_at: at(0),
             attempts: 0,
             state: State::AwaitingHuman,

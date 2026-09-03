@@ -49,6 +49,14 @@ pub const DEFAULT_MAX_SESSION_SECS: u64 = 12 * 3600;
 /// Found by opening a socket and waiting.
 pub const PEER_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The largest request this agent will read.
+///
+/// A request is a JSON line. The biggest legitimate one is an import of many
+/// records through `AddMany`, which is why this is generous rather than tight;
+/// what it must not be is unbounded, because a peer that never sends a newline
+/// would otherwise grow this process's memory until something died.
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
 /// Why the vault stopped being open. Surfaced through status so the deck can
 /// say "locked before suspend" instead of a generic "locked".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -923,22 +931,21 @@ impl Agent {
         stream.set_read_timeout(Some(PEER_IO_TIMEOUT))?;
         stream.set_write_timeout(Some(PEER_IO_TIMEOUT))?;
 
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => return Ok(()),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                line.zeroize();
-                bail!("peer sent nothing within {}s; dropped", PEER_IO_TIMEOUT.as_secs());
-            }
-            Err(e) => {
-                line.zeroize();
-                return Err(e.into());
-            }
+        let mut raw = Vec::new();
+        if !read_request_line(&stream, &mut raw)? {
+            raw.zeroize();
+            return Ok(());
         }
+        let mut line = match String::from_utf8(raw) {
+            Ok(line) => line,
+            Err(e) => {
+                // Wipe the bytes on the way out: a malformed request is still a
+                // request, and may carry a passphrase somebody mistyped.
+                let mut bytes = e.into_bytes();
+                bytes.zeroize();
+                bail!("request was not UTF-8");
+            }
+        };
 
         let mut response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => self.dispatch(request),
@@ -1265,6 +1272,7 @@ impl Agent {
                     prf_first_salt: prf_first_salt.as_deref().map(unhex).transpose()?,
                     prf_second_salt: prf_second_salt.as_deref().map(unhex).transpose()?,
                     owner: self.peer.map(|p| format!("{p:?}")),
+                    requester: self.peer.and_then(|p| PeerId::program(p.pid)),
                     registered_at: Utc::now(),
                     attempts: 0,
                     state: State::AwaitingHuman,
@@ -1628,6 +1636,71 @@ fn set_socket_mode(path: &Path) -> Result<()> {
 }
 
 /// uid of the connected peer, via `SO_PEERCRED`.
+/// Read one request line, bounded in both bytes and wall-clock time.
+///
+/// `SO_RCVTIMEO` — which is what `set_read_timeout` sets — bounds a single
+/// `recv`, not a loop of them. `BufReader::read_line` loops, so a peer that
+/// sends one byte every two seconds resets the timeout forever and the call
+/// never returns.
+///
+/// That is not a slow client, it is a lock bypass. This agent is deliberately
+/// single-threaded: it serves one connection to completion and only then
+/// re-checks the idle deadline, the session ceiling and the queue of
+/// suspend/screen-lock signals. A wedged connection therefore holds the data
+/// key in memory across a suspend — exactly the case locking on suspend exists
+/// to prevent.
+///
+/// Returns `false` on a clean end of input before any request arrived.
+fn read_request_line(stream: &UnixStream, out: &mut Vec<u8>) -> Result<bool> {
+    use std::io::Read;
+
+    let deadline = Instant::now() + PEER_IO_TIMEOUT;
+    let mut chunk = [0u8; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            out.zeroize();
+            bail!(
+                "peer did not finish a request within {}s; dropped",
+                PEER_IO_TIMEOUT.as_secs()
+            );
+        }
+        // Re-armed each pass against the REMAINING budget, so the total is
+        // bounded however the peer paces its bytes.
+        stream.set_read_timeout(Some(remaining))?;
+
+        match (&*stream).read(&mut chunk) {
+            Ok(0) => return Ok(!out.is_empty()),
+            Ok(n) => {
+                if out.len() + n > MAX_REQUEST_BYTES {
+                    out.zeroize();
+                    bail!("request exceeds {MAX_REQUEST_BYTES} bytes; dropped");
+                }
+                out.extend_from_slice(&chunk[..n]);
+                chunk.zeroize();
+                if let Some(end) = out.iter().position(|&b| b == b'\n') {
+                    out.truncate(end);
+                    return Ok(true);
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                out.zeroize();
+                bail!(
+                    "peer sent nothing within {}s; dropped",
+                    PEER_IO_TIMEOUT.as_secs()
+                );
+            }
+            Err(e) => {
+                out.zeroize();
+                return Err(e.into());
+            }
+        }
+    }
+}
+
 /// Who a ceremony belongs to.
 ///
 /// A pid alone is not an identity — pids are recycled, and a process that dies
@@ -1641,6 +1714,18 @@ pub struct PeerId {
 }
 
 impl PeerId {
+    /// What to call this peer on screen: the basename of its executable.
+    ///
+    /// Not a security control — a hostile process can be named anything, and
+    /// `/proc/<pid>/exe` may be unreadable. It is there so a person answering a
+    /// prompt can see that the thing asking to sign them in is their browser
+    /// and not something else, which is the difference between a prompt that
+    /// can be substituted for and one that cannot be substituted for silently.
+    fn program(pid: i32) -> Option<String> {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        Some(exe.file_name()?.to_string_lossy().into_owned())
+    }
+
     fn of(pid: i32) -> Option<Self> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // The second field is the executable name in parentheses and may itself
@@ -2814,5 +2899,71 @@ mod client_data_tests {
                 .unwrap();
         assert!(text.contains(r#""crossOrigin":true"#), "{text}");
         assert!(text.contains(r#""type":"webauthn.create""#), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod peer_pinning_tests {
+    use super::tests::spawn_test_agent;
+    use super::*;
+
+    /// A peer that dribbles bytes must not be able to hold the agent open.
+    ///
+    /// `set_read_timeout` bounds one `recv`, not a loop of them, so
+    /// `read_line` used to reset its own deadline forever. This agent serves
+    /// one connection to completion before it re-checks the idle deadline, the
+    /// session ceiling, or the queued suspend and screen-lock signals — so a
+    /// connection held open indefinitely holds the data key in memory across a
+    /// suspend, which is the exact case lock-on-suspend exists to prevent.
+    #[test]
+    fn a_trickling_peer_cannot_pin_the_agent() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+
+        let mut slow = UnixStream::connect(&sock).unwrap();
+        let started = Instant::now();
+        // One byte at a time, slower than the per-recv timeout, of a request
+        // that never ends. The agent must give up on its own.
+        std::thread::spawn(move || {
+            for _ in 0..40 {
+                if slow.write_all(b" ").is_err() {
+                    return;
+                }
+                let _ = slow.flush();
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        // While that is going on, an ordinary client must still be served.
+        std::thread::sleep(PEER_IO_TIMEOUT + Duration::from_millis(1500));
+        let reply = ask_at(&sock, &Request::Status).expect("the agent is still answering");
+        assert!(matches!(reply, Response::Status(_)), "{reply:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the agent was pinned for {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// And a peer that sends a great deal without ever ending the line must be
+    /// refused rather than grown into memory.
+    #[test]
+    fn an_endless_request_is_refused_rather_than_buffered() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        let mut flood = UnixStream::connect(&sock).unwrap();
+
+        // Write hard, with no newline, until the agent drops us.
+        let block = vec![b' '; 64 * 1024];
+        let mut sent = 0usize;
+        while sent < MAX_REQUEST_BYTES + (8 * 1024 * 1024) {
+            if flood.write_all(&block).is_err() {
+                break;
+            }
+            sent += block.len();
+        }
+        drop(flood);
+
+        // The agent survived it and still answers.
+        let reply = ask_at(&sock, &Request::Status).expect("the agent is still answering");
+        assert!(matches!(reply, Response::Status(_)), "{reply:?}");
     }
 }

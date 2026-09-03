@@ -303,6 +303,41 @@ Item {
       }
     }
 
+    // ── what asked ───────────────────────────────────────────────────────────
+    //
+    // Not a security control: a hostile process can call itself anything, and
+    // the agent may not be able to read its name at all. It is here because a
+    // prompt raised by something other than your browser should not look
+    // identical to one your browser raised — anything on this machine can queue
+    // a request, and the origin alone does not distinguish them.
+    RowLayout {
+      Layout.fillWidth: true
+      spacing: metric.space(8)
+      Text {
+        text: "ASKED BY"
+        color: Util.alpha(Color.foreground, 0.45)
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
+        font.letterSpacing: metric.spaceReal(1.2)
+        textFormat: Text.PlainText
+        renderType: Text.NativeRendering
+      }
+      Text {
+        Layout.fillWidth: true
+        text: consent.ceremony && consent.ceremony.requester
+          ? String(consent.ceremony.requester)
+          : "an unidentified program"
+        color: consent.ceremony && consent.ceremony.requester
+          ? Color.foreground : Color.urgent
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
+        font.bold: true
+        elide: Text.ElideRight
+        textFormat: Text.PlainText
+        renderType: Text.NativeRendering
+      }
+    }
+
     // ── who as ───────────────────────────────────────────────────────────────
     ColumnLayout {
       Layout.fillWidth: true
