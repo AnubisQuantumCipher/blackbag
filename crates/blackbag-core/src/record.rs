@@ -265,6 +265,11 @@ pub struct Record {
     /// Secret attributes, page-locked and wiped.
     pub fields: Vec<Field>,
     pub totp: Option<TotpConfig>,
+    /// Set on a `Kind::Passkey` record. Absent on every other kind, and absent
+    /// from every vault written before passkeys existed — hence the serde
+    /// default, without which an older vault fails to parse.
+    #[serde(default)]
+    pub passkey: Option<crate::passkey::PasskeyConfig>,
     pub notes: Option<Secret>,
 }
 
@@ -281,6 +286,7 @@ impl Record {
             attributes: Vec::new(),
             fields: Vec::new(),
             totp: None,
+            passkey: None,
             notes: None,
         }
     }

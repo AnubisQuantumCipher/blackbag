@@ -356,6 +356,23 @@ impl Credential {
     }
 }
 
+/// Rebuild a usable credential from a stored record.
+///
+/// A passkey record is a [`crate::record::Kind::Passkey`] carrying its
+/// [`PasskeyConfig`] and its private key in the [`PRIVATE_KEY_FIELD`] secret
+/// field. Anything else is a record that only looks like one.
+pub fn credential_from_record(record: &crate::record::Record) -> Result<Credential> {
+    let config = record
+        .passkey
+        .as_ref()
+        .ok_or_else(|| anyhow!("record {} carries no passkey configuration", record.id))?
+        .clone();
+    let key = record
+        .field(PRIVATE_KEY_FIELD)
+        .ok_or_else(|| anyhow!("passkey record {} has no private key", record.id))?;
+    Credential::from_stored(config, &key.open())
+}
+
 /// The PRF evaluation a relying party asked for.
 ///
 /// WebAuthn Level 3 §10.1.4 defines the input as
@@ -714,6 +731,39 @@ mod tests {
         assert_ne!(a.public_key_der, b.public_key_der);
         assert_ne!(a.credential.private_key(), b.credential.private_key());
         assert_ne!(seed_a.unwrap().as_ref(), seed_b.unwrap().as_ref());
+    }
+
+    /// A passkey stored as a vault record must come back able to sign, and a
+    /// record that only resembles one must be refused rather than half-loaded.
+    #[test]
+    fn a_record_round_trips_into_a_signing_credential() {
+        use crate::record::{Kind, Record, Secret};
+
+        let (created, _) = a_credential();
+        let mut record = Record::new(Kind::Passkey, Some("Example".into()));
+        record.passkey = Some(created.credential.config.clone());
+        record.set_field(PRIVATE_KEY_FIELD, Secret::new(created.credential.private_key()));
+
+        let loaded = credential_from_record(&record).unwrap();
+        assert_eq!(loaded.config.rp_id, "example.com");
+        let a = loaded.assert("https://example.com", b"{}", true).unwrap();
+
+        let mut signed = a.authenticator_data.clone();
+        signed.extend_from_slice(&Sha256::digest(b"{}"));
+        use p256::pkcs8::DecodePublicKey;
+        p256::ecdsa::VerifyingKey::from_public_key_der(&created.public_key_der)
+            .unwrap()
+            .verify(&signed, &DerSignature::from_bytes(&a.signature).unwrap())
+            .expect("a passkey read back out of a record still signs as itself");
+
+        // No config, or no key, and it must refuse.
+        let mut no_config = record.clone();
+        no_config.passkey = None;
+        assert!(credential_from_record(&no_config).is_err());
+
+        let mut no_key = Record::new(Kind::Passkey, None);
+        no_key.passkey = Some(created.credential.config);
+        assert!(credential_from_record(&no_key).is_err());
     }
 
     #[test]

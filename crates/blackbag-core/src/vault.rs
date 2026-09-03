@@ -571,6 +571,40 @@ impl Vault {
         self.payload.records.iter().find(|r| r.id == id)
     }
 
+    /// Every passkey this vault holds for `rp_id`.
+    ///
+    /// The relying-party id is compared exactly, lowercased. A WebAuthn get
+    /// with an empty `allowCredentials` is a request for *discoverable*
+    /// credentials, and this is what discovers them.
+    pub fn passkeys_for_rp(&self, rp_id: &str) -> Vec<&Record> {
+        let want = rp_id.trim_end_matches('.').to_ascii_lowercase();
+        self.payload
+            .records
+            .iter()
+            .filter(|r| {
+                r.passkey
+                    .as_ref()
+                    .is_some_and(|p| p.rp_id == want)
+            })
+            .collect()
+    }
+
+    /// The passkey with this credential id, if the vault holds it.
+    ///
+    /// Compared in constant time. A credential id is not a secret — the browser
+    /// sends it in the clear — but the comparison sits on a path an attacker
+    /// can drive repeatedly, and a length-and-prefix oracle over stored
+    /// credential ids would leak which relying parties this vault knows.
+    pub fn passkey_by_credential_id(&self, credential_id: &[u8]) -> Option<&Record> {
+        use subtle::ConstantTimeEq;
+        self.payload.records.iter().find(|r| {
+            r.passkey.as_ref().is_some_and(|p| {
+                p.credential_id.len() == credential_id.len()
+                    && bool::from(p.credential_id.ct_eq(credential_id))
+            })
+        })
+    }
+
     pub fn get_mut(&mut self, id: Uuid) -> Option<&mut Record> {
         self.payload.records.iter_mut().find(|r| r.id == id)
     }
@@ -1380,5 +1414,80 @@ mod witness_integrity_tests {
             );
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod passkey_lookup_tests {
+    use super::*;
+    use crate::passkey::{PasskeyConfig, ALG_ES256};
+    use crate::record::{Kind, Record};
+
+    const PASS: &[u8] = b"correct horse battery staple";
+    const MEM: u32 = 32_768;
+
+    /// A real vault on disk, holding `records` — the same path the product
+    /// takes, so the lookups are exercised against real stored state rather
+    /// than a payload assembled in the test.
+    fn vault_holding(records: Vec<Record>) -> (tempfile::TempDir, Vault) {
+        Witness::isolate_for_tests();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vault.cbor");
+        Vault::init(&path, PASS, MEM).unwrap();
+        let mut vault = Vault::unlock(&path, PASS).unwrap();
+        for r in records {
+            vault.add_record(r).unwrap();
+        }
+        vault.save().unwrap();
+        (dir, vault)
+    }
+
+    fn passkey_record(rp: &str, id: &[u8]) -> Record {
+        let mut r = Record::new(Kind::Passkey, Some(rp.into()));
+        r.passkey = Some(PasskeyConfig {
+            credential_id: id.to_vec(),
+            rp_id: rp.into(),
+            rp_name: None,
+            user_handle: b"u".to_vec(),
+            user_name: None,
+            user_display_name: None,
+            algorithm: ALG_ES256,
+            prf: false,
+            backed_up: false,
+        });
+        r
+    }
+
+    /// Discovery is by relying party, and it must not reach across to another.
+    #[test]
+    fn passkeys_are_discovered_only_for_their_own_relying_party() {
+        let (_dir, vault) = vault_holding(vec![
+            passkey_record("example.com", b"aaaa"),
+            passkey_record("example.com", b"bbbb"),
+            passkey_record("bank.example", b"cccc"),
+            // A login record for the same site is not a passkey.
+            Record::new(Kind::Login, Some("example.com".into())),
+        ]);
+
+        assert_eq!(vault.passkeys_for_rp("example.com").len(), 2);
+        assert_eq!(vault.passkeys_for_rp("bank.example").len(), 1);
+        assert_eq!(vault.passkeys_for_rp("evil.example").len(), 0);
+        // Case and a trailing root dot are the same relying party.
+        assert_eq!(vault.passkeys_for_rp("EXAMPLE.com.").len(), 2);
+        // A suffix is NOT a match here: discovery is exact, and the
+        // registrable-suffix rule belongs to the origin check, not to lookup.
+        assert_eq!(vault.passkeys_for_rp("com").len(), 0);
+    }
+
+    #[test]
+    fn a_credential_id_is_found_exactly_or_not_at_all() {
+        let (_dir, vault) = vault_holding(vec![passkey_record("example.com", b"aaaa")]);
+
+        assert!(vault.passkey_by_credential_id(b"aaaa").is_some());
+        assert!(vault.passkey_by_credential_id(b"aaab").is_none());
+        // A prefix must not match, or a caller could walk the id a byte at a time.
+        assert!(vault.passkey_by_credential_id(b"aaa").is_none());
+        assert!(vault.passkey_by_credential_id(b"aaaaa").is_none());
+        assert!(vault.passkey_by_credential_id(b"").is_none());
     }
 }
