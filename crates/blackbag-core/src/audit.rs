@@ -77,6 +77,12 @@ pub enum Decision {
     Blocked,
     /// It expired before anyone answered.
     Lapsed,
+    /// An approval that had been given was withdrawn.
+    ///
+    /// Its own decision rather than reusing `Refused`, which means "somebody
+    /// was denied something they asked for". A log is only worth keeping if it
+    /// can be read back without a glossary.
+    Revoked,
 }
 
 impl Decision {
@@ -87,6 +93,7 @@ impl Decision {
             Decision::Remembered => "remembered",
             Decision::Blocked => "blocked",
             Decision::Lapsed => "lapsed",
+            Decision::Revoked => "revoked",
         }
     }
 }

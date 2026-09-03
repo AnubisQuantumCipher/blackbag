@@ -222,6 +222,16 @@ pub enum Request {
     PasskeyCollect { nonce: String },
     /// What is waiting for a human right now, so the deck can show it.
     PasskeyQueue,
+    /// Everything currently approved.
+    Approvals,
+    /// Withdraw one approval, or every approval for one program.
+    Revoke {
+        client: String,
+        #[serde(default)]
+        item: Option<String>,
+    },
+    /// Deny every program until told otherwise, or lift that.
+    Lockdown { on: bool },
     /// Stop the agent.
     Shutdown,
 }
@@ -1497,6 +1507,57 @@ impl Agent {
             Request::PasskeyQueue => Ok(Response::PasskeyQueue {
                 pending: self.consent.summaries(Utc::now()),
             }),
+
+            Request::Approvals => Ok(Response::Approvals {
+                granted: self.approvals.granted().cloned().collect(),
+                lockdown: self.approvals.is_locked_down(),
+            }),
+
+            Request::Revoke { client, item } => {
+                use crate::policy::{Capability, ClientKey};
+                let key = ClientKey::of(Some(&client));
+                let n = match item {
+                    Some(item) => {
+                        // Every capability for that item: a person revoking
+                        // "this program's access to this record" does not mean
+                        // "except for copying it".
+                        [
+                            Capability::Reveal,
+                            Capability::Copy,
+                            Capability::SshSign,
+                            Capability::SecretService,
+                        ]
+                        .into_iter()
+                        .filter(|c| self.approvals.revoke(&key, &item, *c))
+                        .count()
+                    }
+                    None => self.approvals.revoke_client(&key),
+                };
+                self.record_audit(
+                    crate::audit::Surface::Socket,
+                    crate::audit::Decision::Revoked,
+                    &format!("revoke:{client}"),
+                    Some(&n.to_string()),
+                );
+                self.publish()?;
+                Ok(Response::Added { count: n })
+            }
+
+            Request::Lockdown { on } => {
+                self.approvals.set_lockdown(on);
+                self.record_audit(
+                    crate::audit::Surface::Socket,
+                    if on {
+                        crate::audit::Decision::Blocked
+                    } else {
+                        crate::audit::Decision::Approved
+                    },
+                    "lockdown",
+                    Some(if on { "on" } else { "off" }),
+                );
+                self.publish()?;
+                Ok(Response::Ok)
+            }
 
             Request::PasskeyCollect { nonce } => {
                 use crate::consent::{Operation, State};

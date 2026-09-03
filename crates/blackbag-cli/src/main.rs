@@ -60,6 +60,8 @@ enum Command {
     /// Run the unlock agent, or talk to it.
     #[command(subcommand)]
     Agent(AgentCommand),
+    /// Show who asked for what, and whether the record still holds.
+    Audit(AuditArgs),
     /// Report vault and host posture.
     Doctor(DoctorArgs),
     /// Write status.json for the cockpit.
@@ -266,6 +268,24 @@ enum AgentCommand {
     Status,
     /// Stop the agent.
     Stop,
+    /// What programs are currently approved to read what, as JSON.
+    Approvals,
+    /// Withdraw an approval: one item for one program, or everything a
+    /// program has.
+    Revoke {
+        /// The program, as the approval names it.
+        client: String,
+        /// Restrict to one record id. Omitted, this withdraws everything that
+        /// program has.
+        #[arg(long)]
+        item: Option<String>,
+    },
+    /// Deny every program until told otherwise.
+    Lockdown {
+        /// Lift it again.
+        #[arg(long)]
+        off: bool,
+    },
     /// Passkey ceremonies waiting for an answer, as JSON.
     PasskeyQueue,
     /// Answer a waiting passkey ceremony.
@@ -373,6 +393,19 @@ enum AgentCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Args)]
+struct AuditArgs {
+    /// How many of the most recent entries to show.
+    #[arg(long, default_value_t = 20)]
+    tail: usize,
+    /// Machine-readable, one JSON object per line, oldest first.
+    #[arg(long)]
+    json: bool,
+    /// Only check the chain, and say where it breaks.
+    #[arg(long)]
+    verify: bool,
 }
 
 #[derive(Args)]
@@ -492,6 +525,7 @@ fn run(hardening: harden::HardenReport) -> Result<()> {
         Command::Rekey(args) => cmd_rekey(&path, args),
         Command::Recovery(cmd) => cmd_recovery(&path, cmd),
         Command::Agent(cmd) => cmd_agent(&path, cmd, hardening),
+        Command::Audit(args) => cmd_audit(args),
         Command::Doctor(args) => cmd_doctor(&path, args, hardening),
         Command::Status(args) => cmd_status(&path, args, hardening),
         Command::Gen(cmd) => cmd_gen(cmd),
@@ -873,6 +907,58 @@ fn cmd_agent(
             Response::Error { message } => bail!("{message}"),
             _ => bail!("unexpected reply"),
         },
+        AgentCommand::Approvals => match session::ask(&Request::Approvals)? {
+            Response::Approvals { granted, lockdown } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "lockdown": lockdown,
+                        "granted": granted,
+                    }))?
+                );
+                Ok(())
+            }
+            Response::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        },
+
+        AgentCommand::Revoke { client, item } => {
+            match session::ask(&Request::Revoke { client, item })? {
+                Response::Added { count } => {
+                    println!("Withdrew {count} approval(s).");
+                    Ok(())
+                }
+                Response::Error { message } => bail!("{message}"),
+                other => bail!("unexpected reply: {other:?}"),
+            }
+        }
+
+        AgentCommand::Lockdown { off } => {
+            match session::ask(&Request::Lockdown { on: !off })? {
+                Response::Ok => {
+                    // Say what actually happened. Lifting lockdown restores
+                    // the specific approvals the owner had already given —
+                    // those were answers to specific questions — and does NOT
+                    // restore blanket trust, which has to be granted again on
+                    // purpose. Claiming otherwise would misdescribe the state
+                    // of the machine at the exact moment somebody is checking.
+                    println!(
+                        "{}",
+                        if off {
+                            "Lockdown lifted. Approvals given before it are in force again; \
+                             blanket trust was cleared and must be granted again."
+                        } else {
+                            "Lockdown on. Every program is denied, including trusted ones, \
+                             until you lift it."
+                        }
+                    );
+                    Ok(())
+                }
+                Response::Error { message } => bail!("{message}"),
+                other => bail!("unexpected reply: {other:?}"),
+            }
+        }
+
         AgentCommand::PasskeyQueue => match session::ask(&Request::PasskeyQueue)? {
             Response::PasskeyQueue { pending } => {
                 println!("{}", serde_json::to_string_pretty(&pending)?);
@@ -1519,6 +1605,60 @@ fn reveal_with_approval(id: &str, field: &str, approve: bool) -> Result<Zeroizin
             }
         }
         _ => bail!("unexpected reply"),
+    }
+}
+
+/// Show the history, or check it.
+///
+/// The log is read from disk rather than asked of the agent: it outlives any
+/// one agent, and a history you can only see by asking the thing being audited
+/// is not much of a history.
+fn cmd_audit(args: AuditArgs) -> Result<()> {
+    use blackbag_core::audit::{Log, Verdict};
+
+    let path = Log::default_path()?;
+    let log = Log::at(&path);
+
+    if args.verify {
+        match log.verify(None)? {
+            Verdict::Intact { entries, head } => {
+                println!("intact · {entries} entr(ies) · head {}", &head[..16.min(head.len())]);
+                Ok(())
+            }
+            Verdict::Broken { at, why } => {
+                bail!("entry {at} does not hold: {why}")
+            }
+            // Without a recorded head to compare against, `verify` cannot
+            // report truncation, and saying "intact" would overstate what was
+            // checked. See audit.rs.
+            Verdict::Truncated { entries } => {
+                bail!("the chain is valid but shorter than expected ({entries} entries)")
+            }
+        }
+    } else {
+        let entries = log.entries()?;
+        let start = entries.len().saturating_sub(args.tail);
+        for e in &entries[start..] {
+            if args.json {
+                println!("{}", serde_json::to_string(e)?);
+            } else {
+                println!(
+                    "{}  {:<11} {:<14} {}{}",
+                    e.at.format("%Y-%m-%d %H:%M:%S"),
+                    e.decision.as_str(),
+                    e.who.program.as_deref().unwrap_or("unidentified"),
+                    e.subject,
+                    e.detail
+                        .as_deref()
+                        .map(|d| format!(" · {d}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        if entries.is_empty() {
+            println!("Nothing recorded yet.");
+        }
+        Ok(())
     }
 }
 
