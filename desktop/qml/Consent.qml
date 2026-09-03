@@ -379,6 +379,50 @@ Item {
       }
     }
 
+    // ── the second thing being asked, when there is one ─────────────────────
+    Rectangle {
+      Layout.fillWidth: true
+      visible: consent.ceremony && consent.ceremony.want_prf === true
+      implicitHeight: prfCol.implicitHeight + metric.space(20)
+      radius: metric.cornerRadius
+      color: Util.alpha(Color.urgent, 0.06)
+      border.width: Math.max(1, metric.spacing.hairline)
+      border.color: Util.alpha(Color.urgent, 0.4)
+
+      ColumnLayout {
+        id: prfCol
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.leftMargin: metric.space(18)
+        anchors.rightMargin: metric.space(18)
+        spacing: metric.space(3)
+        Text {
+          text: "AND AN ENCRYPTION KEY"
+          color: Util.alpha(Color.urgent, 0.9)
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
+          font.bold: true
+          font.letterSpacing: metric.spaceReal(1.2)
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+        }
+        Text {
+          Layout.fillWidth: true
+          text: "This site is also asking this passkey to derive a key for it. "
+              + "Sites use that to encrypt your data so only this passkey can "
+              + "read it back. It is not your vault key and it never leaves as "
+              + "one — but it is a second thing you are agreeing to."
+          color: Util.alpha(Color.foreground, 0.6)
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
+          wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+        }
+      }
+    }
+
     // ── the honest sentence ─────────────────────────────────────────────────
     Text {
       Layout.fillWidth: true

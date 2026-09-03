@@ -148,6 +148,15 @@ pub struct Ceremony {
     /// changeable after the human has approved.
     pub prf_first_salt: Option<Vec<u8>>,
     pub prf_second_salt: Option<Vec<u8>>,
+    /// Opaque identity of the process that registered this ceremony, if the
+    /// agent could determine one. Only that process may collect the answer.
+    ///
+    /// The human approves a login *for the thing that asked*. Without this, a
+    /// local process could sit polling and take the signature the browser was
+    /// waiting for — the person would have approved one login and someone else
+    /// would have received it. This is blast-radius reduction and not a
+    /// boundary: anything that can reach the socket can also spawn a process.
+    pub owner: Option<String>,
     pub registered_at: DateTime<Utc>,
     /// Failed proofs so far. A ceremony is refused outright after
     /// [`MAX_PROOF_ATTEMPTS`], so this is not an oracle to guess against.
@@ -191,6 +200,7 @@ impl Ceremony {
                 .clone()
                 .or_else(|| self.choices.first().map(|c| c.label.clone())),
             choices: self.choices.clone(),
+            want_prf: self.want_prf,
             expires_at: self.expires_at(),
         }
     }
@@ -211,6 +221,15 @@ pub struct Summary {
     pub rp_name: Option<String>,
     pub account: Option<String>,
     pub choices: Vec<Choice>,
+    /// Whether the relying party also asked for a PRF value.
+    ///
+    /// Worth its own line on screen: a PRF output is a key this credential
+    /// derives for that site, which the site uses to encrypt things. Approving
+    /// it is a different act from approving a sign-in, and a prompt that said
+    /// only "sign in" while handing one over would be describing half of what
+    /// it did.
+    #[serde(default)]
+    pub want_prf: bool,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -338,10 +357,22 @@ impl Desk {
     ///
     /// Single use: the caller gets the frozen request and its verdict exactly
     /// once, so a completed approval cannot be replayed into a second signature.
-    pub fn take_answered(&mut self, nonce: &str, now: DateTime<Utc>) -> Option<Ceremony> {
+    pub fn take_answered(
+        &mut self,
+        nonce: &str,
+        collector: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Option<Ceremony> {
         self.expire(now);
         let idx = self.pending.iter().position(|c| {
-            c.nonce == nonce && !matches!(c.state, State::AwaitingHuman)
+            c.nonce == nonce
+                && !matches!(c.state, State::AwaitingHuman)
+                // A ceremony registered by an identified peer is collectable
+                // only by that peer. One registered by a peer the agent could
+                // not identify is collectable by anyone — refusing outright
+                // would break the ceremony rather than protect it, and the
+                // approval still cost a passphrase.
+                && (c.owner.is_none() || c.owner.as_deref() == collector)
         })?;
         Some(self.pending.remove(idx))
     }
@@ -452,6 +483,7 @@ mod tests {
             want_prf: false,
             prf_first_salt: None,
             prf_second_salt: None,
+            owner: None,
             registered_at: at(0),
             attempts: 0,
             state: State::AwaitingHuman,
@@ -473,13 +505,48 @@ mod tests {
         assert!(desk.is_waiting(N1), "a refused swap must not answer it");
 
         desk.approve(N1, Some(b"aaaa"), true, at(1)).unwrap();
-        let done = desk.take_answered(N1, at(1)).unwrap();
+        let done = desk.take_answered(N1, None, at(1)).unwrap();
         assert_eq!(
             done.state,
             State::Approved {
                 credential_id: b"aaaa".to_vec()
             }
         );
+    }
+
+    /// A human approves a login *for the thing that asked*. Another process
+    /// must not be able to take the signature it was waiting for.
+    #[test]
+    fn only_the_peer_that_asked_can_collect_the_answer() {
+        let mut desk = Desk::new();
+        let mut c = ceremony(N1, vec![choice(b"aaaa", "ada")]);
+        c.owner = Some("PeerId { pid: 42, started: 900 }".into());
+        desk.register(c, at(0)).unwrap();
+        desk.approve(N1, None, true, at(1)).unwrap();
+
+        assert!(
+            desk.take_answered(N1, Some("PeerId { pid: 99, started: 7 }"), at(1)).is_none(),
+            "a different process must not receive it"
+        );
+        assert!(
+            desk.take_answered(N1, None, at(1)).is_none(),
+            "nor must an unidentified one"
+        );
+        assert!(
+            desk.take_answered(N1, Some("PeerId { pid: 42, started: 900 }"), at(1)).is_some(),
+            "the peer that asked still gets it"
+        );
+    }
+
+    /// When the agent could not identify the registering peer, binding would
+    /// break the ceremony rather than protect it.
+    #[test]
+    fn an_unidentified_ceremony_is_still_collectable() {
+        let mut desk = Desk::new();
+        desk.register(ceremony(N1, vec![choice(b"aaaa", "ada")]), at(0))
+            .unwrap();
+        desk.approve(N1, None, true, at(1)).unwrap();
+        assert!(desk.take_answered(N1, Some("anyone"), at(1)).is_some());
     }
 
     #[test]
@@ -489,9 +556,9 @@ mod tests {
             .unwrap();
         desk.approve(N1, None, true, at(1)).unwrap();
 
-        assert!(desk.take_answered(N1, at(1)).is_some());
+        assert!(desk.take_answered(N1, None, at(1)).is_some());
         assert!(
-            desk.take_answered(N1, at(1)).is_none(),
+            desk.take_answered(N1, None, at(1)).is_none(),
             "one approval must not yield two signatures"
         );
     }
@@ -512,7 +579,7 @@ mod tests {
 
         // Expiry proper happens on a path that can act on it, and then it is
         // refused rather than answerable.
-        let done = desk.take_answered(N1, after).unwrap();
+        let done = desk.take_answered(N1, None, after).unwrap();
         assert!(matches!(done.state, State::Refused { .. }));
         assert!(!desk.is_waiting(N1), "and it is gone from the desk");
     }
@@ -585,7 +652,7 @@ mod tests {
         desk.clear();
         assert!(desk.is_empty());
         assert!(
-            desk.take_answered(N1, at(1)).is_none(),
+            desk.take_answered(N1, None, at(1)).is_none(),
             "an approval must not survive the lock it was given under"
         );
     }
@@ -612,6 +679,6 @@ mod tests {
         let mut desk = Desk::new();
         assert!(desk.approve(N1, None, true, at(0)).is_err());
         assert!(desk.refuse(N1, "no", at(0)).is_err());
-        assert!(desk.take_answered(N1, at(0)).is_none());
+        assert!(desk.take_answered(N1, None, at(0)).is_none());
     }
 }

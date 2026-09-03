@@ -745,6 +745,8 @@ pub struct Agent {
     status_dir: Option<PathBuf>,
     /// Passkey ceremonies waiting for a human.
     consent: crate::consent::Desk,
+    /// Who is on the other end of the connection being served right now.
+    peer: Option<PeerId>,
 }
 
 struct OpenVault {
@@ -779,6 +781,7 @@ impl Agent {
             sleep_watch: None,
             status_dir: None,
             consent: crate::consent::Desk::new(),
+            peer: None,
         }
     }
 
@@ -913,6 +916,7 @@ impl Agent {
         if peer != unsafe { libc::getuid() } {
             bail!("rejected connection from uid {peer}");
         }
+        self.peer = peer_pid(&stream).ok().and_then(PeerId::of);
 
         // Rule 4: a peer gets a bounded slice of the agent's attention. One
         // request line in, one reply out, each within PEER_IO_TIMEOUT.
@@ -1260,6 +1264,7 @@ impl Agent {
                     want_prf,
                     prf_first_salt: prf_first_salt.as_deref().map(unhex).transpose()?,
                     prf_second_salt: prf_second_salt.as_deref().map(unhex).transpose()?,
+                    owner: self.peer.map(|p| format!("{p:?}")),
                     registered_at: Utc::now(),
                     attempts: 0,
                     state: State::AwaitingHuman,
@@ -1305,7 +1310,11 @@ impl Agent {
             Request::PasskeyCollect { nonce } => {
                 use crate::consent::{Operation, State};
 
-                let Some(ceremony) = self.consent.take_answered(&nonce, Utc::now()) else {
+                let collector = self.peer.map(|p| format!("{p:?}"));
+                let Some(ceremony) =
+                    self.consent
+                        .take_answered(&nonce, collector.as_deref(), Utc::now())
+                else {
                     if self.consent.is_waiting(&nonce) {
                         return Ok(Response::PasskeyWaiting);
                     }
@@ -1618,6 +1627,30 @@ fn set_socket_mode(path: &Path) -> Result<()> {
 }
 
 /// uid of the connected peer, via `SO_PEERCRED`.
+/// Who a ceremony belongs to.
+///
+/// A pid alone is not an identity — pids are recycled, and a process that dies
+/// mid-ceremony can be impersonated by whatever the kernel hands the number to
+/// next. Field 22 of `/proc/<pid>/stat` is the process start time in clock
+/// ticks since boot, and the pair is unique for the life of the boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerId {
+    pid: i32,
+    started: u64,
+}
+
+impl PeerId {
+    fn of(pid: i32) -> Option<Self> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The second field is the executable name in parentheses and may itself
+        // contain spaces and parentheses, so fields are counted from the LAST
+        // ')' rather than by splitting the whole line.
+        let rest = &stat[stat.rfind(')')? + 1..];
+        let started = rest.split_whitespace().nth(19)?.parse().ok()?;
+        Some(Self { pid, started })
+    }
+}
+
 fn peer_uid(stream: &UnixStream) -> Result<u32> {
     use std::os::unix::io::AsRawFd;
 
@@ -1640,6 +1673,31 @@ fn peer_uid(stream: &UnixStream) -> Result<u32> {
         return Err(std::io::Error::last_os_error()).context("SO_PEERCRED failed");
     }
     Ok(cred.uid)
+}
+
+/// The peer's pid, from the same kernel-attested credentials as its uid.
+fn peer_pid(stream: &UnixStream) -> Result<i32> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("SO_PEERCRED failed");
+    }
+    Ok(cred.pid)
 }
 
 /// Client side: one request, one response, at the default socket.
