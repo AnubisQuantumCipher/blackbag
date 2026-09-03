@@ -1355,14 +1355,32 @@ fn cmd_import(path: &std::path::Path, args: ImportArgs) -> Result<()> {
         bail!("nothing to import");
     }
 
-    let _lock = blackbag_core::vault::open_lock(path)?;
-    let mut vault = open_vault(path)?;
-    let mut added = 0usize;
-    for record in imported.records {
-        vault.add_record(record)?;
-        added += 1;
-    }
-    vault.save()?;
+    // If the agent already holds this vault open, let it do the writing. It
+    // is the process that should be writing while it holds the file, and it
+    // means the deck can run an import without asking for a passphrase the
+    // agent is already holding the key for. One request, one save.
+    let added = if agent_session_view().unlocked {
+        let drafts = imported
+            .records
+            .iter()
+            .map(session::RecordDraft::of)
+            .collect();
+        match session::ask(&Request::AddMany { drafts })? {
+            Response::Added { count } => count,
+            Response::Error { message } => bail!("{message}"),
+            _ => bail!("unexpected reply"),
+        }
+    } else {
+        let _lock = blackbag_core::vault::open_lock(path)?;
+        let mut vault = open_vault(path)?;
+        let mut added = 0usize;
+        for record in imported.records {
+            vault.add_record(record)?;
+            added += 1;
+        }
+        vault.save()?;
+        added
+    };
     println!("imported {added} record(s) into {}", path.display());
     println!("The export file still holds every secret in plaintext. Delete it: shred -u {}", args.from.display());
     Ok(())

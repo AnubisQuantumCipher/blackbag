@@ -112,6 +112,10 @@ pub enum Request {
     /// Create a record. Secrets travel inside this request, over the socket —
     /// which is exactly why authoring lives here and not behind CLI flags.
     Add { draft: RecordDraft },
+    /// Create many records in one write. An import of five hundred records
+    /// through `Add` would be five hundred saves, five hundred epoch bumps
+    /// and five hundred fsyncs.
+    AddMany { drafts: Vec<RecordDraft> },
     /// Replace a record's contents, keeping its id and created_at.
     Update { id: String, draft: RecordDraft },
     /// Remove a record. Not undoable.
@@ -150,6 +154,8 @@ pub enum Response {
     Secret { value: Zeroizing<String> },
     Totp { code: String, ttl_secs: u64, step: u64 },
     Saved { id: String },
+    /// Several records were written in one save.
+    Added { count: usize },
     Hygiene(crate::hygiene::VaultReport),
     BreachPrefixes { candidates: Vec<crate::breach::Candidate> },
     Breach(crate::breach::Report),
@@ -179,8 +185,57 @@ pub struct RecordDraft {
     /// Values are wiped when the draft is dropped.
     #[serde(default)]
     pub secrets: Vec<(String, Zeroizing<String>)>,
+    /// Free-form notes attached to the record itself, as opposed to a secret
+    /// field a kind happens to call "notes". `None` leaves what is stored
+    /// alone; `Some("")` clears it.
+    #[serde(default)]
+    pub notes: Option<Zeroizing<String>>,
     #[serde(default)]
     pub totp: Option<TotpDraft>,
+}
+
+impl RecordDraft {
+    /// The draft that would rebuild `record`. This is how a parsed import
+    /// reaches the agent, which is the only process that should write the
+    /// vault while it holds it open.
+    pub fn of(record: &Record) -> Self {
+        Self {
+            kind: record.kind.to_string(),
+            title: record.title.clone(),
+            tags: record.tags.clone(),
+            attributes: record.attributes.clone(),
+            secrets: record
+                .fields
+                .iter()
+                .filter(|f| f.name != "totp")
+                .filter_map(|f| {
+                    f.secret
+                        .expose_str()
+                        .ok()
+                        .map(|v| (f.name.clone(), Zeroizing::new(v.to_string())))
+                })
+                .collect(),
+            notes: record
+                .notes
+                .as_ref()
+                .and_then(|n| n.expose_str().ok())
+                .map(|n| Zeroizing::new(n.to_string())),
+            totp: record.totp.as_ref().map(|cfg| TotpDraft {
+                secret_base32: record.field("totp").map(|s| {
+                    Zeroizing::new(base32::encode(
+                        base32::Alphabet::Rfc4648 { padding: false },
+                        s.open().as_slice(),
+                    ))
+                }),
+                otpauth_uri: None,
+                issuer: cfg.issuer.clone(),
+                account: cfg.account.clone(),
+                digits: Some(cfg.digits),
+                step: Some(cfg.step),
+                algorithm: Some(cfg.algorithm.as_str().to_string()),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -412,6 +467,10 @@ impl RecordDraft {
             None => {
                 record.totp = None;
             }
+        }
+
+        if let Some(notes) = &self.notes {
+            record.notes = (!notes.is_empty()).then(|| Secret::from_str(notes));
         }
 
         record.updated_at = Utc::now();
@@ -838,6 +897,26 @@ impl Agent {
                 open.vault.save()?;
                 self.publish()?;
                 Ok(Response::Saved { id: id.to_string() })
+            }
+
+            Request::AddMany { drafts } => {
+                // Every draft becomes a record before anything is written, so
+                // a malformed one at position four hundred does not leave
+                // three hundred and ninety-nine behind it.
+                let mut records = Vec::with_capacity(drafts.len());
+                for draft in drafts {
+                    records.push(draft.into_record()?);
+                }
+                let _guard = crate::vault::open_lock(&self.vault_path)?;
+                let open = self.opened()?;
+                let mut added = 0usize;
+                for record in records {
+                    open.vault.add_record(record)?;
+                    added += 1;
+                }
+                open.vault.save()?;
+                self.publish()?;
+                Ok(Response::Added { count: added })
             }
 
             Request::Update { id, draft } => {
@@ -1314,6 +1393,7 @@ mod tests {
             tags: vec!["dev".into()],
             attributes: vec![("username".into(), "octocat".into())],
             secrets: vec![("password".into(), Zeroizing::new("hunter2".into()))],
+            notes: None,
             totp: None,
         }
     }
@@ -1596,6 +1676,62 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = ask_at(&sock, &Request::Shutdown);
+    }
+
+    /// A parsed import must survive the trip through the agent whole —
+    /// including the notes, which the draft had no field for and which a
+    /// route through `Add` would therefore have dropped in silence.
+    #[test]
+    fn a_record_survives_the_round_trip_through_a_draft() {
+        let mut record = Record::new(Kind::Ssh, Some("build box".into()));
+        record.tags = vec!["infra".into()];
+        record.set_attribute("label", "ci");
+        record.set_field("private_key", Secret::from_str("-----BEGIN-----"));
+        record.set_field("passphrase", Secret::from_str("unlock me"));
+        record.notes = Some(Secret::from_str("kept in the safe"));
+
+        let back = RecordDraft::of(&record).into_record().unwrap();
+        assert_eq!(back.kind, Kind::Ssh);
+        assert_eq!(back.title.as_deref(), Some("build box"));
+        assert_eq!(back.tags, vec!["infra"]);
+        assert_eq!(back.attribute("label"), Some("ci"));
+        assert_eq!(
+            back.field("private_key").unwrap().expose_str().unwrap().as_str(),
+            "-----BEGIN-----"
+        );
+        assert_eq!(
+            back.field("passphrase").unwrap().expose_str().unwrap().as_str(),
+            "unlock me"
+        );
+        assert_eq!(
+            back.notes.as_ref().unwrap().expose_str().unwrap().as_str(),
+            "kept in the safe",
+            "notes must not be lost on the way to the agent"
+        );
+    }
+
+    /// And a TOTP record keeps its seed and its parameters.
+    #[test]
+    fn a_totp_record_survives_the_round_trip_through_a_draft() {
+        let (bytes, mut cfg) =
+            parse_otpauth("otpauth://totp/GitHub:octocat?secret=JBSWY3DPEHPK3PXP").unwrap();
+        cfg.digits = 8;
+        cfg.step = 60;
+        cfg.issuer = Some("GitHub".into());
+        let mut record = Record::new(Kind::Totp, Some("GitHub 2FA".into()));
+        record.set_field("totp", Secret::new(&bytes));
+        record.totp = Some(cfg);
+
+        let back = RecordDraft::of(&record).into_record().unwrap();
+        assert_eq!(
+            back.field("totp").unwrap().open().as_slice(),
+            bytes.as_slice(),
+            "the shared secret must survive base32 and back"
+        );
+        let cfg = back.totp.as_ref().unwrap();
+        assert_eq!(cfg.digits, 8);
+        assert_eq!(cfg.step, 60);
+        assert_eq!(cfg.issuer.as_deref(), Some("GitHub"));
     }
 
     #[test]

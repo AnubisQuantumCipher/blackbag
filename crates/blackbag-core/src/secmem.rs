@@ -972,14 +972,38 @@ mod tests {
 
     #[test]
     fn oversize_allocations_get_their_own_slab_and_give_it_back() {
-        let before = locked_bytes() + unlocked_bytes();
+        // Deliberately not a before/after assertion on the arena counters:
+        // they are process-global and every other test in this binary moves
+        // them, so an exact delta is a race, not a check. What is actually
+        // being claimed is that an oversize buffer works and that repeating
+        // it does not grow the arena without bound — a dedicated slab that
+        // was never unmapped would show up as linear growth here.
+        const ROUNDS: usize = 16;
+        let oversize = SLAB_BYTES * 2 + 5;
+
         {
-            let big = SecretBuf::new(&vec![7u8; SLAB_BYTES * 2 + 5]);
-            assert_eq!(big.len(), SLAB_BYTES * 2 + 5);
-            assert!(locked_bytes() + unlocked_bytes() >= before + SLAB_BYTES * 2);
+            let big = SecretBuf::new(&vec![7u8; oversize]);
+            assert_eq!(big.len(), oversize);
+            assert!(big.iter().all(|&b| b == 7), "contents survived the mapping");
         }
-        // Released on drop; the pool slabs stay.
-        assert!(locked_bytes() + unlocked_bytes() < before + SLAB_BYTES * 2 + page_size() * 2);
+
+        let before = locked_bytes() + unlocked_bytes();
+        for round in 0..ROUNDS {
+            let big = SecretBuf::zeroed(oversize);
+            assert_eq!(big.len(), oversize, "round {round}");
+            drop(big);
+        }
+        let after = locked_bytes() + unlocked_bytes();
+
+        // Sixteen leaked dedicated slabs would be ~8 MiB of growth. One
+        // round's worth of slack absorbs whatever the rest of the suite did
+        // concurrently.
+        assert!(
+            after <= before + oversize + SLAB_BYTES,
+            "the arena grew by {} bytes over {ROUNDS} oversize allocations; \
+             a dedicated slab is not being unmapped",
+            after.saturating_sub(before)
+        );
     }
 
     #[test]
