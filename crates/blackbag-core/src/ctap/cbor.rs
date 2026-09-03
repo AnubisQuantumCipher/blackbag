@@ -589,4 +589,84 @@ mod tests {
             assert!(parse_request(&bytes).is_err(), "{bytes:?} must be refused");
         }
     }
+
+    /// A tiny deterministic PRNG (SplitMix64), so a fuzz failure reproduces
+    /// from its fixed seed rather than vanishing with the run.
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// The command payload is untrusted: it arrives off the wire from whatever
+    /// spoke to the virtual key. `parse_request` must always RETURN — never an
+    /// index-out-of-bounds, an arithmetic underflow, or an unwrap on attacker
+    /// data. This throws a large volume of structured-random and mutated
+    /// payloads at it; a panic anywhere fails the test. `malformed_cbor_...`
+    /// above pins a few by hand; this widens the net.
+    #[test]
+    fn arbitrary_payloads_never_panic_parse_request() {
+        let mut prng = SplitMix64::new(0xC0FF_EE00_1234_5678);
+
+        // Mutating something near a valid structure reaches far deeper than
+        // uniformly random bytes ever would.
+        let get_assertion = {
+            let body = Value::Map(vec![
+                (Value::Integer(1.into()), text("example.com")),
+                (Value::Integer(2.into()), Value::Bytes(vec![0x11; 32])),
+            ]);
+            let mut out = vec![command::GET_ASSERTION];
+            out.extend(encode(&body));
+            out
+        };
+        let corpus: Vec<Vec<u8>> = vec![
+            make_credential_bytes(),
+            get_assertion,
+            vec![command::GET_INFO],
+            vec![command::MAKE_CREDENTIAL],
+            vec![command::GET_ASSERTION],
+            Vec::new(),
+        ];
+
+        for _ in 0..100_000 {
+            let mut buf = if prng.next() & 1 == 0 {
+                corpus[(prng.next() as usize) % corpus.len()].clone()
+            } else {
+                let n = (prng.next() % 300) as usize;
+                (0..n).map(|_| (prng.next() & 0xff) as u8).collect()
+            };
+            let edits = (prng.next() % 6) as usize;
+            for _ in 0..edits {
+                if buf.is_empty() {
+                    buf.push((prng.next() & 0xff) as u8);
+                    continue;
+                }
+                match prng.next() % 4 {
+                    0 => {
+                        let i = (prng.next() as usize) % buf.len();
+                        buf[i] = (prng.next() & 0xff) as u8;
+                    }
+                    1 => {
+                        let i = (prng.next() as usize) % buf.len();
+                        buf[i] ^= 1 << (prng.next() % 8);
+                    }
+                    2 => {
+                        let i = (prng.next() as usize) % buf.len();
+                        buf.truncate(i);
+                    }
+                    _ => buf.push((prng.next() & 0xff) as u8),
+                }
+            }
+            // The whole contract: it returns. A panic fails the test.
+            let _ = parse_request(&buf);
+        }
+    }
 }

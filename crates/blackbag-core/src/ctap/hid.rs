@@ -535,4 +535,50 @@ mod tests {
         assert_eq!(body[16], capability::CBOR);
         assert_eq!(body.len(), 17);
     }
+
+    /// A tiny deterministic PRNG (SplitMix64) so a fuzz failure reproduces.
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// Reports are untrusted: a local process with access to the hidraw node
+    /// can write any bytes it likes. Feeding the reassembler a large volume of
+    /// structured-random reports must only ever yield a `Step` — never an
+    /// index panic, a subtraction underflow, or unbounded growth. Channel ids
+    /// are biased small so continuations actually land on live channels and the
+    /// multi-packet paths are exercised, not just the header guards.
+    #[test]
+    fn arbitrary_reports_never_panic_the_reassembler() {
+        let mut prng = SplitMix64::new(0x5EED_1234_ABCD_0001);
+        let mut r = Reassembler::new();
+        for _ in 0..300_000 {
+            let mut pkt = [0u8; PACKET];
+            for b in pkt.iter_mut() {
+                *b = (prng.next() & 0xff) as u8;
+            }
+            // Bias toward a handful of channel ids so transactions interleave.
+            if prng.next() & 1 == 0 {
+                let cid = ((prng.next() % 4) as u32 + 1).to_be_bytes();
+                pkt[..4].copy_from_slice(&cid);
+            }
+            // Occasionally hand it a short slice to exercise the header guards.
+            let len = if prng.next() % 16 == 0 {
+                (prng.next() % (PACKET as u64 + 1)) as usize
+            } else {
+                PACKET
+            };
+            // The whole contract: it returns a Step. A panic fails the test.
+            let _ = r.push(&pkt[..len]);
+        }
+    }
 }

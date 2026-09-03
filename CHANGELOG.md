@@ -44,6 +44,11 @@ a regression test.
   approval wait, or one idle client, wedged every other `ssh`; it is now one
   bounded thread per connection.
 
+The two untrusted-input CTAP parsers — the CTAPHID reassembler and the CTAP2
+CBOR request parser — also gained deterministic fuzz tests (seeded SplitMix64,
+hundreds of thousands of structured-random and mutated inputs each) that assert
+they only ever return, never panic. They run in the normal suite on stable.
+
 ### Security — supply-chain audit, and a vulnerable dependency removed
 
 - **`cargo-deny` is enforced in CI** (advisories, licences, sources, bans), with
