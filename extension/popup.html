@@ -1,0 +1,67 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Black-Bag</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #060a07;
+    --fg: #c6f5d5;
+    --accent: #00ff41;
+    --muted: #2b4a37;
+    --urgent: #ff2f2f;
+  }
+  body {
+    margin: 0;
+    padding: 16px 18px 18px;
+    width: 300px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.5 "CaskaydiaMono Nerd Font", "JetBrains Mono", ui-monospace, monospace;
+  }
+  h1 {
+    margin: 0;
+    font-size: 13px;
+    letter-spacing: 3px;
+    font-weight: 700;
+    color: var(--fg);
+  }
+  .sub {
+    margin: 2px 0 14px;
+    font-size: 11px;
+    letter-spacing: 1.2px;
+    color: color-mix(in srgb, var(--fg) 45%, transparent);
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 0;
+    border-top: 1px solid color-mix(in srgb, var(--muted) 60%, transparent);
+  }
+  .k { color: color-mix(in srgb, var(--fg) 60%, transparent); }
+  .v { font-weight: 700; text-align: right; }
+  .on { color: var(--accent); }
+  .off { color: var(--urgent); }
+  .unknown { color: color-mix(in srgb, var(--fg) 40%, transparent); }
+  .note {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid color-mix(in srgb, var(--muted) 60%, transparent);
+    font-size: 11px;
+    color: color-mix(in srgb, var(--fg) 55%, transparent);
+  }
+  .note b { color: var(--fg); font-weight: 700; }
+</style>
+
+<h1>BLACK-BAG</h1>
+<div class="sub">PASSKEY PROVIDER</div>
+
+<div class="row"><span class="k">provider</span><span class="v unknown" id="attached">checking…</span></div>
+<div class="row"><span class="k">vault</span><span class="v unknown" id="vault">checking…</span></div>
+
+<div class="note" id="note">
+  Every signature is approved by you <b>in Black-Bag</b>, not here. This page
+  cannot approve anything.
+</div>
+
+<script src="popup.js"></script>

@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Black-Bag",
+  "version": "1.0.0",
+  "description": "Passkeys from your Black-Bag vault. Every signature is approved by you, in Black-Bag, not here.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoCvjgW3w+uZetdE5xsvMKhQpFatPR2OjbEUyNNrvm8JI5lx2HLbdWJW2iozai0NPAIXSXk/LFAUY8tg2L0Ix+WYi6gcKuzNEHK4qMukA5iPqHDMSLc+2FshKRcIWMx1mMoqTRpVhbyHEs4555HX+3YK+4JVKDlAAb6UfTMen/20S7lBTEHzFEf+TYGDxe1GFqCzCK9aKMVvzayaf5rME6Tf0rrva1SWszqu+jT+GfZL07x87DRFr1+xBKvsxkqHvRYMTNTGMDOGb53RDI6BcVjGw4CpPLMdovt5A+4LC8j8kUi5A3qusP+WrIEfmLUu/KdFvQZFY19LF6jtEnnLFGQIDAQAB",
+  "permissions": [
+    "webAuthenticationProxy",
+    "nativeMessaging"
+  ],
+  "background": {
+    "service_worker": "sw.js"
+  },
+  "action": {
+    "default_title": "Black-Bag passkeys",
+    "default_popup": "popup.html"
+  },
+  "icons": {}
+}
