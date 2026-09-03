@@ -1949,23 +1949,39 @@ fn cmd_audit(args: AuditArgs) -> Result<()> {
     let log = Log::at(&path);
 
     if args.verify {
-        match log.verify(None)? {
+        // The recorded head is what turns "a valid but shorter chain" into a
+        // detectable truncation. When there isn't one yet (a log written
+        // before head-recording existed), `verify` says so rather than
+        // overstate — it cannot tell a truncation from a clean slate.
+        let expected = log.recorded_head()?;
+        match log.verify(expected.as_deref())? {
             Verdict::Intact { entries, head } => {
+                let scope = if expected.is_some() {
+                    "intact"
+                } else {
+                    "intact so far"
+                };
                 println!(
-                    "intact · {entries} {} · head {}",
+                    "{scope} · {entries} {} · head {}",
                     if entries == 1 { "entry" } else { "entries" },
                     &head[..16.min(head.len())]
                 );
+                if expected.is_none() {
+                    println!(
+                        "note: no head recorded yet, so a truncated end could \
+                         not be detected; the next audited action records one."
+                    );
+                }
                 Ok(())
             }
             Verdict::Broken { at, why } => {
                 bail!("entry {at} does not hold: {why}")
             }
-            // Without a recorded head to compare against, `verify` cannot
-            // report truncation, and saying "intact" would overstate what was
-            // checked. See audit.rs.
             Verdict::Truncated { entries } => {
-                bail!("the chain is valid but shorter than expected ({entries} entries)")
+                bail!(
+                    "the chain is valid but its head does not match the one \
+                     recorded — entries were cut from the end ({entries} remain)"
+                )
             }
         }
     } else {

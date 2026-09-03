@@ -30,6 +30,15 @@ pub const PACKET: usize = 64;
 /// The most a CTAPHID message may carry, per §11.2.4.
 pub const MAX_MESSAGE: usize = 7609;
 
+/// The most half-finished transactions the reassembler will hold at once.
+///
+/// Nothing here has a clock, so a stale transaction is never timed out; without
+/// a bound, a same-seat peer that opens multi-packet transactions on distinct
+/// channel ids and never finishes them grows the table forever. A real client
+/// has one, maybe two, in flight, so this is far above any honest need and only
+/// refuses a flood.
+const MAX_OPEN_CHANNELS: usize = 64;
+
 pub const BROADCAST_CID: u32 = 0xffff_ffff;
 
 /// CTAPHID commands. The top bit marks an initialisation packet on the wire
@@ -228,6 +237,17 @@ impl Reassembler {
                 self.open.remove(&cid);
                 return Step::Done(Message::new(cid, cmd, data));
             }
+            if !self.open.contains_key(&cid) && self.open.len() >= MAX_OPEN_CHANNELS {
+                // A fresh channel would grow the table past its bound. Refuse it
+                // rather than leak: a client with a transaction genuinely in
+                // flight is on a channel already counted here, so it is never
+                // the one turned away. (A re-INIT of an existing channel below
+                // overwrites in place and does not grow the table.)
+                return Step::Error {
+                    cid,
+                    code: err::CHANNEL_BUSY,
+                };
+            }
             self.open.insert(
                 cid,
                 Partial {
@@ -354,6 +374,48 @@ mod tests {
                 code: err::CHANNEL_BUSY
             },
             "a busy channel must not be silently restarted by whoever asks second"
+        );
+    }
+
+    /// The reassembler never grows past its cap of half-finished transactions,
+    /// so a same-seat peer cannot leak the table by opening channels it never
+    /// completes. A channel already counted is never the one turned away.
+    #[test]
+    fn the_reassembler_caps_concurrent_open_channels() {
+        let mut r = Reassembler::new();
+        // Keep channel 1's packets so we can finish it later and free its slot.
+        let ch1 = Message::new(1, cmd::CBOR, vec![7; 300]).to_packets();
+        assert_eq!(r.push(&ch1[0]), Step::Continue, "channel 1 should open");
+        for cid in 2..=MAX_OPEN_CHANNELS as u32 {
+            let pkts = Message::new(cid, cmd::CBOR, vec![7; 300]).to_packets();
+            assert_eq!(r.push(&pkts[0]), Step::Continue, "channel {cid} should open");
+        }
+
+        // At capacity: a fresh channel is refused rather than grown into memory.
+        let overflow = MAX_OPEN_CHANNELS as u32 + 1;
+        let pkts = Message::new(overflow, cmd::CBOR, vec![7; 300]).to_packets();
+        assert_eq!(
+            r.push(&pkts[0]),
+            Step::Error { cid: overflow, code: err::CHANNEL_BUSY },
+            "a fresh channel past the cap must be refused"
+        );
+
+        // Finishing an in-flight transaction frees its slot...
+        let mut done = false;
+        for p in &ch1[1..] {
+            if let Step::Done(_) = r.push(p) {
+                done = true;
+            }
+        }
+        assert!(done, "channel 1's transaction should complete");
+
+        // ...so a new channel is admitted again. The cap is a live count, not a
+        // high-water mark that would wedge the device once reached.
+        let pkts = Message::new(overflow, cmd::CBOR, vec![7; 300]).to_packets();
+        assert_eq!(
+            r.push(&pkts[0]),
+            Step::Continue,
+            "a freed slot admits a new channel"
         );
     }
 

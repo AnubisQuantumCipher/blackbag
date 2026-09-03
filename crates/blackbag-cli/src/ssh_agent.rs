@@ -17,6 +17,8 @@ use blackbag_core::ssh::wire::Writer;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long to wait for a human to approve a first-time signature before giving
@@ -27,6 +29,12 @@ const APPROVAL_WAIT: Duration = Duration::from_secs(90);
 const POLL_EVERY: Duration = Duration::from_millis(250);
 /// The largest agent message we will read. The protocol's own cap is 256 KiB.
 const MAX_MESSAGE: usize = 256 * 1024;
+/// The most connections served at once. One thread per connection means a
+/// first-use approval wait on one `ssh` no longer blocks a signature on
+/// another; this bounds how many threads a same-uid peer can start by opening
+/// sockets it never drives. Far above any real fan-out of concurrent `ssh`
+/// invocations.
+const MAX_CONNECTIONS: usize = 64;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -181,14 +189,43 @@ pub fn serve(explicit: Option<PathBuf>) -> Result<()> {
     eprintln!("black-bag: ssh-agent listening at {}", path.display());
     eprintln!("black-bag: export SSH_AUTH_SOCK={}", path.display());
 
+    // One thread per connection. The vault agent answers each `SshSign` poll
+    // immediately (pending or signed), so the 90s first-use approval wait lives
+    // here, in this process — serving connections serially would let one such
+    // wait, or one idle client, wedge every other `ssh`. See session.rs, which
+    // draws the same single-threaded-agent-is-a-lock-bypass line on its socket.
+    let live = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                let mut signer = VaultSigner;
-                if let Err(e) = serve_connection(stream, &mut signer) {
-                    // One client's error is not the agent's; keep serving.
-                    eprintln!("black-bag: ssh connection ended: {e}");
+                if live.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    // At the ceiling: drop the newest rather than start an
+                    // unbounded number of threads for a peer that opens sockets
+                    // and never speaks. A same-uid peer has blunter tools, so
+                    // this only bounds accidental or hostile fan-out.
+                    eprintln!(
+                        "black-bag: refusing ssh connection; {MAX_CONNECTIONS} already open"
+                    );
+                    drop(stream);
+                    continue;
                 }
+                live.fetch_add(1, Ordering::Relaxed);
+                let live = Arc::clone(&live);
+                std::thread::spawn(move || {
+                    // Decrement even if serve_connection panics.
+                    struct Guard(Arc<AtomicUsize>);
+                    impl Drop for Guard {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                    let _guard = Guard(live);
+                    let mut signer = VaultSigner;
+                    if let Err(e) = serve_connection(stream, &mut signer) {
+                        // One client's error is not the agent's; keep serving.
+                        eprintln!("black-bag: ssh connection ended: {e}");
+                    }
+                });
             }
             Err(e) => eprintln!("black-bag: accept failed: {e}"),
         }

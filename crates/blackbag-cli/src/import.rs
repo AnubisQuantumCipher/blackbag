@@ -657,6 +657,52 @@ struct NoteMeta {
     secrets: Vec<(String, String)>,
 }
 
+/// Encode a value for the line-oriented `[black-bag]` meta block.
+///
+/// The block is read back one physical line at a time by [`split_meta`], so a
+/// raw newline in a value would split it across lines: the continuation lines
+/// were silently dropped on re-import (losing secret material), and one that
+/// happened to begin with a directive keyword could inject a spurious kind,
+/// attribute or field. Backslash, newline and carriage return are the only
+/// characters that need escaping; everything else rides through unchanged.
+fn meta_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The inverse of [`meta_escape`], tolerant of older exports that never
+/// escaped: an unknown `\x` is left as its two literal characters, so a value
+/// that genuinely held a lone backslash still round-trips unchanged.
+fn meta_unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// Split a Notes column into the user's notes and whatever our exporter put
 /// after the marker. A column with no marker is all notes, which is what
 /// every other tool's export looks like.
@@ -672,11 +718,11 @@ fn split_meta(notes: &str) -> (NoteMeta, String) {
             meta.kind = rest.trim().parse::<Kind>().ok();
         } else if let Some(rest) = line.strip_prefix("attr ") {
             if let Some((k, v)) = rest.split_once(": ") {
-                meta.attributes.push((k.to_string(), v.to_string()));
+                meta.attributes.push((k.to_string(), meta_unescape(v)));
             }
         } else if let Some(rest) = line.strip_prefix("secret ") {
             if let Some((k, v)) = rest.split_once(": ") {
-                meta.secrets.push((k.to_string(), v.to_string()));
+                meta.secrets.push((k.to_string(), meta_unescape(v)));
             }
         }
     }
@@ -1167,13 +1213,13 @@ fn render_keepassxc(records: &[Record]) -> Result<Zeroizing<String>> {
         }
         for (k, v) in &r.attributes {
             if k != "username" && k != "url" && k != "account" {
-                meta.push(format!("attr {k}: {v}"));
+                meta.push(format!("attr {k}: {}", meta_escape(v)));
             }
         }
         for f in &r.fields {
             if Some(f.name.as_str()) != primary.map(|(n, _)| n) && f.name != "totp" {
                 if let Ok(v) = f.secret.expose_str() {
-                    meta.push(format!("secret {}: {}", f.name, *v));
+                    meta.push(format!("secret {}: {}", f.name, meta_escape(&v)));
                 }
             }
         }
@@ -1389,6 +1435,51 @@ mod tests {
         assert!(back.records[0].notes.is_none(), "the metadata block is not left in the notes");
         assert_eq!(back.records[1].kind, Kind::Note);
         assert_eq!(back.records[1].field("body").unwrap().expose_str().unwrap().as_str(), "line one\nline two");
+    }
+
+    /// A non-primary secret field whose value spans lines used to come back as
+    /// only its first line: the meta block is line-oriented and the value's
+    /// newlines split it. Escaping fixes the round trip.
+    #[test]
+    fn a_multi_line_secondary_secret_survives_the_keepassxc_round_trip() {
+        let mut r = Record::new(Kind::Login, Some("Bank".into()));
+        r.set_attribute("username", "me");
+        r.set_field("password", Secret::from_str("primary"));
+        let codes = "aaaa-bbbb\ncccc-dddd\neeee-ffff";
+        r.set_field("backup_codes", Secret::from_str(codes));
+
+        let csv = render(&[r], ExportFormat::Keepassxc).unwrap();
+        let back = parse(ImportFormat::Keepassxc, &csv).unwrap();
+        assert_eq!(back.records.len(), 1, "{:?}", back.skipped);
+        let b = &back.records[0];
+        assert_eq!(b.field("password").unwrap().expose_str().unwrap().as_str(), "primary");
+        assert_eq!(
+            b.field("backup_codes").unwrap().expose_str().unwrap().as_str(),
+            codes,
+            "a multi-line secondary secret must not be truncated"
+        );
+    }
+
+    /// And a value that begins with a directive keyword cannot inject one: the
+    /// newline that would have started a fresh physical line is escaped away.
+    #[test]
+    fn a_secondary_secret_cannot_inject_a_meta_directive() {
+        let mut r = Record::new(Kind::Login, Some("x".into()));
+        r.set_attribute("username", "me");
+        r.set_field("password", Secret::from_str("primary"));
+        let payload = "real\nkind: note\nattr injected: yes";
+        r.set_field("note", Secret::from_str(payload));
+
+        let csv = render(&[r], ExportFormat::Keepassxc).unwrap();
+        let back = parse(ImportFormat::Keepassxc, &csv).unwrap();
+        let b = &back.records[0];
+        assert_eq!(b.kind, Kind::Login, "the injected kind must not take effect");
+        assert_eq!(b.attribute("injected"), None, "no attribute may be injected");
+        assert_eq!(
+            b.field("note").unwrap().expose_str().unwrap().as_str(),
+            payload,
+            "the value must survive whole, keyword lines and all"
+        );
     }
 
     #[test]

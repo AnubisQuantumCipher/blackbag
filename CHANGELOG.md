@@ -5,6 +5,45 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — adversarial review, eight findings fixed
+
+A multi-agent adversarial review swept every security surface — vault crypto,
+the passkey core, the CTAP lane, the agent session, consent/policy/audit, the
+Secret Service, the SSH agent, and import/generate — with each finding
+independently verified before it counted. Eight held up and are fixed; each has
+a regression test.
+
+- **Reply writes are now wall-clock-bounded** (agent). The request read already
+  gave up on a peer that would not finish; the reply write only had a
+  per-syscall `SO_SNDTIMEO`, which a peer could reset forever by trickle-reading
+  a large reply — pinning the single-threaded agent across a suspend with the
+  data key resident. Replies are serialized into memory and drained under the
+  same total `PEER_IO_TIMEOUT` the read path enforces.
+- **Audit-log truncation is detectable** (audit). The chain made edits visible
+  but not truncation; the head-recording half of that defence was never wired
+  up, so `audit --verify` said "intact" over a silently shortened log. The head
+  is now recorded in a sidecar beside the log on every write (the same place and
+  caveat as the rollback witness) and `--verify` compares against it; a
+  benign one-behind head after a crash is not mistaken for truncation.
+- **KeePassXC round trips no longer lose multi-line secrets** (import). A
+  secondary secret field whose value contained a newline was silently truncated
+  to its first line on re-import — and a crafted value could inject a meta
+  directive. The line-oriented meta block now escapes newlines both ways.
+- **The recovery key is wiped and never printed** (vault). `RecoveryKey`'s
+  X25519 static secret and ML-KEM seed — which open the vault without the
+  passphrase — sat in plain heap with a derived `Debug`. It now zeroizes on drop
+  and has a redacting `Debug`, matching every other secret type in the crate.
+- **The CTAPHID reassembler is bounded** (ctap). Incomplete transactions on
+  distinct channel ids were never capped or expired, so a same-seat peer could
+  grow the table without bound; concurrent half-open channels are now capped.
+- **Secret Service `replace` only overwrites an exact attribute match** (secret
+  service). A subset — or empty — attribute set could overwrite an unrelated
+  app's item; replace now requires the item's attribute set to equal the request
+  exactly, and never fires on an empty set.
+- **The SSH agent serves connections concurrently** (ssh). One first-use
+  approval wait, or one idle client, wedged every other `ssh`; it is now one
+  bounded thread per connection.
+
 ### Security — supply-chain audit, and a vulnerable dependency removed
 
 - **`cargo-deny` is enforced in CI** (advisories, licences, sources, bans), with

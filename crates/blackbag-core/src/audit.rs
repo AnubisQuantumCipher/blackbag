@@ -17,9 +17,14 @@
 //! also truncate it or delete it, and nothing in a local file can stop that —
 //! the same limit the rollback witness has, and stated here for the same
 //! reason. What it changes is that tampering becomes *visible* instead of
-//! silent: a truncated log is a shorter log with a valid chain, so the head
-//! digest is recorded in the vault's own state on every write, and a head that
-//! does not match the file is reported.
+//! silent: a truncated log is a shorter log with a valid chain, which the
+//! chain alone cannot notice. So the head digest is recorded in a sidecar
+//! beside the log on every write — the same place, and with the same local-file
+//! caveat, as the rollback witness — and a log whose head does not match it is
+//! reported as truncated. A same-uid writer can rewrite the sidecar too; what
+//! this removes is *silent* truncation (a crash, a restore of an older copy, a
+//! partial cut, an attacker who does not also rewrite the sidecar), not the
+//! ability to truncate.
 //!
 //! # What goes in it
 //!
@@ -217,7 +222,66 @@ impl Log {
             .with_context(|| format!("failed to open {}", self.path.display()))?;
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
+        // Record the new head beside the log. A truncation is a shorter log
+        // with a perfectly valid chain, which `verify` cannot notice on its
+        // own; the recorded head is what it compares against. Written after the
+        // entry is durable, so a crash between the two leaves the head one
+        // behind — which `verify` treats as benign (see the ancestor rule
+        // there), never as truncation. The same local-file limit the rollback
+        // witness has applies: a same-uid writer can rewrite this too. What it
+        // removes is *silent* truncation, not the ability to truncate.
+        if let Err(e) = self.write_head(&entry.digest) {
+            eprintln!(
+                "black-bag audit: could not record the head ({e}); truncation \
+                 detection is weakened until the next write"
+            );
+        }
         Ok(entry.digest)
+    }
+
+    /// The sidecar that remembers the head, beside the log itself.
+    fn head_path(&self) -> PathBuf {
+        let mut name = self.path.as_os_str().to_os_string();
+        name.push(".head");
+        PathBuf::from(name)
+    }
+
+    /// Record `head` as the digest of the last entry — atomically, 0600.
+    fn write_head(&self, head: &str) -> Result<()> {
+        let path = self.head_path();
+        let dir = path
+            .parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        std::fs::create_dir_all(&dir)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        tmp.write_all(head.as_bytes())?;
+        tmp.as_file_mut().sync_all()?;
+        tmp.persist(&path)
+            .map_err(|e| anyhow!("failed to record the audit head: {e}"))?;
+        Ok(())
+    }
+
+    /// The head this log last recorded, or `None` if it never has.
+    ///
+    /// `None` covers a log written before head-recording existed: `verify`
+    /// then cannot tell a truncation from a clean prefix, and says so rather
+    /// than overstate what it checked. The next `append` writes a head and
+    /// closes the gap.
+    pub fn recorded_head(&self) -> Result<Option<String>> {
+        match std::fs::read_to_string(self.head_path()) {
+            Ok(raw) => {
+                let head = raw.trim().to_string();
+                Ok((!head.is_empty()).then_some(head))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| {
+                format!("failed to read {}", self.head_path().display())
+            }),
+        }
     }
 
     /// Every entry, oldest first.
@@ -274,9 +338,18 @@ impl Log {
         }
         if let Some(want) = expected_head {
             if want != prev {
-                return Ok(Verdict::Truncated {
-                    entries: entries.len(),
-                });
+                // The recorded head is not the current head. If it appears
+                // earlier in the chain, the log only grew past a head recorded
+                // before the last append landed — benign, and the recorded
+                // entry is still present and intact. If it appears nowhere, the
+                // entries it belonged to were cut from the end: the truncation
+                // a valid prefix hides from the chain alone.
+                let grew_past = entries.iter().any(|e| e.digest == want);
+                if !grew_past {
+                    return Ok(Verdict::Truncated {
+                        entries: entries.len(),
+                    });
+                }
             }
         }
         Ok(Verdict::Intact {
@@ -516,6 +589,54 @@ mod tests {
         assert_eq!(
             log.verify(Some(&head)).unwrap(),
             Verdict::Truncated { entries: 0 }
+        );
+    }
+
+    /// The recorded head is written by `append` itself, not only in tests — so
+    /// a truncation is caught end-to-end without anyone handing `verify` a head.
+    #[test]
+    fn append_records_the_head_so_truncation_is_caught_end_to_end() {
+        let (_d, log) = log();
+        for i in 0..4 {
+            log.append(who_test(), Surface::Socket, Decision::Approved, &format!("rec-{i}"), None, at(i))
+                .unwrap();
+        }
+        assert_eq!(
+            log.recorded_head().unwrap().as_deref(),
+            Some(log.head().unwrap().as_str()),
+            "append must record the head beside the log"
+        );
+
+        // Cut the last two entries; the sidecar is a separate file and still
+        // points at the cut-away head.
+        let lines: Vec<String> = std::fs::read_to_string(&log.path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        std::fs::write(&log.path, lines[..2].join("\n") + "\n").unwrap();
+
+        let expected = log.recorded_head().unwrap();
+        assert_eq!(
+            log.verify(expected.as_deref()).unwrap(),
+            Verdict::Truncated { entries: 2 },
+            "a truncation must be visible from the recorded head alone"
+        );
+    }
+
+    /// A head the log legitimately grew past (recorded before the last append
+    /// landed, e.g. a crash in that window) is not a truncation.
+    #[test]
+    fn a_head_the_log_grew_past_is_not_read_as_truncation() {
+        let (_d, log) = log();
+        let older = log
+            .append(who_test(), Surface::Socket, Decision::Approved, "rec-0", None, at(0))
+            .unwrap();
+        log.append(who_test(), Surface::Socket, Decision::Approved, "rec-1", None, at(1))
+            .unwrap();
+        assert!(
+            log.verify(Some(&older)).unwrap().is_intact(),
+            "a valid extension of the recorded head is intact, not truncated"
         );
     }
 

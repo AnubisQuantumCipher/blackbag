@@ -83,6 +83,30 @@ fn matches(item: &SecretItemView, query: &HashMap<String, String>) -> bool {
     })
 }
 
+/// The item a `CreateItem(replace=true)` should overwrite, if any.
+///
+/// `matches`/`search` is a *subset* test — every query pair present on the item
+/// — which is what SearchItems wants but is wrong for replace: an empty
+/// attribute set matches every item, and a partial set matches any item that
+/// merely has those attributes among more, so a client could overwrite an
+/// unrelated app's secret. Replace is therefore gated on an EXACT attribute-set
+/// match, and never fires on an empty set.
+fn replacement_target<'a>(
+    items: &'a [SecretItemView],
+    attributes: &HashMap<String, String>,
+) -> Option<&'a SecretItemView> {
+    if attributes.is_empty() {
+        return None;
+    }
+    items.iter().find(|it| {
+        it.attributes.len() == attributes.len()
+            && it
+                .attributes
+                .iter()
+                .all(|(k, v)| attributes.get(k) == Some(v))
+    })
+}
+
 // ── the live sessions ──────────────────────────────────────────────────────
 
 /// Sessions opened by clients, by their object path. Encryption state lives
@@ -273,12 +297,15 @@ impl CollectionIface {
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        // Overwrite an existing item with the same attributes when asked.
+        // Overwrite an existing item with the SAME attributes when asked. See
+        // `replacement_target`: `search` is a subset match (right for
+        // SearchItems, wrong for replace), so replace is gated on an exact
+        // attribute-set match to keep one client from clobbering another's item.
         let mut existing_id = String::new();
         if replace {
             if let Ok((items, _)) = search(&attributes).await {
-                if let Some(first) = items.first() {
-                    existing_id = first.id.clone();
+                if let Some(exact) = replacement_target(&items, &attributes) {
+                    existing_id = exact.id.clone();
                 }
             }
         }
@@ -668,4 +695,70 @@ pub fn doctor() -> Result<()> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod replace_target_tests {
+    use super::*;
+
+    fn item(id: &str, attrs: &[(&str, &str)]) -> SecretItemView {
+        SecretItemView {
+            id: id.to_string(),
+            label: String::new(),
+            attributes: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            created: 0,
+            modified: 0,
+        }
+    }
+
+    fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn an_exact_attribute_set_is_replaced() {
+        let items = vec![item("a", &[("service", "mail"), ("user", "me")])];
+        let target = replacement_target(&items, &query(&[("service", "mail"), ("user", "me")]));
+        assert_eq!(target.map(|i| i.id.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn an_empty_query_replaces_nothing() {
+        let items = vec![item("a", &[("service", "mail")])];
+        // A subset test would match every item here; replace must not.
+        assert!(replacement_target(&items, &query(&[])).is_none());
+    }
+
+    #[test]
+    fn a_subset_query_does_not_overwrite_a_larger_item() {
+        // App A's item has two attributes; App B asks to replace with only one
+        // of them. That is a subset, not the same item, so it must not match.
+        let items = vec![item("a", &[("service", "mail"), ("user", "me")])];
+        assert!(replacement_target(&items, &query(&[("service", "mail")])).is_none());
+    }
+
+    #[test]
+    fn a_superset_query_does_not_match_a_smaller_item() {
+        let items = vec![item("a", &[("service", "mail")])];
+        assert!(
+            replacement_target(&items, &query(&[("service", "mail"), ("user", "me")])).is_none()
+        );
+    }
+
+    #[test]
+    fn the_exact_item_is_chosen_among_similar_ones() {
+        let items = vec![
+            item("a", &[("service", "mail")]),
+            item("b", &[("service", "mail"), ("user", "me")]),
+            item("c", &[("service", "chat"), ("user", "me")]),
+        ];
+        let target = replacement_target(&items, &query(&[("service", "mail"), ("user", "me")]));
+        assert_eq!(target.map(|i| i.id.as_str()), Some("b"));
+    }
 }

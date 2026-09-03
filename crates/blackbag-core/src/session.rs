@@ -1347,16 +1347,35 @@ impl Agent {
         };
         line.zeroize();
 
-        let mut out = stream;
-        let written = serde_json::to_writer(&mut out, &response)
-            .map_err(anyhow::Error::from)
-            .and_then(|_| out.write_all(b"\n").map_err(Into::into))
-            .and_then(|_| out.flush().map_err(Into::into));
+        // Serialize into memory first, then drain it under a total wall-clock
+        // deadline. `serde_json::to_writer` streaming straight to the socket is
+        // a loop of small writes, and `set_write_timeout` (SO_SNDTIMEO) bounds
+        // one zero-progress write, not the loop — so a peer that trickle-reads
+        // the reply keeps every write making a little progress and holds this
+        // single-threaded agent for as long as it likes, across a suspend, with
+        // the data key resident. That is the same lock bypass the read path
+        // defends against, so the reply gets the same bound. See
+        // `write_response_line`.
+        let mut buf = match serde_json::to_vec(&response) {
+            Ok(mut buf) => {
+                buf.push(b'\n');
+                buf
+            }
+            Err(e) => {
+                if let Response::Secret { value } = &mut response {
+                    value.zeroize();
+                }
+                return Err(e.into());
+            }
+        };
         // Whatever happened on the wire, a revealed value does not outlive the
-        // request in this process.
+        // request in this process — not in `response`, and not in the bytes it
+        // was serialized into.
         if let Response::Secret { value } = &mut response {
             value.zeroize();
         }
+        let written = write_response_line(&stream, &buf);
+        buf.zeroize();
         written
     }
 
@@ -2841,6 +2860,53 @@ fn read_request_line(stream: &UnixStream, out: &mut Vec<u8>) -> Result<bool> {
             }
         }
     }
+}
+
+/// Write one reply, bounded in both bytes and wall-clock time — the mirror of
+/// [`read_request_line`].
+///
+/// `set_write_timeout` sets `SO_SNDTIMEO`, which bounds a single `write` that
+/// makes zero progress, not a loop of them. A peer that reads the reply one
+/// byte at a time keeps every write making a little progress, so no write ever
+/// times out and this single-threaded agent is held for as long as the peer
+/// dribbles — across a suspend, with the data key still in memory. So the reply
+/// is drained under a re-armed remaining-budget deadline and the agent gives up
+/// the moment the total exceeds `PEER_IO_TIMEOUT`. A local reply drains in
+/// milliseconds, so the only thing this refuses is a peer that will not read.
+fn write_response_line(stream: &UnixStream, buf: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let deadline = Instant::now() + PEER_IO_TIMEOUT;
+    let mut out = stream;
+    let mut sent = 0;
+    while sent < buf.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "peer did not drain the reply within {}s; dropped",
+                PEER_IO_TIMEOUT.as_secs()
+            );
+        }
+        // Re-armed each pass against the REMAINING budget, so the total is
+        // bounded however the peer paces its reads.
+        stream.set_write_timeout(Some(remaining))?;
+        match out.write(&buf[sent..]) {
+            Ok(0) => bail!("peer closed the connection before the reply was sent"),
+            Ok(n) => sent += n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // The write blocked for the whole remaining budget without
+                // draining; the next pass sees a zero budget and bails.
+                continue;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    out.flush()?;
+    Ok(())
 }
 
 /// Who a ceremony belongs to.
@@ -4738,6 +4804,45 @@ mod peer_pinning_tests {
         // The agent survived it and still answers.
         let reply = ask_at(&sock, &Request::Status).expect("the agent is still answering");
         assert!(matches!(reply, Response::Status(_)), "{reply:?}");
+    }
+
+    /// The reply direction gets the same wall-clock bound as the request one.
+    ///
+    /// A peer that asks for a large reply and then never reads it fills the
+    /// kernel send buffer, blocks the write, and — before this — held the
+    /// single-threaded agent until it chose to drain, across a suspend, with
+    /// the data key resident. `write_response_line` refuses that.
+    #[test]
+    fn a_peer_that_will_not_read_the_reply_is_dropped() {
+        let (server, _client) = UnixStream::pair().unwrap();
+        // Far larger than the socket buffers, so an unread reply blocks.
+        let buf = vec![b'x'; 4 * 1024 * 1024];
+        let started = Instant::now();
+        let result = write_response_line(&server, &buf);
+        assert!(result.is_err(), "a peer that never reads must be dropped");
+        assert!(
+            started.elapsed() < PEER_IO_TIMEOUT + Duration::from_secs(3),
+            "the reply write was not bounded: {:?}",
+            started.elapsed()
+        );
+        // `_client` stays open (never read) until here on purpose.
+    }
+
+    /// And a peer that actually reads gets the whole reply, however large.
+    #[test]
+    fn a_reader_that_drains_gets_the_whole_reply() {
+        use std::io::Read;
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let buf = vec![b'y'; 4 * 1024 * 1024];
+        let n = buf.len();
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).unwrap();
+            got.len()
+        });
+        write_response_line(&server, &buf).expect("a draining reader is served");
+        drop(server); // EOF, so the reader's read_to_end returns.
+        assert_eq!(reader.join().unwrap(), n);
     }
 }
 

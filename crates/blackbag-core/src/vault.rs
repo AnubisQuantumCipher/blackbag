@@ -29,7 +29,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroizing, ZeroizeOnDrop};
 
 use crate::crypto::{
     self, ArgonParams, Sealed, AAD_PAYLOAD, AAD_RECIPIENT_PASSPHRASE, AAD_RECIPIENT_PQ,
@@ -185,9 +185,17 @@ pub struct Payload {
 }
 
 /// Recovery key material handed to the user, never stored in the vault.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// The two byte vectors are private key material that opens the vault WITHOUT
+/// the passphrase, so they are wiped on drop (`ZeroizeOnDrop`) and never
+/// printed (hand-written `Debug` below) — the same discipline `SecretBuf`,
+/// `Guarded`, `Secret` and `Vault` already keep. The label and id are not
+/// secret and are skipped by the zeroizer (`Uuid` is not `Zeroize` anyway).
+#[derive(Serialize, Deserialize, ZeroizeOnDrop)]
 pub struct RecoveryKey {
+    #[zeroize(skip)]
     pub label: String,
+    #[zeroize(skip)]
     pub vault_id: Uuid,
     #[serde(with = "serde_bytes")]
     pub x25519_secret: Vec<u8>,
@@ -197,6 +205,20 @@ pub struct RecoveryKey {
     /// deterministically.
     #[serde(with = "serde_bytes")]
     pub mlkem_decapsulation_key: Vec<u8>,
+}
+
+/// Hand-written, never derived: a derived `Debug` would print the private key
+/// bytes that open the vault. One stray `{:?}` sink is all it would take, so
+/// the material is redacted the same way every other secret type here is.
+impl std::fmt::Debug for RecoveryKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryKey")
+            .field("label", &self.label)
+            .field("vault_id", &self.vault_id)
+            .field("x25519_secret", &"[redacted]")
+            .field("mlkem_decapsulation_key", &"[redacted]")
+            .finish()
+    }
 }
 
 /// How a vault was unlocked, so the UI can say so truthfully.
@@ -584,11 +606,14 @@ impl Vault {
         self.file.header.recipients.push(recipient);
         self.save()?;
 
+        // Wrap the array copies `to_bytes` returns so the intermediates are
+        // wiped once the Vecs own the bytes; the Vecs themselves are wiped by
+        // `RecoveryKey`'s `ZeroizeOnDrop`.
         Ok(RecoveryKey {
             label: label.to_string(),
             vault_id: self.file.header.vault_id,
-            x25519_secret: x_secret.to_bytes().to_vec(),
-            mlkem_decapsulation_key: mlkem_dk.to_bytes().to_vec(),
+            x25519_secret: Zeroizing::new(x_secret.to_bytes()).to_vec(),
+            mlkem_decapsulation_key: Zeroizing::new(mlkem_dk.to_bytes()).to_vec(),
         })
     }
 
@@ -1117,6 +1142,23 @@ mod tests {
             recovered.get(id).unwrap().field("body").unwrap().expose_str().unwrap().as_str(),
             "launch codes"
         );
+    }
+
+    /// The recovery private material never prints, the same as every other
+    /// secret type here. A stray `{:?}` sink must not become a key leak.
+    #[test]
+    fn a_recovery_key_redacts_its_private_material_in_debug() {
+        let key = RecoveryKey {
+            label: "yubi-offline".into(),
+            vault_id: Uuid::nil(),
+            x25519_secret: vec![0x11; 32],
+            mlkem_decapsulation_key: vec![0x22; 64],
+        };
+        let shown = format!("{key:?}");
+        assert!(shown.contains("[redacted]"), "not redacted: {shown}");
+        assert!(!shown.contains("17, 17"), "x25519 secret leaked: {shown}");
+        assert!(!shown.contains("34, 34"), "mlkem seed leaked: {shown}");
+        assert!(shown.contains("yubi-offline"), "the label is not secret: {shown}");
     }
 
     #[test]
