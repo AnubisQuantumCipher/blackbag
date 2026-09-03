@@ -1291,6 +1291,79 @@ fn percent_encode(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A tiny deterministic PRNG (SplitMix64), so a fuzz failure reproduces.
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// Every importer reads untrusted file text. Feeding structured-random and
+    /// mutated input to each must only ever return Ok/Err — never an index
+    /// panic, an unwrap on a short row, or an arithmetic overflow. The pool is
+    /// biased toward CSV and JSON punctuation so the structure-sensitive paths
+    /// are exercised, not just the "this is not our format" bail.
+    #[test]
+    fn arbitrary_text_never_panics_any_importer() {
+        let mut prng = SplitMix64::new(0x1073_5EED_0BAD_F00D);
+        // The delimiters and quoting characters that actually drive the parsers.
+        let pool: Vec<char> = "abc012,\"{}[]:\n\t \\/=@.-\r".chars().collect();
+        let corpus = [
+            "name,username,password,url,notes\na,b,c,d,e",
+            "{\"format\":\"black-bag-export\",\"records\":[]}",
+            "{\"items\":[{\"type\":1,\"name\":\"x\"}]}",
+            "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP",
+            "",
+        ];
+        let formats = [
+            ImportFormat::Bitwarden,
+            ImportFormat::Keepassxc,
+            ImportFormat::Firefox,
+            ImportFormat::Chrome,
+            ImportFormat::Csv,
+            ImportFormat::BlackBag,
+            ImportFormat::Cxf,
+        ];
+        for _ in 0..20_000 {
+            let mut text = if prng.next() & 1 == 0 {
+                String::from(corpus[(prng.next() as usize) % corpus.len()])
+            } else {
+                let n = (prng.next() % 200) as usize;
+                (0..n).map(|_| pool[(prng.next() as usize) % pool.len()]).collect()
+            };
+            // A few random edits.
+            for _ in 0..(prng.next() % 5) {
+                let chars: Vec<char> = text.chars().collect();
+                if chars.is_empty() {
+                    text.push(pool[(prng.next() as usize) % pool.len()]);
+                    continue;
+                }
+                let i = (prng.next() as usize) % chars.len();
+                match prng.next() % 3 {
+                    0 => {
+                        let mut c = chars.clone();
+                        c[i] = pool[(prng.next() as usize) % pool.len()];
+                        text = c.into_iter().collect();
+                    }
+                    1 => text = chars[..i].iter().collect(),
+                    _ => text.push(pool[(prng.next() as usize) % pool.len()]),
+                }
+            }
+            for f in formats {
+                // The whole contract: it returns. A panic fails the test.
+                let _ = parse(f, &text);
+            }
+        }
+    }
+
     #[test]
     fn csv_handles_quotes_newlines_and_bom() {
         let text = "\u{feff}a,b,c\r\n1,\"two, with comma\",\"three \"\"quoted\"\"\"\n\"multi\nline\",,\n";

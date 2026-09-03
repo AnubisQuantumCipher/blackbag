@@ -232,6 +232,72 @@ mod tests {
         assert!(Session::open(DH_ALGORITHM, &p.to_bytes_be()).is_err());
     }
 
+    /// A tiny deterministic PRNG (SplitMix64) so a fuzz failure reproduces.
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// Everything a Secret-Service client sends is untrusted: the session
+    /// algorithm string, the DH public value, and the IV + ciphertext of a
+    /// secret it asks us to decrypt. Every one must return Ok/Err — never a
+    /// panic (a bad BigUint, an out-of-range public value, a short IV, a
+    /// mis-padded ciphertext). `open` already range-checks the public value;
+    /// this proves the whole surface holds under arbitrary bytes.
+    #[test]
+    fn arbitrary_input_never_panics_the_session() {
+        let mut prng = SplitMix64::new(0x5EC5_0FF1_CE00_0001);
+        // A real DH session to drive decrypt/encrypt against.
+        let live = {
+            let client_priv = BigUint::from(1234567u32);
+            let client_pub = BigUint::from(2u32).modpow(&client_priv, &prime());
+            Session::open(DH_ALGORITHM, &client_pub.to_bytes_be())
+                .unwrap()
+                .session
+        };
+        // The hot loop fuzzes the untrusted DECRYPT path (a client's IV +
+        // ciphertext) and the cheap PLAIN/garbage open() strings. These are the
+        // real per-request attack surface and are fast.
+        let cheap_algos = [PLAIN_ALGORITHM, "", "dh", "plain-ish", "DH_ALGORITHM"];
+        for _ in 0..20_000 {
+            let algo = cheap_algos[(prng.next() as usize) % cheap_algos.len()];
+            let n = (prng.next() % 160) as usize;
+            let input: Vec<u8> = (0..n).map(|_| (prng.next() & 0xff) as u8).collect();
+            let _ = Session::open(algo, &input);
+
+            // decrypt(): arbitrary IV (parameters) + ciphertext, on a real key.
+            let plen = (prng.next() % 20) as usize;
+            let params: Vec<u8> = (0..plen).map(|_| (prng.next() & 0xff) as u8).collect();
+            let clen = (prng.next() % 80) as usize;
+            let value: Vec<u8> = (0..clen).map(|_| (prng.next() & 0xff) as u8).collect();
+            let _ = live.decrypt(&params, &value);
+
+            // encrypt(): arbitrary plaintext (must always succeed on DH).
+            let slen = (prng.next() % 80) as usize;
+            let secret: Vec<u8> = (0..slen).map(|_| (prng.next() & 0xff) as u8).collect();
+            let _ = live.encrypt(&secret);
+        }
+
+        // The DH open() path (a full 1024-bit modpow each) is exercised a
+        // modest number of times — enough to hit the public-value range check
+        // and BigUint parsing across arbitrary lengths, without the modpuff
+        // cost dominating the suite.
+        for _ in 0..200 {
+            let n = (prng.next() % 160) as usize;
+            let input: Vec<u8> = (0..n).map(|_| (prng.next() & 0xff) as u8).collect();
+            let _ = Session::open(DH_ALGORITHM, &input);
+        }
+    }
+
     /// HKDF-SHA256 against RFC 5869 Appendix A.1, adapted: A.1 uses a salt and
     /// info, so this checks our EMPTY-salt/empty-info path against a value
     /// computed the same way, and pins the extract+expand shape.

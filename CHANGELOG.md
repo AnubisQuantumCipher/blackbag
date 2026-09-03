@@ -62,10 +62,14 @@ a regression test.
   approval wait, or one idle client, wedged every other `ssh`; it is now one
   bounded thread per connection.
 
-The two untrusted-input CTAP parsers — the CTAPHID reassembler and the CTAP2
-CBOR request parser — also gained deterministic fuzz tests (seeded SplitMix64,
-hundreds of thousands of structured-random and mutated inputs each) that assert
-they only ever return, never panic. They run in the normal suite on stable.
+Every untrusted-input parser gained a deterministic fuzz test (seeded
+SplitMix64, tens to hundreds of thousands of structured-random and mutated
+inputs each) that asserts it only ever returns, never panics — no index
+out-of-bounds, no arithmetic underflow, no unwrap on attacker data. Covered:
+the CTAPHID reassembler and the CTAP2 CBOR request parser, all seven import
+formats, the SSH agent request path (`respond` + the wire reader), and the
+Secret Service session (algorithm negotiation, the DH public value, and a
+client's IV + ciphertext on decrypt). They run in the normal suite on stable.
 
 ### Security — supply-chain audit, and a vulnerable dependency removed
 

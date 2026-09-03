@@ -141,6 +141,56 @@ mod tests {
         w.into_bytes()
     }
 
+    /// A tiny deterministic PRNG (SplitMix64) so a fuzz failure reproduces.
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// The agent request is untrusted: it arrives length-prefixed off the
+    /// socket and is walked by the SSH wire reader. `respond` must always
+    /// return a reply (a failure frame at worst) — never an index panic or an
+    /// unwrap on a truncated length field. Requests are biased to start with a
+    /// real message type so the sign/list decoders are reached, not just the
+    /// unknown-type bail.
+    #[test]
+    fn arbitrary_requests_never_panic_respond() {
+        let mut prng = SplitMix64::new(0x0055_1234_ABCD_5555);
+        let types = [
+            client::REQUEST_IDENTITIES,
+            client::SIGN_REQUEST,
+            0x11,
+            0x00,
+            0xff,
+        ];
+        let mut f = Fake {
+            ids: vec![Identity {
+                key_blob: ed25519_public_blob(&[9; 32]),
+                comment: "k".into(),
+            }],
+            sign: Some(vec![1, 2, 3]),
+            last_signed: None,
+        };
+        for _ in 0..50_000 {
+            let n = (prng.next() % 300) as usize;
+            let mut req: Vec<u8> = (0..n).map(|_| (prng.next() & 0xff) as u8).collect();
+            if !req.is_empty() {
+                req[0] = types[(prng.next() as usize) % types.len()];
+            }
+            // The whole contract: it returns a reply. A panic fails the test.
+            let _ = respond(&mut f, &req);
+        }
+    }
+
     #[test]
     fn identities_are_listed_in_order_with_their_comments() {
         let mut f = Fake {
