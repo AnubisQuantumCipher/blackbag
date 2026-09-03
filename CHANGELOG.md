@@ -5,6 +5,21 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — supply-chain audit, and a vulnerable dependency removed
+
+- **`cargo-deny` is enforced in CI** (advisories, licences, sources, bans), with
+  a `deny.toml` whose licence allow-list is the exact set the tree resolves to.
+- It earned its keep on the first run: it flagged **RUSTSEC-2024-0398** in
+  `sharks 0.5.0`, the Shamir Secret Sharing crate — a bias that could leak a
+  secret shared hundreds of times. `sharks` turned out to be a **declared but
+  entirely unused** dependency (recovery uses hybrid X25519 + ML-KEM, not
+  Shamir), so it is simply removed. The vulnerability was never reachable, but
+  dead weight in the crypto dependency list is exactly what an audit should
+  clear out.
+- The workspace crates are marked `publish = false` — they are an application,
+  not crates.io libraries — which is both correct and what lets the audit
+  exempt the internal path dependency from its wildcard ban.
+
 ### Added — packaging and a fresh-box build
 
 - **`packaging/PKGBUILD`** builds the whole thing on Arch/Omarchy — the

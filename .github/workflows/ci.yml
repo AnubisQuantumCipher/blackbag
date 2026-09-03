@@ -190,3 +190,19 @@ jobs:
 
       - name: The AppStream metainfo is valid
         run: desktop-file-validate desktop/packaging/dev.blackbag.Deck.desktop
+
+  supply-chain:
+    name: supply-chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      # advisories: no known-vulnerable or yanked dependency.
+      # licenses: nothing outside the allow-list in deny.toml.
+      # sources: everything from crates.io.
+      # bans: no wildcard version requirements.
+      - name: cargo deny check
+        run: cargo deny check advisories licenses sources bans

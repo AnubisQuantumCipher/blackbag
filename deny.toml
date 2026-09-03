@@ -1,0 +1,56 @@
+# Supply-chain policy, enforced by `cargo deny check` in CI.
+#
+# Three questions it answers on every push: does anything in the dependency
+# tree carry a known vulnerability, does anything carry a licence this project
+# will not ship, and did a dependency slip in from an unexpected source. The
+# allow-list below is the exact set of licences the current tree resolves to —
+# a new dependency under anything else is a deliberate decision, made here.
+
+[advisories]
+version = 2
+# A known-vulnerable or yanked dependency fails the build. That is the whole
+# point of the check; a warning in a log nobody reads is not a gate.
+yanked = "deny"
+# RustSec ids to accept, with a reason each, when a fix is not yet available.
+# Empty: nothing is being carried.
+ignore = []
+
+[licenses]
+version = 2
+# Every licence the dependency tree actually resolves to today. Permissive
+# throughout, plus the Unicode data licence, MPL-2.0 (file-level copyleft, no
+# obligation on this project's own code), the BSD family, Zlib, and the public
+# domain dedications. LLVM-exception rides on Apache-2.0.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSD-1-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "MPL-2.0",
+  "CC0-1.0",
+  "Unlicense",
+  "MIT-0",
+  "LGPL-2.1-or-later",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two copies of one crate is a smell, not a crime — the tree has a few across
+# the async and crypto stacks. Surface it without failing the build.
+multiple-versions = "warn"
+# A wildcard version requirement is a real smell — EXCEPT the workspace's own
+# path dependencies (blackbag-cli -> blackbag-core), which carry no version by
+# design. allow-wildcard-paths exempts exactly those.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Everything must come from crates.io. A git or unknown-registry dependency is
+# a supply-chain surface that has to be chosen on purpose.
+unknown-registry = "deny"
+unknown-git = "deny"
