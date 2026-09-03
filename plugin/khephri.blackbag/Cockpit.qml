@@ -3387,6 +3387,12 @@ Item {
           onTextChanged: root.approvalPassphrase = text
           Keys.onReturnPressed: root.submitApproval()
           Keys.onEnterPressed: root.submitApproval()
+          // Escape backs out. This lives on the field, not the deck's key
+          // handler: while a prompt is up the field holds focus (so its
+          // passphrase is not swallowed), which means Escape arrives here, and
+          // the window-level Esc shortcut is deliberately disabled. Without
+          // this, an auto-raised prompt could only be dismissed with a pointer.
+          Keys.onEscapePressed: root.cancelApproval()
         }
 
         Text {
