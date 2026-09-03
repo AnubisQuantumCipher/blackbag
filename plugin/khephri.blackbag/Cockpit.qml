@@ -267,6 +267,7 @@ Item {
     if (onboardSheet.open_) onboardSheet.abandon()
     if (recoverSheet.open_) recoverSheet.clear()
     if (consentSheet.open_) consentSheet.standDown()
+    if (root.pendingApproval !== null) root.cancelApproval()
     if (manageSheet.open_) manageSheet.clear()
   }
 
@@ -293,6 +294,7 @@ Item {
     if (pending.length === 0) {
       // The ceremony was answered, expired, or the vault locked underneath it.
       if (consentSheet.open_) consentSheet.standDown()
+    if (root.pendingApproval !== null) root.cancelApproval()
       return
     }
     var next = pending[0]
@@ -438,6 +440,58 @@ Item {
 
   function primaryField(record) { return Model.primaryField(record) }
 
+  /// A read the agent would not serve until somebody approves it.
+  ///
+  /// The agent answers ApprovalRequired the first time a given program asks for
+  /// a given field, and the CLI exits 3 with a machine-readable line. The deck
+  /// cannot type into a process it spawned, so it asks here and re-runs the
+  /// same command with --approve, writing the passphrase on stdin.
+  property string copyPendingField: ""
+  property var pendingApproval: null
+  property string approvalPassphrase: ""
+  property string approvalError: ""
+
+  /// Did that exit mean "approve it first"?
+  ///
+  /// Exit code, not message text: the wording is for people, and matching on
+  /// it would break the moment it improved.
+  function isApprovalRequired(code) { return code === 3 }
+
+  function askApproval(kind, record, field) {
+    root.pendingApproval = { kind: kind, id: String(record.id), field: String(field),
+                             title: String(record.title || record.id) }
+    root.approvalPassphrase = ""
+    root.approvalError = ""
+    Qt.callLater(function () { approvalField.forceActiveFocus() })
+  }
+
+  function cancelApproval() {
+    root.pendingApproval = null
+    root.approvalPassphrase = ""
+    root.approvalError = ""
+    approvalField.text = ""
+    Qt.callLater(function () { if (root.unlocked) keyCatcher.forceActiveFocus() })
+  }
+
+  function submitApproval() {
+    if (!root.pendingApproval) return
+    if (root.approvalPassphrase.length === 0) {
+      root.approvalError = "type your master passphrase to approve"
+      return
+    }
+    var p = root.pendingApproval
+    approveProcess.kind = p.kind
+    approveProcess.command = p.kind === "copy"
+      ? ["black-bag", "agent", "reveal", p.id, p.field, "--approve",
+         "--to", "clipboard", "--clear-after", String(root.clipboardClearSec)]
+      : ["black-bag", "agent", "show", p.id, p.field, "--approve"]
+    if (p.kind === "show") {
+      root.showPendingId = p.id
+      root.showPendingField = p.field
+    }
+    approveProcess.running = true
+  }
+
   function copyField(record, field) {
     if (!record || !field) { root.actionNote = "no record selected"; return }
     // Setting `running` on a running Process is a silent no-op, so a second
@@ -455,6 +509,7 @@ Item {
          "--to", "clipboard", "--clear-after", String(root.clipboardClearSec)]
       : ["black-bag", "agent", "reveal", String(record.id), String(field),
          "--to", "clipboard", "--clear-after", String(root.clipboardClearSec)]
+    root.copyPendingField = String(field)
     copyProcess.running = true
     root.actionNote = "copying " + (isTotp ? "the current code" : field) + "…"
   }
@@ -771,6 +826,11 @@ Item {
     stderr: StdioCollector { waitForEnd: true }
     onExited: function (code) {
       var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+      if (root.isApprovalRequired(code)) {
+        root.actionNote = ""
+        if (root.selectedRecord) root.askApproval("copy", root.selectedRecord, root.copyPendingField)
+        return
+      }
       if (code !== 0) {
         root.actionError = err.length > 0 ? err : "copy failed"
         root.actionNote = ""
@@ -830,11 +890,57 @@ Item {
     }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function (code) {
+      if (root.isApprovalRequired(code)) {
+        // Not an error: nobody has approved this deck reading this field yet.
+        root.clearReveal()
+        if (root.selectedRecord)
+          root.askApproval("show", root.selectedRecord, root.showPendingField)
+        return
+      }
       if (code !== 0) {
         var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
         root.actionError = err.length > 0 ? err : "reveal failed"
         root.clearReveal()
       }
+    }
+  }
+
+  // Re-runs the read with the passphrase the owner just typed.
+  Process {
+    id: approveProcess
+    property string kind: "show"
+    running: false
+    stdinEnabled: true
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (approveProcess.kind !== "show") return
+        if (!root.selectedRecord || String(root.selectedRecord.id) !== root.showPendingId) return
+        root.revealedField = root.showPendingField
+        root.revealedFor = root.showPendingId
+        root.revealedValue = String(this.text || "").replace(/\n+$/, "")
+        root.revealSecondsLeft = Math.max(1, root.revealSeconds)
+      }
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onStarted: {
+      // On stdin, and the pipe closes at once. There is no --passphrase flag
+      // anywhere in this project: /proc/<pid>/cmdline is world-readable.
+      write(root.approvalPassphrase + "\n")
+      stdinEnabled = false
+    }
+    onExited: function (code) {
+      var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+      if (code !== 0) {
+        // Stay on the sheet so a mistyped passphrase can be retried without
+        // starting the whole read again.
+        root.approvalError = err.length > 0 ? err : "that did not work"
+        root.approvalPassphrase = ""
+        approvalField.text = ""
+        return
+      }
+      root.actionNote = approveProcess.kind === "copy" && err.length > 0 ? err : root.actionNote
+      root.cancelApproval()
     }
   }
 
@@ -950,13 +1056,13 @@ Item {
       // while you are typing into a field.
       Shortcut {
         sequences: ["Esc"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_ && root.pendingApproval === null
         context: Qt.WindowShortcut
         onActivated: root.backOut()
       }
       Shortcut {
         sequences: ["Ctrl+L"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_ && root.unlocked
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_ && root.pendingApproval === null && root.unlocked
         context: Qt.WindowShortcut
         onActivated: root.doLock()
       }
@@ -990,7 +1096,7 @@ Item {
 
       Shortcut {
         sequences: ["Ctrl+R"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_ && root.pendingApproval === null
         context: Qt.WindowShortcut
         onActivated: {
           refreshProcess.running = true
@@ -1004,7 +1110,7 @@ Item {
       Shortcut {
         sequences: ["Ctrl+M"]
         enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_
-                 && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_
+                 && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_ && root.pendingApproval === null
         context: Qt.WindowShortcut
         onActivated: manageSheet.begin("passphrase")
       }
@@ -1014,19 +1120,28 @@ Item {
         sequences: ["Ctrl+K"]
         enabled: root.opened && !root.unlocked && !recordEditor.open_
                  && !onboardSheet.open_ && !recoverSheet.open_
-                 && !consentSheet.open_
+                 && !consentSheet.open_ && root.pendingApproval === null
                  && Model.canRecover(root.status)
         context: Qt.WindowShortcut
         onActivated: recoverSheet.begin()
       }
       Shortcut {
         sequences: ["Ctrl+B"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_ && root.unlocked
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_ && root.pendingApproval === null && root.unlocked
         context: Qt.WindowShortcut
         onActivated: root.requestBreachCheck()
       }
 
       Keys.onPressed: function (event) {
+        // A sheet that owns the keyboard owns ALL of it. Without this, typing
+        // a passphrase into the approval sheet reached the deck's own map —
+        // where Return means "copy the selected record" — so approving one read
+        // silently started another. Gate first, ask questions later.
+        if (root.pendingApproval !== null) {
+          if (event.key === Qt.Key_Escape) root.cancelApproval()
+          event.accepted = true
+          return
+        }
         // The first-run sheet owns the keyboard while it is up. Esc abandons
         // it; everything else belongs to its own fields.
         if (onboardSheet.open_) {
@@ -2920,6 +3035,136 @@ Item {
           renderType: Text.NativeRendering
         }
       }
+
+    // ── first-use approval ────────────────────────────────────────────────
+    //
+    // The vault is open; this is not an unlock. It is asked because the socket
+    // cannot tell this deck from anything else running as you, and a click
+    // could be synthesised by any of them.
+    Rectangle {
+      id: approvalSheet
+      anchors.fill: parent
+      visible: root.pendingApproval !== null
+      color: Util.alpha(Color.background, 0.97)
+
+      // Asserted on the transition rather than only from askApproval: the
+      // sheet becomes visible a frame later, and focus given to an invisible
+      // item does not stick.
+      onVisibleChanged: if (visible) Qt.callLater(function () {
+        approvalField.forceActiveFocus()
+      })
+
+      MouseArea { anchors.fill: parent; hoverEnabled: true; onClicked: {} }
+
+      ColumnLayout {
+        anchors.centerIn: parent
+        width: Math.min(parent.width - metric.space(80), metric.space(620))
+        spacing: metric.space(14)
+
+        Text {
+          text: "APPROVE THIS READ"
+          color: Util.alpha(Color.foreground, 0.5)
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
+          font.letterSpacing: metric.spaceReal(1.6)
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+        }
+
+        Rectangle {
+          Layout.fillWidth: true
+          implicitHeight: whatCol.implicitHeight + metric.space(24)
+          radius: metric.cornerRadius
+          color: Util.alpha(Color.accent, 0.07)
+          border.width: Math.max(1, metric.spacing.hairline)
+          border.color: Util.alpha(Color.accent, 0.4)
+          ColumnLayout {
+            id: whatCol
+            anchors.left: parent.left; anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: metric.space(18); anchors.rightMargin: metric.space(18)
+            spacing: metric.space(2)
+            Text {
+              Layout.fillWidth: true
+              text: root.pendingApproval
+                ? String(root.pendingApproval.field) + " of " + String(root.pendingApproval.title)
+                : ""
+              color: Color.accent
+              font.family: metric.font.family
+              font.pixelSize: metric.font.body
+              font.bold: true
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              renderType: Text.NativeRendering
+            }
+            Text {
+              Layout.fillWidth: true
+              text: root.pendingApproval && root.pendingApproval.kind === "copy"
+                ? "onto the clipboard, cleared after " + root.clipboardClearSec + "s"
+                : "on screen, for " + root.revealSeconds + "s"
+              color: Util.alpha(Color.foreground, 0.55)
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
+              textFormat: Text.PlainText
+              renderType: Text.NativeRendering
+            }
+          }
+        }
+
+        Text {
+          Layout.fillWidth: true
+          text: "The vault is already open. This is asked once per program and "
+              + "field, and remembered until the vault locks — because the "
+              + "socket cannot tell this deck from anything else running as you."
+          color: Util.alpha(Color.foreground, 0.5)
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
+          wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+        }
+
+        TextField {
+          id: approvalField
+          Layout.fillWidth: true
+          echoMode: TextInput.Password
+          placeholderText: "master passphrase"
+          font.family: metric.font.family
+          font.pixelSize: metric.font.body
+          onTextChanged: root.approvalPassphrase = text
+          Keys.onReturnPressed: root.submitApproval()
+          Keys.onEnterPressed: root.submitApproval()
+        }
+
+        Text {
+          Layout.fillWidth: true
+          visible: root.approvalError.length > 0
+          text: root.approvalError
+          color: Color.urgent
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
+          wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+        }
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: metric.space(12)
+          Item { Layout.fillWidth: true }
+          ActionButton {
+            label: "CANCEL"
+            tone: Util.alpha(Color.foreground, 0.6)
+            onActivated: root.cancelApproval()
+          }
+          ActionButton {
+            label: "APPROVE"
+            tone: Color.accent
+            onActivated: root.submitApproval()
+          }
+        }
+      }
+    }
 
     // ── everything else the engine can do ─────────────────────────────────
     // The passkey prompt sits above every other sheet, because it is the only
