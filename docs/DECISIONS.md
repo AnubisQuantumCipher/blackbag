@@ -48,6 +48,40 @@ Owner's ruling: *"you're right, I was wrong."*
 - **Never BS = 1 with BE = 0.**
 - The state machine gets unit tests.
 
+### Done. What it took, and what it is allowed to claim
+
+BS needed something true to be computed *from*, so `black-bag backup` was
+built first (it was already a §3.4 gap). It copies the sealed file — nothing is
+decrypted, so it works while you are locked out — reads the copy back, checks
+the digest, and records `{at, vault_id, epoch, path, digest, bytes}` in
+`<state>/backups.json`.
+
+The log lives **outside** the vault deliberately. Inside, it would be copied
+into the backup and so claim to know about itself, and it would travel with the
+file — a vault carried to another machine would arrive asserting it is backed
+up on a disk that machine cannot see. Outside, a restored vault reports BS=0
+until a backup is taken there, which is the truth on that machine.
+
+`BS = 1` means: a recorded copy of this vault is still at its path, still the
+size it was, and was taken at a vault epoch at or after the one this credential
+was written in. Records carry `created_epoch` for that comparison; one written
+before the field existed has no epoch to compare and reports not-backed-up
+until the next backup covers it for certain.
+
+**The limit, stated rather than papered over:** a copy that still exists but
+has been *replaced* is not detected until `black-bag backup --verify` (or `^K`
+in the deck) re-reads it. A digest on every assertion would put a disk read in
+the signing path.
+
+BS is read live on every ceremony, so deleting the backup turns it off again —
+which is what makes it truthful rather than a one-way boast. Both directions
+are tested end to end through the agent, and the whole flag space is walked in
+`passkey::flag_state_machine`.
+
+The deck grew a BACKUP section, because the owner drives the GUI: a backup you
+can only take from a terminal is one that does not get taken, and BS would then
+never leave 0.
+
 ## D3 — `passkey-rs`: borrow, do not adopt
 
 Keep our authenticator. `passkey-authenticator` is ES256-only, its PRF is the

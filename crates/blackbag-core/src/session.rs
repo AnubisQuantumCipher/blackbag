@@ -821,6 +821,13 @@ pub struct Agent {
     approvals: crate::policy::Approvals,
     /// Where the history goes. `None` in tests that do not want a file.
     audit_path: Option<PathBuf>,
+    /// Where the record of backups is read from.
+    ///
+    /// Configurable for the same reason the audit path is: a test that used
+    /// the real one would read whatever this machine happens to have backed
+    /// up, and a passkey test would then pass or fail depending on the
+    /// operator's disk rather than on the code.
+    backup_log_path: Option<PathBuf>,
 }
 
 struct OpenVault {
@@ -858,6 +865,7 @@ impl Agent {
             peer: None,
             approvals: crate::policy::Approvals::new(),
             audit_path: None,
+            backup_log_path: crate::backup::Log::default_path().ok(),
         }
     }
 
@@ -904,6 +912,12 @@ impl Agent {
     /// whose value is that it is trustworthy the one file full of noise.
     pub fn with_audit_path(mut self, path: PathBuf) -> Self {
         self.audit_path = Some(path);
+        self
+    }
+
+    /// Where the record of backups is read from. See the field comment.
+    pub fn with_backup_log_path(mut self, path: PathBuf) -> Self {
+        self.backup_log_path = Some(path);
         self
     }
 
@@ -1677,21 +1691,37 @@ impl Agent {
                 // exact frozen request. That — and only that — is what sets UV.
                 let user_verified = true;
 
+                // BS is a live fact, not a stored one: a backup can be deleted
+                // between one ceremony and the next, so it is read now rather
+                // than remembered. A log that will not load is treated as "no
+                // backup", which understates rather than overstates.
+                let backups = self
+                    .backup_log_path
+                    .as_ref()
+                    .and_then(|p| crate::backup::Log::load(p).ok())
+                    .unwrap_or_default();
+
                 match ceremony.operation {
                     Operation::Create => {
                         let handle = ceremony
                             .user_handle
                             .clone()
                             .ok_or_else(|| anyhow!("a new passkey needs a user handle"))?;
-                        let (created, seed) = crate::passkey::Credential::create(
-                            &ceremony.rp_id,
-                            ceremony.rp_name.clone(),
-                            handle,
-                            ceremony.user_name.clone(),
-                            ceremony.user_display_name.clone(),
-                            user_verified,
-                            ceremony.want_prf,
-                        )?;
+                        let (created, seed) =
+                            crate::passkey::Credential::create(crate::passkey::NewCredential {
+                                rp_id: ceremony.rp_id.clone(),
+                                rp_name: ceremony.rp_name.clone(),
+                                user_handle: handle,
+                                user_name: ceremony.user_name.clone(),
+                                user_display_name: ceremony.user_display_name.clone(),
+                                user_verified,
+                                with_prf: ceremony.want_prf,
+                                // A credential being created right now cannot
+                                // be in a backup taken before it existed. It
+                                // becomes backed up at the next
+                                // `black-bag backup`, and says so from then on.
+                                backed_up: false,
+                            })?;
 
                         let mut record = crate::record::Record::new(
                             crate::record::Kind::Passkey,
@@ -1750,6 +1780,24 @@ impl Agent {
                             .map(|s| s.open());
                         let credential = crate::passkey::credential_from_record(record)?;
 
+                        // Is a copy of this vault, containing THIS credential,
+                        // known to exist right now? A backup taken before the
+                        // credential was written does not contain it, so the
+                        // epochs are compared rather than merely asking whether
+                        // any backup exists.
+                        //
+                        // A record written before `created_epoch` existed has
+                        // no epoch to compare, and there is no honest way to
+                        // guess one: it reports not-backed-up until the next
+                        // backup, which then covers it for certain.
+                        let backed_up = match (
+                            backups.backed_up_through(open.vault.vault_id()),
+                            record.created_epoch,
+                        ) {
+                            (Some(through), Some(written_at)) => written_at <= through,
+                            _ => false,
+                        };
+
                         // Re-checked at the moment of signing, not merely when
                         // the ceremony was registered: the vault can be
                         // refreshed from disk in between.
@@ -1760,7 +1808,12 @@ impl Agent {
                             ceremony.cross_origin,
                         );
                         let asserted =
-                            credential.assert(&ceremony.origin, &client_data, user_verified)?;
+                            credential.assert(
+                                &ceremony.origin,
+                                &client_data,
+                                user_verified,
+                                backed_up,
+                            )?;
 
                         // The PRF is evaluated only when the credential
                         // actually carries a seed AND the relying party asked.
@@ -2539,6 +2592,7 @@ mod tests {
     pub(super) fn spawn_test_agent(idle_secs: u64, max_secs: u64) -> (tempfile::TempDir, PathBuf, PathBuf) {
         use crate::vault::Vault;
         crate::vault::Witness::isolate_for_tests();
+        crate::backup::Log::isolate_for_tests();
         let dir = tempfile::TempDir::new().unwrap();
         let vault = dir.path().join("vault.cbor");
         Vault::init(&vault, b"agent test passphrase", 32_768).unwrap();
@@ -2547,7 +2601,8 @@ mod tests {
         let agent = Agent::new(vault.clone(), idle_secs)
             .with_max_session_secs(max_secs)
             .with_status_dir(status_dir)
-            .with_audit_path(dir.path().join("audit.jsonl"));
+            .with_audit_path(dir.path().join("audit.jsonl"))
+            .with_backup_log_path(dir.path().join("backups.json"));
         let sock_for_thread = sock.clone();
         std::thread::spawn(move || {
             if let Err(e) = agent.serve_at(&sock_for_thread) {
@@ -2800,6 +2855,162 @@ mod passkey_agent_tests {
             panic!("create did not complete")
         };
         credential_id
+    }
+
+    /// BS is not a boast. It is 0 while nothing holds a copy of this vault,
+    /// and 1 once something does — for the same credential, in the same
+    /// session, with nothing else changed.
+    #[test]
+    fn the_backup_flag_follows_the_actual_backup() {
+        use crate::passkey::flags;
+
+        let (dir, vault_path, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = make_one(&sock, "example.com");
+
+        let flags_now = |allow: &str| -> u8 {
+            let Response::PasskeyRegistered { nonce, .. } = begin(
+                &sock,
+                Operation::Assert,
+                "https://example.com",
+                "example.com",
+                vec![allow.to_string()],
+            ) else {
+                panic!("assert was not registered")
+            };
+            ask_at(
+                &sock,
+                &Request::PasskeyAnswer {
+                    nonce: nonce.clone(),
+                    approve: true,
+                    credential_id: Some(allow.to_string()),
+                    passphrase: Zeroizing::new(PASS.into()),
+                },
+            )
+            .unwrap();
+            let Response::PasskeyResult {
+                authenticator_data, ..
+            } = ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap()
+            else {
+                panic!("assert did not complete")
+            };
+            let bytes = unhex(&authenticator_data).unwrap();
+            // rpIdHash(32) || flags(1) || signCount(4)
+            bytes[32]
+        };
+
+        let before = flags_now(&id);
+        assert_eq!(
+            before & flags::BS,
+            0,
+            "nothing has copied this vault, so BS must be 0"
+        );
+        assert_eq!(before & flags::BE, flags::BE, "BE is set regardless");
+
+        // Take a real backup: copy the sealed file and record it, exactly as
+        // `black-bag backup` does.
+        let copy = dir.path().join("offsite.cbor");
+        let bytes = std::fs::read(&vault_path).unwrap();
+        std::fs::write(&copy, &bytes).unwrap();
+        let file: crate::vault::VaultFile =
+            ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let mut log = crate::backup::Log::default();
+        log.push(crate::backup::Entry {
+            at: Utc::now(),
+            vault_id: file.header.vault_id,
+            epoch: file.header.epoch,
+            path: copy.clone(),
+            digest: crate::backup::digest_of(&bytes),
+            bytes: bytes.len() as u64,
+        });
+        log.save(&dir.path().join("backups.json")).unwrap();
+
+        let after = flags_now(&id);
+        assert_eq!(
+            after & flags::BS,
+            flags::BS,
+            "a copy of this vault exists and contains this credential, so BS is 1"
+        );
+        assert_eq!(after & flags::BE, flags::BE, "BE did not move");
+
+        // And it goes back down. This is the half that makes it truthful
+        // rather than a one-way switch: delete the copy, and the credential
+        // stops claiming to be backed up.
+        std::fs::remove_file(&copy).unwrap();
+        assert_eq!(
+            flags_now(&id) & flags::BS,
+            0,
+            "a deleted backup must stop being asserted"
+        );
+    }
+
+    /// A credential minted after the last backup is not in it.
+    #[test]
+    fn a_credential_newer_than_the_backup_is_not_backed_up() {
+        use crate::passkey::flags;
+
+        let (dir, vault_path, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let old = make_one(&sock, "example.com");
+
+        // Back up now — this copy contains `old` and nothing after it.
+        let copy = dir.path().join("offsite.cbor");
+        let bytes = std::fs::read(&vault_path).unwrap();
+        std::fs::write(&copy, &bytes).unwrap();
+        let file: crate::vault::VaultFile =
+            ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let mut log = crate::backup::Log::default();
+        log.push(crate::backup::Entry {
+            at: Utc::now(),
+            vault_id: file.header.vault_id,
+            epoch: file.header.epoch,
+            path: copy,
+            digest: crate::backup::digest_of(&bytes),
+            bytes: bytes.len() as u64,
+        });
+        log.save(&dir.path().join("backups.json")).unwrap();
+
+        let new = make_one(&sock, "later.example");
+
+        let flags_of = |cred: &str, rp: &str| -> u8 {
+            let Response::PasskeyRegistered { nonce, .. } = begin(
+                &sock,
+                Operation::Assert,
+                &format!("https://{rp}"),
+                rp,
+                vec![cred.to_string()],
+            ) else {
+                panic!("assert was not registered")
+            };
+            ask_at(
+                &sock,
+                &Request::PasskeyAnswer {
+                    nonce: nonce.clone(),
+                    approve: true,
+                    credential_id: Some(cred.to_string()),
+                    passphrase: Zeroizing::new(PASS.into()),
+                },
+            )
+            .unwrap();
+            let Response::PasskeyResult {
+                authenticator_data, ..
+            } = ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap()
+            else {
+                panic!("assert did not complete")
+            };
+            unhex(&authenticator_data).unwrap()[32]
+        };
+
+        assert_eq!(
+            flags_of(&old, "example.com") & flags::BS,
+            flags::BS,
+            "the credential the backup contains says so"
+        );
+        assert_eq!(
+            flags_of(&new, "later.example") & flags::BS,
+            0,
+            "a credential minted after the backup is not in it, and must not claim to be"
+        );
     }
 
     #[test]

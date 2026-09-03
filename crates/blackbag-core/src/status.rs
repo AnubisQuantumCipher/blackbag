@@ -263,6 +263,12 @@ pub struct Status {
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub epoch: Option<u64>,
+    /// The highest vault epoch known to exist in a copy somewhere else, if
+    /// any. `None` means nothing on this machine has a record of a copy —
+    /// which is also what a restored vault reports until a backup is taken
+    /// here, because that is the truth on this machine.
+    #[serde(default)]
+    pub backed_up_through: Option<u64>,
     pub witness_epoch: Option<u64>,
     pub rollback_suspected: bool,
     pub recipients: Vec<RecipientView>,
@@ -287,6 +293,7 @@ impl Status {
             vault_path: vault_path.display().to_string(),
             vault_format: None,
             vault_id: None,
+            backed_up_through: None,
             created_at: None,
             updated_at: None,
             epoch: None,
@@ -308,6 +315,13 @@ impl Status {
                 status.created_at = Some(file.header.created_at);
                 status.updated_at = Some(file.header.updated_at);
                 status.epoch = Some(file.header.epoch);
+
+                // What is known about copies of this vault. A log that will
+                // not load is treated as "nothing known", which understates.
+                status.backed_up_through = crate::backup::Log::default_path()
+                    .and_then(|p| crate::backup::Log::load(&p))
+                    .ok()
+                    .and_then(|log| log.backed_up_through(file.header.vault_id));
 
                 let witness = Witness::seen_epoch(file.header.vault_id);
                 status.witness_epoch = witness;
@@ -379,6 +393,25 @@ impl Status {
                     "losing the passphrase means losing the vault",
                 ));
             }
+            // A recovery key and a backup are not the same thing, and having
+            // one is not having the other: a recovery key opens this vault, and
+            // is no use at all if the file itself is gone.
+            match (self.epoch, self.backed_up_through) {
+                (_, None) => out.push(Finding::note(
+                    "NO_BACKUP",
+                    "No copy of this vault is known to exist",
+                    "losing the file loses everything in it · black-bag backup --to <path>",
+                )),
+                (Some(now), Some(through)) if through < now => out.push(Finding::note(
+                    "STALE_BACKUP",
+                    "The last known copy is behind this vault",
+                    &format!(
+                        "copied at epoch {through}, now at {now} · passkeys written since \
+                         report themselves not backed up"
+                    ),
+                )),
+                _ => {}
+            }
         }
 
         out.extend(self.host.findings());
@@ -442,6 +475,62 @@ pub fn set_owner_only(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("failed to restrict {}", path.display()))
+}
+
+#[cfg(test)]
+mod backup_finding_tests {
+    use super::*;
+    use crate::vault::{Vault, Witness};
+    use tempfile::TempDir;
+
+    /// Probe a throwaway vault, then say what is known about copies of it.
+    /// Only the two fields under test are overridden, so the rest of the
+    /// findings come out exactly as they would in the field.
+    fn ids(epoch: Option<u64>, through: Option<u64>) -> Vec<String> {
+        Witness::isolate_for_tests();
+        crate::backup::Log::isolate_for_tests();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vault.cbor");
+        Vault::init(&path, b"pass pass pass", 32_768).unwrap();
+        let mut status = Status::probe(&path, SessionView::default(), HostPosture::measure());
+        status.epoch = epoch;
+        status.backed_up_through = through;
+        status
+            .derive_findings()
+            .iter()
+            .map(|f| f.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_vault_nobody_has_copied_says_so() {
+        let ids = ids(Some(9), None);
+        assert!(ids.iter().any(|i| i == "NO_BACKUP"), "{ids:?}");
+        assert!(!ids.iter().any(|i| i == "STALE_BACKUP"), "{ids:?}");
+    }
+
+    #[test]
+    fn a_copy_that_has_fallen_behind_says_so() {
+        let ids = ids(Some(12), Some(9));
+        assert!(ids.iter().any(|i| i == "STALE_BACKUP"), "{ids:?}");
+        assert!(!ids.iter().any(|i| i == "NO_BACKUP"), "{ids:?}");
+    }
+
+    /// The quiet case. A current copy earns no note at all — a finding that
+    /// fires when everything is fine is a finding people learn to skip.
+    #[test]
+    fn a_current_copy_earns_no_note() {
+        let ids = ids(Some(9), Some(9));
+        assert!(!ids.iter().any(|i| i == "NO_BACKUP" || i == "STALE_BACKUP"), "{ids:?}");
+    }
+
+    /// A copy ahead of the vault is not stale. It happens legitimately: the
+    /// vault was restored from that copy and has not been written since.
+    #[test]
+    fn a_copy_ahead_of_the_vault_is_not_stale() {
+        let ids = ids(Some(4), Some(9));
+        assert!(!ids.iter().any(|i| i == "STALE_BACKUP"), "{ids:?}");
+    }
 }
 
 #[cfg(test)]

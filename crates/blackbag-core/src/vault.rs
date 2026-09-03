@@ -611,13 +611,31 @@ impl Vault {
         &self.payload.records
     }
 
-    pub fn add_record(&mut self, record: Record) -> Result<()> {
+    pub fn add_record(&mut self, mut record: Record) -> Result<()> {
         record.validate()?;
         if self.payload.records.len() >= MAX_RECORDS {
             bail!("vault is full (max {MAX_RECORDS} records)");
         }
+        // The epoch this will be saved AT, not the one it was loaded at: save
+        // increments before writing, so a record added now lands in epoch+1.
+        // Off by one in the other direction would claim a backup taken before
+        // this record contains it.
+        record.created_epoch = Some(self.file.header.epoch + 1);
         self.payload.records.push(record);
         Ok(())
+    }
+
+    /// The epoch the next `save` will write.
+    pub fn next_epoch(&self) -> u64 {
+        self.file.header.epoch + 1
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.file.header.epoch
+    }
+
+    pub fn vault_id(&self) -> Uuid {
+        self.file.header.vault_id
     }
 
     pub fn get(&self, id: Uuid) -> Option<&Record> {
@@ -1506,7 +1524,6 @@ mod passkey_lookup_tests {
             user_display_name: None,
             algorithm: ALG_ES256,
             prf: false,
-            backed_up: false,
         });
         r
     }

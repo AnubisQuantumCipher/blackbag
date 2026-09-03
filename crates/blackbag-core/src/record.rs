@@ -270,6 +270,15 @@ pub struct Record {
     /// default, without which an older vault fails to parse.
     #[serde(default)]
     pub passkey: Option<crate::passkey::PasskeyConfig>,
+    /// The vault epoch this record was first written at.
+    ///
+    /// Used for one thing: deciding whether a backup taken at some epoch
+    /// contains this record, which is what the WebAuthn BS flag reports.
+    /// `None` on every record written before the field existed — those fall
+    /// back to comparing timestamps, which is less precise and errs toward
+    /// "not backed up".
+    #[serde(default)]
+    pub created_epoch: Option<u64>,
     pub notes: Option<Secret>,
 }
 
@@ -287,6 +296,9 @@ impl Record {
             fields: Vec::new(),
             totp: None,
             passkey: None,
+            // Stamped by the vault when the record is actually written: only
+            // the vault knows what epoch that will be.
+            created_epoch: None,
             notes: None,
         }
     }

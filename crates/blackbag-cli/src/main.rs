@@ -62,6 +62,14 @@ enum Command {
     Agent(AgentCommand),
     /// Show who asked for what, and whether the record still holds.
     Audit(AuditArgs),
+    /// Copy this vault somewhere else, and say what is known about the copies.
+    ///
+    /// The copy is the sealed file, unchanged: it is already encrypted, and
+    /// re-encrypting it under a second passphrase would create a second thing
+    /// to forget. What this adds over `cp` is the record — what was copied,
+    /// when, at what epoch, and its digest — which is what lets a passkey say
+    /// truthfully whether it is backed up.
+    Backup(BackupArgs),
     /// Report vault and host posture.
     Doctor(DoctorArgs),
     /// Write status.json for the cockpit.
@@ -412,6 +420,23 @@ struct AuditArgs {
 }
 
 #[derive(Args)]
+struct BackupArgs {
+    /// Where to write the copy. Put it on something that is not this disk.
+    #[arg(long = "to")]
+    to: Option<PathBuf>,
+    /// List what is known about copies of this vault, and whether they are
+    /// still there.
+    #[arg(long)]
+    list: bool,
+    /// Re-read every recorded copy and check it byte for byte.
+    #[arg(long)]
+    verify: bool,
+    /// Machine-readable, for the deck.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct DoctorArgs {
     #[arg(long)]
     json: bool,
@@ -529,6 +554,7 @@ fn run(hardening: harden::HardenReport) -> Result<()> {
         Command::Recovery(cmd) => cmd_recovery(&path, cmd),
         Command::Agent(cmd) => cmd_agent(&path, cmd, hardening),
         Command::Audit(args) => cmd_audit(args),
+        Command::Backup(args) => cmd_backup(&path, args),
         Command::Doctor(args) => cmd_doctor(&path, args, hardening),
         Command::Status(args) => cmd_status(&path, args, hardening),
         Command::Gen(cmd) => cmd_gen(cmd),
@@ -1666,6 +1692,148 @@ where
 /// The log is read from disk rather than asked of the agent: it outlives any
 /// one agent, and a history you can only see by asking the thing being audited
 /// is not much of a history.
+/// Copy the vault, and answer what is known about the copies.
+///
+/// The vault is copied as it sits, sealed. Nothing is decrypted, so this does
+/// not ask for a passphrase and does not need the vault to be open — the one
+/// operation in this program that is safe to run while you are locked out.
+fn cmd_backup(path: &std::path::Path, args: BackupArgs) -> Result<()> {
+    use chrono::Utc;
+    use blackbag_core::backup::{Entry, Log, digest_of};
+
+    let log_path = Log::default_path()?;
+    let mut log = Log::load(&log_path)?;
+
+    if args.list || args.verify {
+        if args.json {
+            let rows: Vec<serde_json::Value> = log
+                .entries
+                .iter()
+                .map(|e| {
+                    // Same words the human output uses. A copy read in full
+                    // and found unchanged is "intact"; one whose size merely
+                    // looks right is "present". Two names for one state, one
+                    // in each output, would be a difference people chase.
+                    let state = if args.verify {
+                        match e.verify() {
+                            Ok(blackbag_core::backup::State::Present) => "intact".to_string(),
+                            Ok(s) => s.as_str().to_string(),
+                            Err(err) => format!("unreadable: {err}"),
+                        }
+                    } else {
+                        e.state().as_str().to_string()
+                    };
+                    serde_json::json!({
+                        "at": e.at,
+                        "vault_id": e.vault_id,
+                        "epoch": e.epoch,
+                        "path": e.path,
+                        "bytes": e.bytes,
+                        "state": state,
+                        // Whether the state came from reading the file or only
+                        // from its size. The deck says which, because they are
+                        // different claims.
+                        "checked": if args.verify { "digest" } else { "size" },
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string(&rows)?);
+            return Ok(());
+        }
+        if log.entries.is_empty() {
+            println!("No copies of any vault have been made from this machine.");
+            return Ok(());
+        }
+        for e in &log.entries {
+            // --verify reads the file; without it, existence and size.
+            let state = if args.verify {
+                match e.verify() {
+                    // "intact" rather than "present": --verify read every byte
+                    // and they were the bytes that were written.
+                    Ok(blackbag_core::backup::State::Present) => "intact".to_string(),
+                    Ok(s) => s.as_str().to_string(),
+                    Err(err) => format!("unreadable: {err}"),
+                }
+            } else {
+                e.state().as_str().to_string()
+            };
+            println!(
+                "{}  epoch {:<6} {:<10} {}",
+                e.at.format("%Y-%m-%d %H:%M:%S"),
+                e.epoch,
+                state,
+                e.path.display()
+            );
+        }
+        // Say plainly what a bare --list did and did not check, so "present"
+        // is never mistaken for "verified".
+        if !args.verify {
+            println!("\n(present = the file is there at the size it was; --verify re-reads it)");
+        }
+        return Ok(());
+    }
+
+    let Some(to) = args.to else {
+        bail!("say where the copy goes: --to <path>, or --list to see what is known");
+    };
+
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let file: blackbag_core::vault::VaultFile = ciborium::de::from_reader(bytes.as_slice())
+        .with_context(|| format!("{} is not a vault", path.display()))?;
+
+    if to == path {
+        bail!("that is the vault itself; a copy has to go somewhere else");
+    }
+    // Never overwrite silently. A backup that quietly replaced last week's is
+    // not a backup, it is one backup.
+    if to.exists() {
+        let moved = to.with_extension(format!(
+            "{}.superseded-{}",
+            to.extension().and_then(|e| e.to_str()).unwrap_or("bak"),
+            Utc::now().format("%Y%m%d-%H%M%S")
+        ));
+        std::fs::rename(&to, &moved)
+            .with_context(|| format!("failed to move the existing {} aside", to.display()))?;
+        println!("moved the existing file aside → {}", moved.display());
+    }
+
+    blackbag_core::backup::write_owner_only(&to, &bytes)?;
+
+    // Read the copy back before recording it. A backup nobody checked is a
+    // claim, not a copy.
+    let written = std::fs::read(&to)
+        .with_context(|| format!("failed to read back {}", to.display()))?;
+    let digest = digest_of(&written);
+    if digest != digest_of(&bytes) {
+        bail!("the copy does not match what was read; nothing was recorded");
+    }
+    ciborium::de::from_reader::<blackbag_core::vault::VaultFile, _>(written.as_slice())
+        .context("the copy does not parse as a vault; nothing was recorded")?;
+
+    log.push(Entry {
+        at: Utc::now(),
+        vault_id: file.header.vault_id,
+        epoch: file.header.epoch,
+        path: to.canonicalize().unwrap_or(to.clone()),
+        digest,
+        bytes: written.len() as u64,
+    });
+    log.save(&log_path)?;
+
+    println!(
+        "copied {} bytes → {} · epoch {} · verified",
+        written.len(),
+        to.display(),
+        file.header.epoch
+    );
+    println!(
+        "Passkeys written at or before epoch {} now report themselves backed up.",
+        file.header.epoch
+    );
+    Ok(())
+}
+
 fn cmd_audit(args: AuditArgs) -> Result<()> {
     use blackbag_core::audit::{Log, Verdict};
 

@@ -53,6 +53,7 @@ Item {
     { key: "keys",       label: "RECOVERY KEYS", hint: "mint one, or revoke one" },
     { key: "import",     label: "IMPORT",        hint: "from six other managers" },
     { key: "export",     label: "EXPORT",        hint: "plaintext, deliberately" },
+    { key: "backup",     label: "BACKUP",        hint: "a sealed copy, elsewhere" },
     { key: "generate",   label: "GENERATE",      hint: "with honest entropy" },
     { key: "access",     label: "ACCESS",        hint: "who reads what · the log" },
     { key: "settings",   label: "SETTINGS",      hint: "how this deck behaves" }
@@ -67,8 +68,13 @@ Item {
       case "keys":       return "mint"
       case "import":     return manage.importPreview.length === 0 ? "preview" : "import"
       case "export":     return "export"
+      case "backup":     return "back it up"
       case "generate":   return "generate"
       case "access":     return "refresh"
+      // Settings apply as they are edited, so the chord has nothing to do and
+      // the footer says nothing. Listed rather than left to fall through: a
+      // section with no verb has to be a decision, not an omission.
+      case "settings":   return ""
       default:           return ""
     }
   }
@@ -105,6 +111,75 @@ Item {
   property string generatedNote: ""
 
   readonly property int minLength: 12
+
+  // ── backup ─────────────────────────────────────────────────────────────────
+
+  /// Where the next copy goes.
+  property string backupPath: ""
+  /// Copies this machine knows about, newest first, as `backup --list` reports.
+  property var copies: []
+  /// True while the last listing was checked by reading every byte rather than
+  /// by looking at the size. Stated, because they are different claims.
+  property bool copiesVerified: false
+
+  function loadCopies(verify) {
+    if (copiesProcess.running) return
+    copiesProcess.verifying = verify === true
+    copiesProcess.command = verify === true
+      ? ["black-bag", "backup", "--verify", "--json"]
+      : ["black-bag", "backup", "--list", "--json"]
+    copiesProcess.running = true
+  }
+
+  function runBackup() {
+    if (manage.busy) return
+    if (manage.backupPath.trim().length === 0) {
+      manage.errorText = "say where the copy goes"
+      return
+    }
+    manage.busy = true
+    manage.errorText = ""
+    manage.noteText = ""
+    backupProcess.command = ["black-bag", "backup", "--to", manage.backupPath.trim()]
+    backupProcess.running = true
+  }
+
+  Process {
+    id: copiesProcess
+    running: false
+    property bool verifying: false
+    stderr: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          manage.copies = JSON.parse(String(this.text || "[]"))
+          manage.copiesVerified = copiesProcess.verifying
+        } catch (e) {
+          manage.copies = []
+        }
+      }
+    }
+  }
+
+  Process {
+    id: backupProcess
+    running: false
+    stderr: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: function (code) {
+      manage.busy = false
+      var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+      if (code !== 0) { manage.errorText = err.length > 0 ? err : "the copy was not made"; return }
+      // The engine's own sentence: it names the byte count and the epoch, and
+      // says the copy was read back and checked. Repeated, not paraphrased.
+      manage.noteText = String(this.stdout.text || "").trim().split("\n")[0]
+      manage.loadCopies(false)
+      // A backup changes what the passkeys say about themselves, so the deck's
+      // posture is now out of date.
+      manage.changed()
+    }
+  }
 
   // ── access ─────────────────────────────────────────────────────────────────
   /// Every approval in force right now, as the agent reports them.
@@ -146,9 +221,12 @@ Item {
     manage.keyPath = (manage.homeDir.length > 0 ? manage.homeDir : "~") + "/black-bag-recovery.key"
     manage.importPath = (manage.homeDir.length > 0 ? manage.homeDir : "~") + "/export.json"
     manage.exportPath = (manage.homeDir.length > 0 ? manage.homeDir : "~") + "/black-bag-export.json"
+    manage.backupPath = (manage.homeDir.length > 0 ? manage.homeDir : "~")
+                      + "/black-bag-backup-" + Model.shortStamp() + ".cbor"
     manage.clear()
     manage.open_ = true
     if (manage.section === "access") manage.loadAccess()
+    if (manage.section === "backup") manage.loadCopies(false)
     Qt.callLater(function () { manage.forceActiveFocus() })
   }
 
@@ -175,7 +253,7 @@ Item {
   function anyProcessRunning() {
     return rekeyProcess.running || keyAddProcess.running || keyRemoveProcess.running
         || importProcess.running || exportProcess.running || genProcess.running
-        || revokeProcess.running || lockdownProcess.running
+        || revokeProcess.running || lockdownProcess.running || backupProcess.running
   }
 
   function go(which) {
@@ -190,6 +268,7 @@ Item {
     // Stale approvals are worse than none: this panel is read to decide
     // whether to withdraw something, so it re-reads every time it is opened.
     if (which === "access") manage.loadAccess()
+    if (which === "backup") manage.loadCopies(false)
   }
 
   // Index of the section on screen, so the rail can number itself and the
@@ -220,6 +299,7 @@ Item {
         else manage.runImport()
         break
       case "export":     manage.runExport(); break
+      case "backup":     manage.runBackup(); break
       case "generate":   manage.generate(); break
       case "access":     manage.loadAccess(); break
       // Settings apply as they are edited; there is nothing to commit.
@@ -777,6 +857,17 @@ Item {
     context: Qt.WindowShortcut
     onActivated: manage.revokePicked()
   }
+  // Checking your backups should not require hunting for a mouse. A Ctrl
+  // chord rather than a bare letter because this section has a text field in
+  // it, and a bare letter belongs to whichever field has the caret.
+  Shortcut {
+    sequences: ["Ctrl+K"]
+    enabled: manage.open_ && manage.section === "backup" && !manage.busy
+             && manage.copies.length > 0
+    context: Qt.WindowShortcut
+    onActivated: manage.loadCopies(true)
+  }
+
   // The switch you want when something is wrong, on a key you can find
   // without looking for a button.
   Shortcut {
@@ -1343,6 +1434,149 @@ Item {
               text: "COPY draws a NEW value straight to the clipboard rather than copying the "
                   + "one on screen, so a value you only glanced at is never the one you paste."
               tone: Util.alpha(Color.foreground, 0.5)
+            }
+          }
+
+          // ── BACKUP ────────────────────────────────────────────────────────
+          ColumnLayout {
+            Layout.fillWidth: true
+            spacing: metric.space(10)
+            visible: manage.section === "backup"
+
+            Blurb {
+              text: "A copy of the vault exactly as it sits — still sealed, still needing "
+                  + "your passphrase. Nothing is decrypted, so this does not ask for one "
+                  + "and works even when you are locked out. It is the opposite of EXPORT, "
+                  + "which writes everything in plaintext."
+            }
+
+            Blurb {
+              text: "A recovery key is not a backup. It opens this vault; it is no use at "
+                  + "all if the file itself is gone."
+              tone: Util.alpha(Color.foreground, 0.5)
+            }
+
+            Field { label: "write the copy to"; value: manage.backupPath
+                    onTextEdited: manage.backupPath = text }
+            Blurb {
+              text: "Put it on removable media or another machine. Beside the vault it "
+                  + "survives a deleted file and nothing else."
+              tone: Util.alpha(Color.foreground, 0.5)
+            }
+
+            RowLayout {
+              Layout.fillWidth: true
+              Item { Layout.fillWidth: true }
+              SheetButton {
+                label: "BACK IT UP"
+                tone: Color.accent
+                enabledAction: !manage.busy
+                tappable: !manage.busy
+                onActivated: manage.runBackup()
+              }
+            }
+
+            SectionLabel { text: "COPIES THIS MACHINE KNOWS ABOUT — " + manage.copies.length }
+
+            Text {
+              Layout.fillWidth: true
+              visible: manage.copies.length === 0
+              text: "None. Losing the file would lose everything in it, and every passkey "
+                  + "in here truthfully reports itself as not backed up."
+              color: Util.alpha(Color.urgent, 0.8)
+              font.family: metric.font.family
+              font.pixelSize: metric.font.caption
+              wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+              textFormat: Text.PlainText
+              renderType: Text.NativeRendering
+            }
+
+            Repeater {
+              model: manage.copies
+              delegate: Rectangle {
+                required property var modelData
+                readonly property bool good: String(modelData.state) === "present"
+                                          || String(modelData.state) === "intact"
+                Layout.fillWidth: true
+                implicitHeight: copyCol.implicitHeight + metric.space(16)
+                radius: metric.cornerRadius
+                color: Util.alpha(Color.foreground, 0.04)
+                border.width: Math.max(1, metric.spacing.hairline)
+                border.color: good ? Util.alpha(Color.muted, 0.4) : Util.alpha(Color.urgent, 0.6)
+                RowLayout {
+                  id: copyCol
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.margins: metric.space(12)
+                  spacing: metric.space(10)
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    Text {
+                      Layout.fillWidth: true
+                      text: String(modelData.path)
+                      color: Color.foreground
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
+                      elide: Text.ElideMiddle
+                      textFormat: Text.PlainText
+                      renderType: Text.NativeRendering
+                    }
+                    Text {
+                      Layout.fillWidth: true
+                      text: "epoch " + modelData.epoch + " · " + Model.auditStamp(modelData.at)
+                          + " · " + Model.backupCheckPhrase(String(modelData.checked))
+                      color: Util.alpha(Color.foreground, 0.5)
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
+                      wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                      textFormat: Text.PlainText
+                      renderType: Text.NativeRendering
+                    }
+                  }
+                  Text {
+                    text: String(modelData.state)
+                    color: parent.parent.good ? Color.accent : Color.urgent
+                    font.family: metric.font.family
+                    font.pixelSize: metric.font.caption
+                    font.bold: true
+                    textFormat: Text.PlainText
+                    renderType: Text.NativeRendering
+                  }
+                }
+              }
+            }
+
+            Blurb {
+              text: "A passkey reports itself backed up only while a copy taken at or after "
+                  + "the epoch it was written in is still there. That is what the BS flag "
+                  + "on a WebAuthn ceremony means, and it is why this deck will not set it "
+                  + "just to look like a synced passkey."
+              tone: Util.alpha(Color.foreground, 0.5)
+            }
+
+            RowLayout {
+              Layout.fillWidth: true
+              Text {
+                text: manage.copies.length === 0 ? ""
+                    : (manage.copiesVerified
+                       ? "every byte was read"
+                       : "checked by size only · ^K re-reads them")
+                color: Util.alpha(Color.foreground, 0.4)
+                font.family: metric.font.family
+                font.pixelSize: metric.font.caption
+                textFormat: Text.PlainText
+                renderType: Text.NativeRendering
+              }
+              Item { Layout.fillWidth: true }
+              SheetButton {
+                label: "CHECK EVERY BYTE"
+                tone: Util.alpha(Color.foreground, 0.7)
+                enabledAction: !manage.busy && manage.copies.length > 0
+                tappable: !manage.busy
+                onActivated: manage.loadCopies(true)
+              }
             }
           }
 

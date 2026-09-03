@@ -123,7 +123,37 @@ else:
                     f"{earlier} is handled before the sheet is checked",
                 )
 
-# 3. A passphrase never crosses in argv.
+# 3. A section cannot arrive without a verb.
+#
+# The management sheet's rail, its Ctrl+Return label and its Ctrl+Return action
+# are three lists that have to agree. BACKUP was added to the rail and to the
+# action, and not to the label: the chord worked and the footer said nothing,
+# so the one affordance telling you what Ctrl+Return would do was silent
+# exactly where a new user needed it.
+manage = strip_comments((PLUGIN / "Manage.qml").read_text())
+sections = re.search(r"readonly property var sections:\s*\[(.*?)\]", manage, re.S)
+if not sections:
+    fail("the sheet has a section list", "sections: [...] was not found in Manage.qml")
+else:
+    keys = re.findall(r'key:\s*"([^"]+)"', sections.group(1))
+    if not keys:
+        fail("the section list has entries", "no key: \"...\" found")
+    label_switch = re.search(
+        r"readonly property string primaryLabel:.*?\n  \}", manage, re.S
+    )
+    action_switch = re.search(r"function primary\(\).*?\n  \}", manage, re.S)
+    for name, block in (("primaryLabel", label_switch), ("primary()", action_switch)):
+        if block is None:
+            fail(f"the sheet has {name}", f"{name} was not found in Manage.qml")
+            continue
+        for key in keys:
+            if f'case "{key}"' not in block.group(0):
+                fail(
+                    f"every section has a case in {name}",
+                    f'section "{key}" is on the rail but not in {name}',
+                )
+
+# 4. A passphrase never crosses in argv.
 #
 # /proc/<pid>/cmdline is world-readable. Every passphrase in this project goes
 # in on stdin, which is why the engine has no --passphrase flag to call.
@@ -138,7 +168,7 @@ for qml in sorted(PLUGIN.glob("*.qml")):
             f"{qml.name} builds a command with {m.group(0)}; argv is world-readable",
         )
 
-# 4. Approving is proved, not clicked.
+# 5. Approving is proved, not clicked.
 #
 # A same-uid process can synthesise a click with wtype or hyprctl, so the
 # approval sheet must send a passphrase on stdin and the engine must be asked

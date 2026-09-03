@@ -103,7 +103,29 @@ pub struct PasskeyConfig {
     pub algorithm: i32,
     /// Whether this credential carries a PRF seed.
     pub prf: bool,
-    /// Whether the credential is currently backed up, reported as the BS flag.
+}
+
+/// Everything a create ceremony is asked for.
+///
+/// A struct rather than eight positional arguments, four of which are bools:
+/// `create(rp, name, handle, user, display, true, true, false)` is a line
+/// nobody can read, and transposing the last three would silently claim user
+/// verification, or a PRF seed, or a backup that does not exist.
+#[derive(Debug, Clone)]
+pub struct NewCredential {
+    pub rp_id: String,
+    pub rp_name: Option<String>,
+    /// 1-64 bytes, per WebAuthn.
+    pub user_handle: Vec<u8>,
+    pub user_name: Option<String>,
+    pub user_display_name: Option<String>,
+    /// Set only when a human answered on a surface this process controls.
+    pub user_verified: bool,
+    /// Mint a PRF seed alongside the key.
+    pub with_prf: bool,
+    /// Whether a copy of the vault containing this credential already exists.
+    /// False for anything created now: a backup taken before this moment
+    /// cannot contain it.
     pub backed_up: bool,
 }
 
@@ -213,15 +235,18 @@ impl Credential {
     ///
     /// `user_verified` records whether a human was actually verified for *this*
     /// ceremony — see the note on [`Credential::assert`].
-    pub fn create(
-        rp_id: &str,
-        rp_name: Option<String>,
-        user_handle: Vec<u8>,
-        user_name: Option<String>,
-        user_display_name: Option<String>,
-        user_verified: bool,
-        with_prf: bool,
-    ) -> Result<(Created, Option<Zeroizing<[u8; 32]>>)> {
+    pub fn create(req: NewCredential) -> Result<(Created, Option<Zeroizing<[u8; 32]>>)> {
+        let NewCredential {
+            rp_id,
+            rp_name,
+            user_handle,
+            user_name,
+            user_display_name,
+            user_verified,
+            with_prf,
+            backed_up,
+        } = req;
+        let rp_id = rp_id.as_str();
         if rp_id.trim().is_empty() {
             bail!("a passkey needs a relying-party id");
         }
@@ -257,13 +282,12 @@ impl Credential {
             user_display_name,
             algorithm: ALG_ES256,
             prf: with_prf,
-            backed_up: false,
         };
 
         let cose = cose_key_es256(&verifying);
         let authenticator_data = authenticator_data(
             &config.rp_id,
-            base_flags(user_verified) | flags::AT,
+            base_flags(user_verified, backed_up) | flags::AT,
             Some((&credential_id, &cose)),
         );
         let attestation_object = attestation_object_none(&authenticator_data)?;
@@ -327,6 +351,7 @@ impl Credential {
         origin: &str,
         client_data_json: &[u8],
         user_verified: bool,
+        backed_up: bool,
     ) -> Result<Asserted> {
         if !rp_id_is_valid_for_origin(&self.config.rp_id, origin) {
             bail!(
@@ -337,7 +362,7 @@ impl Credential {
         }
 
         let authenticator_data =
-            authenticator_data(&self.config.rp_id, base_flags(user_verified), None);
+            authenticator_data(&self.config.rp_id, base_flags(user_verified, backed_up), None);
 
         // WebAuthn Level 3 §6.3.3: the signature is over
         // authenticatorData || SHA-256(clientDataJSON).
@@ -403,12 +428,29 @@ pub fn prf_evaluate(seed: &[u8], salt: &[u8]) -> Zeroizing<[u8; 32]> {
 
 /// Flags every ceremony sets.
 ///
-/// BE is always set and never changes: this credential is multi-device capable
-/// by construction, because the vault it lives in can be copied to another
-/// machine. WebAuthn Level 3 §6.1.3 forbids `BE=0, BS=1`, so BS may only be set
-/// while BE is.
-fn base_flags(user_verified: bool) -> u8 {
+/// **BE is always 1 and never changes for a credential.** This one is
+/// multi-device capable by construction: the vault it lives in is a file, and
+/// a file can be copied to another machine. That is a property of the design,
+/// not of the moment, so it does not move.
+///
+/// **BS is computed and truthful.** It is 1 only when a copy of this vault
+/// that contains this credential is currently known to exist — see
+/// [`crate::backup`] for what "currently known" is allowed to mean. It is not
+/// set to 1 to look like a synced passkey; a relying party reading BS=1 is
+/// being told something, and it should be true.
+///
+/// BS is allowed to flip 0 → 1 later, when a backup is taken. WebAuthn Level 3
+/// §6.1.3 permits that and it is the honest nudge toward taking one.
+///
+/// **`BE=0, BS=1` is forbidden by §6.1.3** and is unrepresentable here: BS is
+/// only ever set inside the branch that has already set BE. If BE ever stops
+/// being unconditional, this function has to be re-read — which is what the
+/// state-machine tests are for.
+fn base_flags(user_verified: bool, backed_up: bool) -> u8 {
     let mut f = flags::UP | flags::BE;
+    if backed_up {
+        f |= flags::BS;
+    }
     if user_verified {
         f |= flags::UV;
     }
@@ -522,21 +564,118 @@ fn signing_key_from(pkcs8: &[u8]) -> Result<SigningKey> {
 }
 
 #[cfg(test)]
+mod flag_state_machine {
+    use super::{base_flags, flags};
+
+    /// Every state the two backup flags can be in, and the one that is illegal.
+    ///
+    /// WebAuthn Level 3 §6.1.3: BS may only be 1 when BE is 1. `BE=0, BS=1` is
+    /// "an invalid state" and a relying party is entitled to reject it. This
+    /// walks the whole space rather than testing the two cases we happen to
+    /// produce, because the point of a state machine test is the transitions
+    /// nobody wrote code for.
+    #[test]
+    fn backup_eligible_is_always_set_and_backup_state_never_stands_alone() {
+        for uv in [false, true] {
+            for backed_up in [false, true] {
+                let f = base_flags(uv, backed_up);
+
+                assert_eq!(
+                    f & flags::BE,
+                    flags::BE,
+                    "BE must be 1 in every state (uv={uv}, backed_up={backed_up})"
+                );
+                assert_eq!(
+                    f & flags::BS != 0,
+                    backed_up,
+                    "BS must say exactly what it was told (uv={uv}, backed_up={backed_up})"
+                );
+                // The forbidden combination, stated as the invariant rather
+                // than as a case: if BS is set, BE is set.
+                if f & flags::BS != 0 {
+                    assert_eq!(f & flags::BE, flags::BE, "BE=0 with BS=1 is invalid");
+                }
+                assert_eq!(f & flags::UP, flags::UP, "UP is set by every ceremony here");
+                assert_eq!(f & flags::UV != 0, uv, "UV must not be claimed unearned");
+            }
+        }
+    }
+
+    /// The transition the specification allows and we rely on: a credential
+    /// that was not backed up becomes backed up, and says so afterwards.
+    #[test]
+    fn backup_state_may_turn_on_later() {
+        let before = base_flags(true, false);
+        let after = base_flags(true, true);
+
+        assert_eq!(before & flags::BS, 0, "nothing backed up yet");
+        assert_eq!(after & flags::BS, flags::BS, "a backup was taken");
+        assert_eq!(
+            before & flags::BE,
+            after & flags::BE,
+            "BE does not move when BS does"
+        );
+    }
+
+    /// And back off again, which is what makes it truthful rather than a
+    /// one-way boast: deleting the backup is visible to the relying party.
+    #[test]
+    fn backup_state_may_turn_off_again() {
+        assert_eq!(base_flags(true, true) & flags::BS, flags::BS);
+        assert_eq!(
+            base_flags(true, false) & flags::BS,
+            0,
+            "a deleted backup must stop being asserted"
+        );
+    }
+
+    /// The bit positions themselves, against the specification's table.
+    /// A transposition here would be invisible to every test above.
+    #[test]
+    fn the_bits_are_where_the_specification_puts_them() {
+        assert_eq!(flags::UP, 0x01, "bit 0");
+        assert_eq!(flags::UV, 0x04, "bit 2");
+        assert_eq!(flags::BE, 0x08, "bit 3");
+        assert_eq!(flags::BS, 0x10, "bit 4");
+        assert_eq!(flags::AT, 0x40, "bit 6");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use p256::ecdsa::signature::Verifier;
 
     fn a_credential() -> (Created, Option<Zeroizing<[u8; 32]>>) {
-        Credential::create(
-            "example.com",
-            Some("Example".into()),
-            b"user-handle-bytes".to_vec(),
-            Some("ada".into()),
-            Some("Ada Lovelace".into()),
-            true,
-            true,
-        )
+        backed_up_credential(false)
+    }
+
+    fn backed_up_credential(backed_up: bool) -> (Created, Option<Zeroizing<[u8; 32]>>) {
+        Credential::create(NewCredential {
+            rp_id: "example.com".into(),
+            rp_name: Some("Example".into()),
+            user_handle: b"user-handle-bytes".to_vec(),
+            user_name: Some("ada".into()),
+            user_display_name: Some("Ada Lovelace".into()),
+            user_verified: true,
+            with_prf: true,
+            backed_up,
+        })
         .unwrap()
+    }
+
+    /// A request that is valid except for whatever the caller overrides.
+    fn a_request() -> NewCredential {
+        NewCredential {
+            rp_id: "example.com".into(),
+            rp_name: None,
+            user_handle: b"u".to_vec(),
+            user_name: None,
+            user_display_name: None,
+            user_verified: true,
+            with_prf: false,
+            backed_up: false,
+        }
     }
 
     #[test]
@@ -546,7 +685,7 @@ mod tests {
 
         let asserted = created
             .credential
-            .assert("https://example.com", client_data, true)
+            .assert("https://example.com", client_data, true, false)
             .unwrap();
 
         let mut signed = asserted.authenticator_data.clone();
@@ -587,7 +726,7 @@ mod tests {
         let (created, _) = a_credential();
         let asserted = created
             .credential
-            .assert("https://example.com", b"{}", false)
+            .assert("https://example.com", b"{}", false, false)
             .unwrap();
         assert_eq!(asserted.authenticator_data.len(), 37);
         assert_eq!(asserted.authenticator_data[32] & flags::AT, 0);
@@ -625,14 +764,14 @@ mod tests {
             "https://oogle.com",
         ] {
             assert!(
-                created.credential.assert(origin, b"{}", true).is_err(),
+                created.credential.assert(origin, b"{}", true, false).is_err(),
                 "must refuse to sign for {origin}"
             );
         }
         // Subdomains of the RP are exactly what an RP ID is for.
         assert!(created
             .credential
-            .assert("https://login.example.com", b"{}", true)
+            .assert("https://login.example.com", b"{}", true, false)
             .is_ok());
     }
 
@@ -686,7 +825,7 @@ mod tests {
         .unwrap();
 
         let a = stored
-            .assert("https://example.com", b"{\"n\":1}", true)
+            .assert("https://example.com", b"{\"n\":1}", true, false)
             .unwrap();
         let mut signed = a.authenticator_data.clone();
         signed.extend_from_slice(&Sha256::digest(b"{\"n\":1}"));
@@ -710,13 +849,13 @@ mod tests {
 
     #[test]
     fn bad_ceremony_parameters_are_refused() {
-        let bad_handle = Credential::create("example.com", None, vec![], None, None, true, false);
+        let bad_handle = Credential::create(NewCredential { user_handle: vec![], ..a_request() });
         assert!(bad_handle.is_err(), "an empty user handle is not a handle");
 
-        let long = Credential::create("example.com", None, vec![0; 65], None, None, true, false);
+        let long = Credential::create(NewCredential { user_handle: vec![0; 65], ..a_request() });
         assert!(long.is_err(), "a user handle is at most 64 bytes");
 
-        let no_rp = Credential::create("  ", None, b"u".to_vec(), None, None, true, false);
+        let no_rp = Credential::create(NewCredential { rp_id: "  ".into(), ..a_request() });
         assert!(no_rp.is_err());
     }
 
@@ -746,7 +885,7 @@ mod tests {
 
         let loaded = credential_from_record(&record).unwrap();
         assert_eq!(loaded.config.rp_id, "example.com");
-        let a = loaded.assert("https://example.com", b"{}", true).unwrap();
+        let a = loaded.assert("https://example.com", b"{}", true, false).unwrap();
 
         let mut signed = a.authenticator_data.clone();
         signed.extend_from_slice(&Sha256::digest(b"{}"));
@@ -769,7 +908,7 @@ mod tests {
     #[test]
     fn a_credential_without_prf_gets_no_seed() {
         let (created, seed) =
-            Credential::create("example.com", None, b"u".to_vec(), None, None, true, false).unwrap();
+            Credential::create(a_request()).unwrap();
         assert!(seed.is_none());
         assert!(!created.credential.config.prf);
     }

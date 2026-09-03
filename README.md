@@ -227,6 +227,10 @@ black-bag get <uuid> --reveal password --to clipboard
 black-bag doctor                     # vault + host posture, including where the session key lives
 black-bag rekey --change-passphrase
 
+black-bag backup --to /run/media/you/stick/vault.cbor   # a sealed copy, no passphrase needed
+black-bag backup --verify            # re-read every recorded copy, byte for byte
+black-bag audit --verify             # who asked for what, and whether the chain still holds
+
 black-bag agent breach --online      # k-anonymity check against Pwned Passwords
 black-bag import --from bitwarden.json --format bitwarden --dry-run
 black-bag export --to out.csv --format keepassxc --plaintext-ok
@@ -241,6 +245,14 @@ black-bag migrate --from ~/.config/black_bag/vault.cbor --to ~/.local/share/blac
 There is deliberately **no `--passphrase` flag**. Passphrases are read from the
 terminal, or from stdin when there is no terminal — never from `argv`, because
 `/proc/<pid>/cmdline` is world-readable.
+
+`backup` is the one command that needs no passphrase at all: the vault is
+already encrypted, so a copy of it is a copy of ciphertext. It works while you
+are locked out, which is exactly when you may want it. A recovery key is not a
+substitute — that opens this vault, and is no use if the file itself is gone.
+
+Everything above is also in the deck, under `^M`: **BACKUP** takes and checks
+copies, **ACCESS** shows what is approved to read what and withdraws it.
 
 ---
 

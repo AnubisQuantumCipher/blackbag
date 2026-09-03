@@ -10,7 +10,7 @@
 //!
 //!     cargo run --release -p blackbag-core --example passkey_vector
 
-use blackbag_core::passkey::{prf_evaluate, Credential};
+use blackbag_core::passkey::{prf_evaluate, Credential, NewCredential};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -19,20 +19,23 @@ fn hex(bytes: &[u8]) -> String {
 fn main() {
     let client_data = br#"{"type":"webauthn.get","challenge":"Y2hhbGxlbmdl","origin":"https://login.example.com","crossOrigin":false}"#;
 
-    let (created, seed) = Credential::create(
-        "example.com",
-        Some("Example Ltd".into()),
-        b"\x01\x02\x03\x04user-handle".to_vec(),
-        Some("ada".into()),
-        Some("Ada Lovelace".into()),
-        true,
-        true,
-    )
+    let (created, seed) = Credential::create(NewCredential {
+        rp_id: "example.com".into(),
+        rp_name: Some("Example Ltd".into()),
+        user_handle: b"\x01\x02\x03\x04user-handle".to_vec(),
+        user_name: Some("ada".into()),
+        user_display_name: Some("Ada Lovelace".into()),
+        user_verified: true,
+        with_prf: true,
+        // Not backed up: this vector is generated from nothing but the inputs
+        // above, so it must not depend on the machine's backup state.
+        backed_up: false,
+    })
     .expect("the ceremony must succeed");
 
     let asserted = created
         .credential
-        .assert("https://login.example.com", client_data, true)
+        .assert("https://login.example.com", client_data, true, false)
         .expect("a subdomain of the RP is a legitimate origin");
 
     let seed = seed.expect("this credential asked for a PRF seed");

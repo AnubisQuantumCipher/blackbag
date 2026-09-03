@@ -1235,3 +1235,12 @@ function auditStamp(at) {
   }
   return rest.slice(0, cut)
 }
+
+/// How a backup's state was decided: by reading it, or by looking at it.
+///
+/// These are different claims and the panel must not blur them. A file that is
+/// there at the right size has not been checked; a file whose every byte was
+/// read has.
+function backupCheckPhrase(checked) {
+  return String(checked) === "digest" ? "read in full" : "size checked"
+}

@@ -5,6 +5,87 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — nothing reads a secret without being asked about, once, per use
+
+- **An approval is per (program, item, capability).** Reading a value onto the
+  screen and copying it onto the clipboard are different exposures — the
+  clipboard is readable by every other process in the session and outlives the
+  glance — so approving one does not approve the other, in either direction.
+  Live TOTP codes go through the same gate; they were previously served to
+  anything that asked.
+- **An approval costs the master passphrase, never a click.** A same-uid
+  process can synthesise a click with `wtype` or `hyprctl`, so a click proves
+  nothing about who is at the keyboard. The proof is checked against the *open
+  vault's own header*, not by re-reading the file at the path, which any
+  same-uid process can swap between the check and the read.
+- **`black-bag audit`** — an append-only hash-chained record of every decision,
+  read from the file rather than asked of the agent, because a history you can
+  only get by asking the thing being audited is not much of a history.
+  `--verify` says whether the chain still holds and where it breaks.
+- **`black-bag backup`** — a copy of the sealed vault. Nothing is decrypted, so
+  it needs no passphrase and works while you are locked out, which is exactly
+  when you may want it. The copy is read back and its digest checked before it
+  is recorded; `--list` and `--verify` say what is known and whether it is
+  still true. A recovery key is not a substitute: that opens this vault, and is
+  no use if the file itself is gone.
+- **The deck grew two sections** (`^M`): **ACCESS** shows what is approved right
+  now, what happened, and whether the record still holds — with revoke, a
+  lockdown switch that denies everything including approved and trusted
+  programs, and a keyboard path for all of it, because a security control you
+  can only work with a mouse is one that does not get used in the moment it is
+  needed. **BACKUP** takes and checks copies. Both exist because the owner
+  drives the GUI; a control that lives only in a terminal does not get used.
+
+### Changed — the backup-state flag now means something
+
+- **BS is computed and truthful.** It is 1 only while a recorded copy of this
+  vault, taken at or after the epoch this credential was written in, is still
+  where it was left. It is read live on every ceremony, so deleting the copy
+  turns it off again — which is what makes it a fact rather than a one-way
+  boast. Setting it unconditionally would tell relying parties something untrue
+  in order to look like a synced passkey.
+- **BE stays 1 and never moves.** This credential is multi-device capable by
+  construction: the vault it lives in is a file, and a file can be copied.
+  `BE=0, BS=1` is forbidden by WebAuthn L3 §6.1.3 and is unrepresentable here;
+  the whole flag space is walked in `passkey::flag_state_machine`.
+- **Known limit, stated rather than papered over:** a copy that still exists
+  but has been *replaced* is not detected until `backup --verify` re-reads it.
+  A digest on every assertion would put a disk read in the signing path.
+
+### Fixed — a status refresh could take a master passphrase out of the sheet
+
+- **The passkey status handler tore down the record approval sheet.** The agent
+  republishes status on every state change, so any refresh — including the
+  deck's own thirty-second safety net — cancelled an approval somebody was
+  part-way through typing. The sheet vanished mid-passphrase, the deck's key
+  gate reopened, and the rest of the passphrase arrived as shortcuts: `e`
+  opened the record editor and the remaining characters were typed into a
+  record field. Reproduced on the rig, fixed, and pinned by a structural test.
+- **A management section could arrive without a verb.** BACKUP reached the rail
+  and the `Ctrl+Return` action but not its label, so the chord worked and the
+  footer said nothing about it. Now every section must appear in all three
+  lists, checked by `tests/structure.py`.
+- **`audit --json` printed a sentence on the JSON stream** when the log was
+  empty. A reader parsing one object per line should never have to skip prose.
+
+### Added — checks that would have caught the above
+
+- **`plugin/khephri.blackbag/tests/structure.py`** — invariants about the QML
+  that no type checker can see. Each rule is there because breaking it caused a
+  real failure, each names that failure in a comment, and every rule was
+  mutation-tested to confirm it bites. Run by `tests/run.sh` and by CI.
+- **A tracked pre-commit secret scan** (`.githooks/pre-commit`, enabled with
+  `git config core.hooksPath .githooks`). This project published a crates.io
+  token in six releases; the hook uses `gitleaks` when installed and a smaller
+  built-in scan when not, so a machine without `gitleaks` is not a machine
+  without a check.
+- **CI now runs the extension's encoding tests**, which were never running
+  there.
+- **One name per thing.** `Capability` and `Surface` serialise to exactly what
+  their `as_str` writes — the audit digest is computed over one and the wire
+  carries the other, and two spellings of one capability is what makes a log
+  hard to trust. Pinned by tests in both modules.
+
 ### Added — passkeys, and the WebAuthn core that makes them possible
 
 - **`Kind::Passkey` and `crates/blackbag-core/src/passkey.rs`** — ES256

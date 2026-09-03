@@ -5,6 +5,7 @@
 //! 0.4.x line dropped a substantial amount of hardening that its own 0.2.x line
 //! had shipped. `docs/AUDIT.md` records what was lost and what was restored.
 
+pub mod backup;
 pub mod audit;
 pub mod breach;
 pub mod consent;

@@ -124,18 +124,18 @@ Ordered by how much of §3 it leaves unbuilt.
 | 3.1 | `isUserVerifyingPlatformAuthenticatorAvailable` | partial — answered, but from host reachability, not vault state |
 | 3.1 | Conditional mediation | **impossible on the proxy route** (§1 above); needs the injection lane |
 | 3.1 | Signal API (`signalUnknownCredential` etc.) | missing |
-| 3.1 | Fallback to the browser's own path when the user declines | missing — we return `NotAllowedError` |
+| 3.1 | Fallback to the browser's own path when the user declines | missing — we return `NotAllowedError` (D1 records the stopgap) |
 | 3.1 | `excludeCredentials`, `residentKey`, `userVerification` levels, `AbortSignal` | partial — allowCredentials and UV honoured; the rest not implemented |
 | 3.1 | Ed25519 (-8) and RS256 (-257) | missing — ES256 only |
-| 3.1 | **BE=1 and BS=1** | **mismatch** — we set BE=1, BS=0. Specification wants both; needs a decision (§5) |
+| 3.1 | **BE=1 and BS=1** | **done, D2** — BE=1 always; BS computed from a real backup and read live on every ceremony, so it turns off again when the copy is deleted |
 | 3.1 | `credProtect`, `credProps` | `credProps` yes; `credProtect` not persisted |
 | 3.2 | Virtual FIDO2 HID device over `/dev/uhid` | **missing entirely** |
 | 3.3 | `credentialsd` seam / `PasskeyProvider` trait | missing — no trait boundary yet |
 | 3.4 | CXF v1.0 import/export, 1PUX, KDBX | missing |
 | 3.4 | Optional TPM sealing, `fprintd` | missing (correctly absent on this hardware, but no runtime detection either) |
-| 3.4 | `black-bag backup` | missing |
-| 3.5 | Per-client approval policy, "deny all agents" switch | **missing** — this is the largest security gap for this machine |
-| 3.5 | Append-only hash-chained audit log | missing |
+| 3.4 | `black-bag backup` | **done** — copies the sealed file (works while locked out), reads it back, records epoch + digest; `--list`/`--verify`; BACKUP section in the deck |
+| 3.5 | Per-client approval policy, "deny all agents" switch | **done** — per (client, item, capability), passphrase-proved, lockdown switch; ACCESS section in the deck shows and revokes it |
+| 3.5 | Append-only hash-chained audit log | **done** — every decision recorded, read from the file rather than from the agent, `audit --verify` and the deck both check the chain |
 | 3.6 | SSH agent | missing |
 | 3.6 | `org.freedesktop.secrets` | missing |
 | 3.6 | Autotype via `wtype` | missing (clipboard fill works) |

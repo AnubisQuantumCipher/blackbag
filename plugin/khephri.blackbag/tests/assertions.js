@@ -500,5 +500,10 @@ eq(auditStamp("2026-09-03T21:04:07-05:00"), "21:04:07", "and a negative one");
 eq(auditStamp(""), "", "nothing in, nothing out");
 eq(auditStamp(undefined), "", "and an absent field does not print 'undefined'");
 
+eq(backupCheckPhrase("digest"), "read in full", "a verified copy says so");
+eq(backupCheckPhrase("size"), "size checked", "an unverified one does not overclaim");
+eq(backupCheckPhrase(undefined), "size checked",
+   "an absent field is the weaker claim, never the stronger one");
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)
