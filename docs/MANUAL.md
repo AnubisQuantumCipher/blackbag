@@ -315,9 +315,16 @@ the memory posture is worth. §10 covers the other rows.
 act in the deck that goes online, and it is armed like a delete: the first
 press, or `Ctrl+B`, flips it to `SURE? CHECK ONLINE` and prints what is about
 to leave the machine — the first five characters of each password's SHA-1,
-and nothing else; the second press or `Ctrl+B` runs
+padded with random decoy prefixes to a multiple of eight and shuffled, and
+nothing else; the second press or `Ctrl+B` runs
 `black-bag agent breach --online --json`; `Esc` backs out. Exposures are
 folded into the card as `EXPOSED` findings for the rest of the session.
+
+Two things that verdict will not do. A run that cannot reach the service
+leaves earlier findings alone rather than quietly clearing them — a failed
+fetch is not evidence that a password is safe. And changing a field drops its
+verdict immediately, rather than carrying the old one until the next online
+check.
 
 Footer notes such as *copied password* expire after seven seconds, so the
 footer never asserts a clipboard state that has long since changed. Every
@@ -546,11 +553,15 @@ Every secret box has a *show* / *hide* toggle beside it (the eye). A
 single-line box masks like a password field. A multi-line box — a private
 key, a seed, a note body — cannot be masked character by character, so it is
 covered instead: the cover reads *hidden · N characters · click to reveal and
-edit*, and typing is not possible until it is opened, because you should see
-what you are about to store. Both mask themselves again on the same countdown
-the inspector's SHOW uses. Copy from the field's context menu is disabled
-while a box is masked or covered, so Copy is not the quiet way around the
-countdown.
+edit*, and the field beneath it is genuinely read-only and does not hold the
+keyboard, because you should see what you are about to store. (Until 2.5.0 it
+was only paint: the field kept focus and kept accepting keystrokes and pastes
+behind it.) Both mask themselves again on the countdown the inspector's SHOW
+uses, but typing or moving about inside a field restarts that countdown — a
+long note used to go blind mid-sentence. Copy from the field's context menu
+is disabled while a box is masked or covered, so Copy is not the quiet way
+around the countdown; a multi-line field has no `echoMode` at all, and
+treating that as "not masked" was how the exemption used to be missed.
 
 The editor does not display the entropy figure; the CLI does, on stderr:
 
@@ -727,12 +738,18 @@ sent instead. What happens (`crates/blackbag-core/src/breach.rs` and
 1. The CLI asks the agent for candidates. The agent hashes every field named
    `password`, `passphrase` or `pin` with SHA-1 and hands back only the
    **first five hex characters** of each — twenty bits. The prefixes are
-   deduplicated and sorted, so two records sharing a password send one
-   prefix and the order tells nothing.
-2. The CLI runs `curl` once per prefix against
+   deduplicated, then padded with random decoys to a multiple of eight and
+   shuffled, so two records sharing a password send one prefix, the order
+   tells nothing, and the *number* of requests no longer counts your
+   passwords exactly. A decoy bucket belongs to no field and is never
+   consulted.
+2. The CLI runs `curl -q` once per prefix against
    `https://api.pwnedpasswords.com/range/<prefix>` with the header
-   `Add-Padding: true`, a `User-Agent` of `black-bag/2.5.0`, and
-   `--max-time 20`. Padding makes every response the same shape so its size
+   `Add-Padding: true`, a `User-Agent` of `black-bag/2.5.0`,
+   `--proto =https`, no proxy, and `--max-time 20`. `-q` is first so the
+   user's own `~/.curlrc` cannot redirect the body to a file and leave an
+   empty response to be read as "not in the corpus"; an empty response is
+   treated as a failed fetch. Padding makes every response the same shape so its size
    reveals nothing; padding entries (count `0`) are dropped on receipt. The
    agent itself cannot do this: its unit has no network address family.
 3. The buckets go back to the agent, which compares them against the full
@@ -762,7 +779,7 @@ taken from `--help`.
 | `black-bag init` | `--mem-kib <KIB>` (default 262144) | Prompts for the new passphrase twice. Refuses if the file exists |
 | `black-bag rekey` | `--change-passphrase`, `--mem-kib <KIB>` | New data key, payload re-encrypted, every recipient re-wrapped, Argon2 salt re-drawn |
 | `black-bag migrate` | `--from <PATH>`, `--to <PATH>` | Reads a `black-bagg` 0.4.x v1 vault. See §9 |
-| `black-bag import` | `--from <FILE>` (required), `--format bitwarden\|keepassxc\|firefox\|chrome\|csv` (required), `--dry-run` | Opens the vault itself (passphrase prompt), parses the export by hand, adds every record it could map. Skipped rows are reported on stderr by reason, never by value. `--dry-run` parses, prints the counts by kind, writes nothing. Afterwards it tells you to `shred -u` the export |
+| `black-bag import` | `--from <FILE>` (required), `--format bitwarden\|keepassxc\|firefox\|chrome\|csv\|black-bag` (required), `--dry-run` | Opens the vault itself (passphrase prompt), parses the export by hand, adds every record it could map. `black-bag` reads this program's own JSON export back whole — kinds, tags, attributes, every field byte for byte, notes and TOTP — so an export is a restorable backup. A file whose header names none of the format's columns is refused by name rather than guessed at, and blank lines are dropped. Skipped rows are reported on stderr by reason, never by value. `--dry-run` parses, prints the counts by kind, writes nothing. Afterwards it tells you to `shred -u` the export |
 | `black-bag export` | `--to <FILE>` (required), `--format json\|keepassxc` (json), `--plaintext-ok` (required) | Every record and every secret in plaintext. Refuses without `--plaintext-ok`, refuses to overwrite, creates the file `0600` with `O_EXCL`, and tells you to shred it once the other tool has read it |
 
 Import formats: `bitwarden` is the unencrypted JSON export (an encrypted one

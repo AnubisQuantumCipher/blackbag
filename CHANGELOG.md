@@ -122,6 +122,73 @@ test that fails on the old behaviour.
   denied, private devices, no IPC, `UMask=0077`. Validated as a transient
   unit before it replaced the installed one.
 
+### Fixed — what an adversarial review of the above then found
+
+Everything in this release was put through a multi-agent review in which each
+reported defect faced three independent reviewers instructed to refute it.
+Twenty-five findings survived that and are fixed here; sixty did not survive
+and were dropped. Several of the survivors were in the new work itself, which
+is the point of running it.
+
+- **The central memory claim was false at the point of encryption.**
+  `crypto::seal` called `aead::Aead::encrypt`, whose blanket implementation
+  stages the entire plaintext in a fresh heap `Vec` before encrypting it, so
+  every save put the whole padded vault — and every wrap the data key — into
+  swappable memory. `Guarded::new` did `plain.to_vec()` on a locked buffer,
+  copying each record field straight back out. Both now encrypt in place
+  inside the arena. `crypto.rs` no longer imports `Aead` at all.
+- **The `/proc/self/mem` test could not see what it existed to catch.** Its
+  setup ran after the secret work, reusing exactly the frames and heap chunks
+  a residue occupies, and one unreadable page discarded its whole mapping — a
+  528-page worker stack thrown away for the sake of 16. It now does the secret
+  work on a parked worker thread, builds the scanner afterwards, reads chunked
+  with a page-level fallback, accounts for every page it could not read, and
+  must find a deliberately planted needle before its silence counts as
+  evidence. `memfd_secret`'s guarantee is asserted directly in a test of its
+  own.
+- **`SecretBuf::zeroed` returned uninitialised memory** on the fallback path —
+  a `&[u8]` over a recycled allocation, undefined behaviour whatever the
+  caller does next. `round_up` and `Slab::map` wrapped near `usize::MAX`.
+- **A local process could blind the sleep watcher.** Any parse or size failure
+  ended the connection, after which it slept a flat twenty seconds: one
+  malformed unicast signal every nineteen seconds kept the vault's suspend
+  guard off the bus indefinitely. Unreadable messages are now consumed and
+  skipped, oversized ones drained, unknown header fields stepped over per the
+  specification, and the backoff starts at one second.
+- **A local process could forge a lock.** The bus rewrites `SENDER` to a
+  unique name, so the check against `org.freedesktop.login1` never fired, and
+  match rules are never consulted for a signal addressed to one connection.
+  The watcher now learns logind's unique name, re-learns it on
+  `NameOwnerChanged`, requires it, and refuses signals carrying a destination.
+  `Session.Lock` is scoped to this process's own session where logind knows
+  of one. All measured against the real system bus, before and after.
+- **Breach verdicts lied in both directions.** A failed or partial fetch
+  erased earlier findings — one HTTP 429 downgraded a known-exposed password
+  to *not exposed*. And a verdict outlived the password it described. Both
+  fixed; verdicts now survive a fetch they could not make and die with the
+  value they described.
+- **The breach request counted your passwords.** One request per distinct
+  password revealed exactly how many there were, and successive runs revealed
+  when one changed. The list is now padded with random decoys to a multiple
+  of eight and shuffled. `curl` also ran without `-q`, so an `-o` line in the
+  user's `~/.curlrc` sent the body to a file and the empty result read as
+  "not in the corpus".
+- **The 2FA shared secret went into an unwiped dependency.** `totp-rs` is
+  gone; HOTP is computed here against the RFC 6238 and RFC 4226 vectors, with
+  the secret borrowed from the arena. The full SHA-1 of every password is
+  now built in a `Zeroizing` buffer too.
+- **Import and export.** The exporter and importer disagreed about which
+  field the Password column holds, so a key with a passphrase came back
+  swapped; a CSV export was open to spreadsheet formula injection; a
+  Bitwarden custom field named `password` or `totp` silently replaced the
+  real one; blank lines and unrecognisable headers imported junk. All fixed,
+  and the JSON export now imports back whole, so a backup is restorable.
+- **Six defects in the deck**, including a first-run sheet that could be
+  stranded past step one with no way forward, a multi-line "cover" that was
+  paint over a field still accepting keystrokes, a 2FA fetch that was dropped
+  and never re-issued, results that repopulated a closed deck, and a
+  screen-lock hook that missed an unlock completing behind the lock screen.
+
 ### Fixed — tests wrote into the operator's state
 
 - Every test that created a vault used to record its epoch in the real

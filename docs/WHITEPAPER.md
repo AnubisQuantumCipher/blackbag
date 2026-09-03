@@ -780,11 +780,22 @@ byte string is served from scratch when it fits and refused otherwise, which
 is the behaviour wanted for a hostile file too; and `Guarded`'s deserializer
 asks for `deserialize_bytes` rather than `deserialize_byte_buf`, so `ciborium`
 serves each field straight out of that scratch instead of building an
-intermediate `Vec`. Between the file and a record the only unlocked memory a
-secret byte touches is the heap `Vec` that `Guarded::new` seals in place —
-plaintext for the length of one XChaCha20-Poly1305 call, then overwritten by
-its own ciphertext — and the register and stack state inside the AEAD. The
-generator's `Scratch` is a `SecretBuf` as well.
+intermediate `Vec`. Between the file and a record the only unlocked
+memory a secret byte touches is the register and stack state inside the AEAD.
+The generator's `Scratch` is a `SecretBuf` as well.
+
+Both sealing paths were the exception to that until an adversarial review of
+2.5.0 found them. `crypto::seal` called `aead::Aead::encrypt`, whose blanket
+implementation stages the entire plaintext in a fresh heap `Vec` before
+encrypting it — so every `Vault::save` put the whole padded vault, and every
+recipient wrap put the data key, into swappable memory for the length of the
+cipher pass; and `Guarded::new` called `plain.to_vec()` on a locked buffer,
+copying each record field straight back out, then reallocated to append the
+tag. Both now copy into a `SecretBuf` and call `encrypt_in_place_detached`
+there, mirroring what `crypto::open` already did, and the single allocation
+that leaves the arena holds ciphertext. `crypto.rs` no longer imports `Aead`
+at all, so restoring that pattern cannot compile without restoring the import
+with it.
 
 What this buys, stated exactly. The set of bytes that must never reach disk
 shrinks from every secret in the vault to 32 bytes, so the 8 MiB memlock
@@ -807,13 +818,29 @@ property of the design.
 **What the `/proc/self/mem` test proves, and what it cannot.**
 `secmem::tests::a_resting_secret_is_nowhere_in_writable_memory` assembles a
 needle at run time (so the literal is not sitting in `.rodata` for the scan to
-trip over), seals it, opens it once, drops the opened buffer, re-enables
-`PR_SET_DUMPABLE` for the test process, parses every `rw` mapping under
-256 MiB out of `/proc/self/maps`, reads each through `/proc/self/mem` into a
-scan buffer allocated once — a buffer that grew between mappings would leave
-its own earlier contents in freed heap and then find them — and asserts the
-needle occurs nowhere but its own allocation. That proves the property the
-old design never had a test for: after a use ends, the plaintext is in none
+trip over) and does the whole seal-open-drop on a **worker thread that then
+parks and is never joined**, so that thread's stack stays mapped and anything
+the cipher left on it is still there to be found. Only then, on another
+thread, does it build the scanner: re-enable `PR_SET_DUMPABLE`, parse every
+`rw` mapping under 256 MiB out of `/proc/self/maps`, and allocate one chunk
+buffer. It reads each mapping in chunks with a **page-by-page fallback** and a
+seam carry, counts every page the kernel refused, and asserts the needle
+occurs nowhere but its own allocation.
+
+The first version of this test could not see what it existed to catch, and an
+adversarial review demonstrated it: the setup ran *after* the secret work,
+reusing exactly the frames and heap chunks a residue occupies, and a single
+unreadable page discarded its entire mapping — a 528-page worker stack thrown
+away for the sake of 16. The scanner now also has to earn its silence. A
+**positive control** needle is planted in a deliberately leaked allocation and
+the scan must find it before the absence of the real needle is allowed to
+mean anything, and the count of unreadable pages is asserted rather than
+swallowed (a live thread stack always has a band of never-faulted pages the
+kernel refuses with `EIO`; measured here as 32 of 2272). The session key's own
+page is excluded by name, because it is unreadable *by design* —
+`the_session_key_page_is_unreadable_through_proc_self_mem` asserts exactly
+that, which is the `memfd_secret` guarantee stated as a test rather than as a
+claim. Together they prove the property the old design never had a test for: after a use ends, the plaintext is in none
 of this process's heap, arena, stacks or other writable mappings. It cannot
 prove that no copy existed in a **register or stack frame inside the AEAD**
 while the seal or open was running, because the scan is taken afterwards. It
@@ -1047,11 +1074,27 @@ suspend, and a locked screen was not a locked vault.
 system bus: `PrepareForSleep(true)` as a signal on the
 `org.freedesktop.login1.Manager` interface, and `Lock` on the
 `org.freedesktop.login1.Session` interface of a session object. The watcher
-adds two match rules —
-`type='signal',sender='org.freedesktop.login1',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'`
-and the same shape for `…login1.Session` / `Lock` — with no path constraint,
-so a `Lock` on *any* session path is accepted and a user with several sessions
-is locked by any of them. `classify` turns `PrepareForSleep(true)` into
+adds match rules for both, plus one for `NameOwnerChanged` on
+`org.freedesktop.login1` so a logind restart is noticed. `Lock` is scoped to
+this process's own session, resolved with `GetSessionByPID`; where logind
+knows of no session for the agent — a user service often has none — any
+session's lock still counts, and the status line says *any session lock*
+rather than implying a guarantee it does not have.
+
+**Who counts as logind.** The bus rewrites every message's `SENDER` to a
+unique name, so a comparison against the well-known name never fires, and
+match rules are not consulted at all for a signal addressed to one
+connection. Before this was measured, any local process could send a forged
+`PrepareForSleep` straight at the agent and lock the vault at will —
+demonstrated against dbus-broker with one `busctl --system emit
+--destination=`. The watcher now asks the bus who owns
+`org.freedesktop.login1` (`GetNameOwner`), re-asks on `NameOwnerChanged`,
+requires that exact unique name on every signal it acts on, and refuses any
+signal carrying a destination header, since logind broadcasts. Verified after
+the change: forged unicast and forged broadcast are both ignored, and
+`loginctl lock-session` still locks.
+
+`classify` turns `PrepareForSleep(true)` into
 `LockReason::Suspend`, `PrepareForSleep(false)` (the wake-up) into nothing,
 and `Lock` into `LockReason::SessionLock`; anything that is not a signal is
 ignored, so a method call carrying the same interface and member is never an
@@ -1067,13 +1110,27 @@ authenticate with SASL `EXTERNAL` on the uid the kernel attaches to the
 socket, send `Hello`, send the two `AddMatch` calls and wait for each reply,
 then read and classify. It sends nothing derived from a secret and exposes no
 interface of its own. The parser (`parse_message`) is bounds-checked at every
-step, refuses a header or body over 1 MiB (`MAX_MESSAGE_BYTES`), and returns
-`None` on anything malformed rather than panicking;
+step and returns `None` on anything malformed rather than panicking;
 `sleepwatch::tests::malformed_bytes_never_panic` feeds it every prefix of a
-valid signal and every single-byte corruption of one. The worst a hostile bus
-can do is fail to mention a sleep — the position before this module existed —
-or announce one that is not happening, which locks the vault. Both fail safe.
-A connection that drops is retried every 20 s (`RETRY_DELAY`), and the
+valid signal and every single-byte corruption of one.
+
+**A message it cannot read costs one message, not the connection.** Every
+parse or size failure used to propagate out of the classify loop and end the
+connection, after which the watcher slept a flat twenty seconds — so one
+malformed or oversized unicast signal bought an attacker twenty seconds of
+blindness, and one every nineteen kept the watcher off the bus indefinitely
+while the vault carried its data key into suspend exactly as it had before
+the module existed. Measured, then fixed, then measured again. `read_message`
+now consumes the declared length whatever happens to it: a body over
+`MAX_MESSAGE_BYTES` is drained and skipped, a message the parser cannot walk
+is skipped, unknown header fields of every fixed-width type are stepped over
+per the specification, and only a genuine I/O failure — or a stream no longer
+carrying D-Bus at all — ends the connection. Three 2 MB shots in a row now
+leave the watcher in `watching`. The worst a hostile bus can do is fail to
+mention a sleep, or announce one that is not happening, which locks the
+vault. Both fail safe. A dropped connection is retried on a backoff starting
+at one second and growing to thirty (`FIRST_RETRY_DELAY`, `MAX_RETRY_DELAY`),
+and the
 watcher's state — `connecting`, `watching org.freedesktop.login1 for suspend
 and session lock`, `disconnected; reconnecting`, `unavailable: …` — is
 published verbatim as `session.sleep_watch` in `status.json`, so the deck's
@@ -1151,12 +1208,24 @@ The protocol is Pwned Passwords' k-anonymity range query, in three round trips
    sense the corpus means. Each candidate carries the record id, title, field
    name and the first five uppercase hex characters of the field's SHA-1
    (`PREFIX_LEN`): twenty bits, naming a bucket of on the order of a thousand
-   real leaked hashes. The CLI deduplicates and sorts the prefixes
-   (`distinct_prefixes`), so two records sharing a value produce one request
-   and the request order says nothing about the vault's order.
+   real leaked hashes. The full hash is built in a `Zeroizing` buffer at its
+   final size, so it neither reallocates nor lingers — it is the password's
+   hash, which is exactly what an offline attacker wants. The CLI
+   deduplicates the prefixes (`distinct_prefixes`), then pads the list with
+   random decoys up to a multiple of `PAD_TO` (eight) and shuffles it
+   (`padded_prefixes`). A decoy bucket belongs to no candidate and is never
+   consulted, so it costs one request and changes no result; what it buys is
+   that the number of requests no longer counts the vault's distinct
+   passwords, and their order no longer sorts them.
 2. **Buckets in from the service.** For each prefix the CLI runs
-   `curl --silent --show-error --fail --max-time 20 --header "Add-Padding: true"
-   --user-agent black-bag/<version> https://api.pwnedpasswords.com/range/<prefix>`.
+   `curl -q --silent --show-error --fail --max-time 20 --proto =https
+   --noproxy '*' --header "Add-Padding: true" --user-agent black-bag/<version>
+   https://api.pwnedpasswords.com/range/<prefix>`. `-q` comes first and is not
+   optional: without it an `-o` line in the user's `~/.curlrc` sent the body
+   to a file and left stdout empty, which parsed as an empty bucket and
+   therefore as *checked, and your password is not in it*. An empty body is
+   now a fetch failure, since with `Add-Padding` a real bucket is never
+   empty.
    `Add-Padding` asks the service to pad every response with fake entries so
    that bucket sizes carry no information about which bucket was fetched;
    padding entries have a count of zero and `parse_range` drops them, along
@@ -1174,17 +1243,31 @@ The protocol is Pwned Passwords' k-anonymity range query, in three round trips
    for the rest of the session folds it in as `Issue::Exposed { field,
    breaches }` — severity **High**, code `EXPOSED` — so the deck's hygiene
    card and `agent hygiene` carry the finding without asking the network
-   again. A fresh check replaces the map wholesale, so a value that was
-   exposed and has since been changed does not keep its old verdict.
+   again.
+
+   Two ways that map could lie, both found by review and both closed. It used
+   to be replaced wholesale, so a field whose bucket did not arrive counted as
+   unchecked and simply vanished — one HTTP 429, or a re-run with the network
+   down, silently downgraded a known-exposed password to *not exposed*.
+   `match_ranges` now takes the previous map and keeps the verdict of any
+   field it could not check, clearing only the fields it actually checked and
+   did not find. And a verdict used to outlive the password it described:
+   changing a field left its `EXPOSED` issue attached to the new value until
+   the next online check. `RecordDraft::apply_to` now reports which fields it
+   replaced or removed, the agent drops their verdicts, and deleting a record
+   drops its verdicts with it.
 
 **What the service sees, exactly.** From one IP address, in one burst: one
-HTTPS request per *distinct* prefix, each carrying five hex characters, the
-`Add-Padding` header and the user agent `black-bag/<version>`. That is: the
-number of distinct prefixes, which is a lower bound on the number of distinct
-password values in the vault; and for each, which bucket of about a thousand
-candidate hashes yours would be in if it is in the corpus at all. It does not
-see which suffix you hold, whether any matched, how many records share a
-value, or any title. Nothing else leaves the machine — no full hash, no
+HTTPS request per prefix in the *padded, shuffled* list, each carrying five
+hex characters, the `Add-Padding` header and the user agent
+`black-bag/<version>`. That is: the number of requests, which is the number
+of distinct password values in the vault rounded up to a multiple of eight;
+and for each, which bucket of about a thousand candidate hashes yours would
+be in *if* that prefix was a real one at all. It does not see which suffix
+you hold, whether any matched, which of the prefixes were real, how many
+records share a value, or any title. Before padding, the request count was
+the exact number of distinct passwords, and two runs from the same address
+revealed that one of them had changed. Nothing else leaves the machine — no full hash, no
 value, no metadata — and `breach::tests::a_report_never_carries_a_hash_or_a_value`
 asserts that neither the candidates the CLI sends nor the report it prints
 contains the value or the full hash, and that the report does not even carry
@@ -1219,11 +1302,14 @@ password nobody has leaked, only one Pwned Passwords has not seen.
   are outside this process. The CLI wraps its copy in `Zeroizing` too, and the
   clipboard path hands it to a helper whose address space is locked
   ([§9](#9-the-clipboard)).
-* **The sender check is delegated to the bus.** logind's signals arrive with
-  its unique name (`:1.6`) as sender rather than the well-known one, so
-  `sleepwatch::classify` refuses only a message whose sender is a *different*
-  `org.`-prefixed well-known name; enforcing `sender='org.freedesktop.login1'` is the
-  bus-side match rule's job. The only effect of a forged signal is a lock.
+* **The sender check is enforced in this process.** `sleepwatch::classify_from`
+  requires the exact unique name the bus reported as the owner of
+  `org.freedesktop.login1`, and refuses any signal carrying a destination
+  header. Delegating it to the match rule was not enough — a match rule is
+  never consulted for a unicast signal — and the delegation was the finding
+  that made forged locks trivial. What remains: a local process can still
+  cause a *denial* by other means, and the only effect of any forged signal
+  that did get through would be a lock, which is the safe direction.
 * **The lock is advisory.** `flock` excludes cooperating writers — the CLI,
   the agent, `import`. A process that writes the vault file without taking
   `<vault>.lock` is caught by the `FileStamp` check at save time, which
@@ -1425,7 +1511,7 @@ Every surface, and whether it can hold a secret.
 | Bar widget (`Panel.qml`) | Omarchy shell process | Never. Reads `status.json` and shells out to `black-bag status --publish` to refresh it. The QML never opens the agent socket itself; the CLI it spawns asks the agent for lock state (`Request::Status`, which carries no record data) and writes the result to the file. |
 | Cockpit (`Cockpit.qml`) | Omarchy shell process | Metadata always, while unlocked. A secret **only** during an explicit `SHOW`, held in a QML property behind a visible countdown, then cleared. `COPY` goes to the clipboard via the CLI and never enters the QML process. |
 | Editor (`Editor.qml`) | Omarchy shell process | Yes, while you are typing. Every secret box is masked with a show/hide toggle that re-masks on the reveal countdown, and a multi-line secret is covered until shown; the draft is passed to `black-bag agent add`/`edit` on stdin. An empty secret box means "keep what is stored", so editing a record never loads its existing secret into the form. A successful save and a dismissal empty the boxes. |
-| Agent | `black-bag agent serve` process | The DEK and every record field, as ciphertext under the session key; the session key itself, in `memfd_secret` memory (or a locked page, reported); plaintext only in the locked arena while a request uses it ([§7.2](#72-encrypted-at-rest-in-memory)), with two exceptions: a revealed value, in a `Zeroizing<String>` that is zeroized after the reply is written, and a TOTP shared secret, which is copied into an ordinary `Vec<u8>` for `totp-rs` on every `TotpCode` request and is not zeroized when that library drops it. The exposure map from a breach check — record id, field name, breach count — until lock. |
+| Agent | `black-bag agent serve` process | The DEK and every record field, as ciphertext under the session key; the session key itself, in `memfd_secret` memory (or a locked page, reported); plaintext only in the locked arena while a request uses it ([§7.2](#72-encrypted-at-rest-in-memory)), with two exceptions: a revealed value, in a `Zeroizing<String>` that is zeroized after the reply is written, and a TOTP shared secret, which `blackbag_core::totp` borrows straight out of the arena for the HMAC and does not copy. (`totp-rs` used to take it as an ordinary `Vec<u8>` and hold it unwiped for the life of its `TOTP` object; the dependency is gone.) The exposure map from a breach check — record id, field name, breach count — until lock. |
 | Agent socket | `$XDG_RUNTIME_DIR/black-bag/agent.sock`, mode 0600 in a 0700 directory, `SO_PEERCRED` checked, 3 s peer I/O timeout | Yes, in transit — inbound passphrases and drafts, outbound revealed fields. Every such string is `Zeroizing` on both ends. |
 | Clipboard | Wayland selection, served by the detached `black-bag clip-serve` helper ([§9](#9-the-clipboard)) | Yes, for the configured interval (30 s default; 5–600 s from the deck, up to 3600 s from the CLI, `0` for no timer), offered with `x-kde-passwordManagerHint`, cleared on time only if the selection is still ours. Every client that pasted keeps its copy. |
 | Omarchy clipboard history | `~/.local/state/omarchy/clipboard-history.json`, mode 0644 | Never, provided the capture script honours the hint — which the one on this machine does, at line 15. Under 2.4.1 it held every copied secret. |
@@ -1769,14 +1855,18 @@ it discloses.** Everything else about the account behind a credential —
 revocation, reachability, whether 2FA is enabled elsewhere — is unknown to the
 vault. `black-bag agent breach --online`, and the deck's CHECK BREACHES after
 its two-step confirm, sends to `api.pwnedpasswords.com` over HTTPS through
-`curl`: one request per distinct five-hex-character SHA-1 prefix among the
-vault's `password`, `passphrase` and `pin` fields, from your address, in one
+`curl`: one request per five-hex-character prefix in a list built from the
+vault's `password`, `passphrase` and `pin` fields, deduplicated, **padded with
+random decoys to a multiple of eight and shuffled**, from your address, in one
 burst, with a `black-bag/<version>` user agent and `Add-Padding: true`. The
-service therefore learns your address, the moment, the number of distinct
-prefixes — a lower bound on the number of distinct password values — and
-twenty bits of each; if it logs, it learns that a Black-Bag user at that
-address holds passwords in those buckets. It does not learn which suffix you
-hold, whether any matched, how many records share a value, or any title. The
+service therefore learns your address, the moment, the number of requests —
+the number of distinct password values rounded up to a multiple of eight —
+and twenty bits of each prefix; if it logs, it learns that a Black-Bag user at
+that address holds passwords in some of those buckets. It does not learn which
+suffix you hold, whether any matched, which prefixes were real, how many
+records share a value, or any title. Without padding the request count was the
+exact number of distinct passwords and successive runs revealed when one
+changed, which is what an earlier revision leaked. The
 matching happens in the agent; the full hash never leaves it, and the agent's
 sandbox has no network family at all. Absence from the corpus is not absence
 from every breach. Without `--online` nothing is sent and the command exits 2
@@ -1798,7 +1888,7 @@ shape.
 
 **13.15 — The dependency tree is trusted.** `argon2`, `chacha20poly1305`,
 `blake3`, `hmac`, `sha2`, `subtle`, `zeroize`, `ml-kem`, `x25519-dalek`,
-`ciborium`, `totp-rs` and the rest are taken on faith, along with everything
+`ciborium` and the rest are taken on faith, along with everything
 they pull in. No vendoring, no reproducible-build attestation, no supply-chain
 verification beyond `Cargo.lock`.
 
