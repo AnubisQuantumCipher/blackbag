@@ -147,8 +147,8 @@ eq(lockReasonLabel(""), "", "no reason")
   eq(shortStamp().length, 8, "stamp is YYYYMMDD")
   eq(/^\d{8}$/.test(shortStamp()), true, "stamp is all digits")
 
-  eq(IMPORT_FORMATS.length, 6, "every import format the engine has is offered")
-  eq(EXPORT_FORMATS.length, 2, "and every export format")
+  eq(IMPORT_FORMATS.length, 7, "every import format the engine has is offered")
+  eq(EXPORT_FORMATS.length, 3, "and every export format")
   eq(GEN_KINDS.length, 3, "and every generator kind")
 
   // The steppers must not be able to offer a value the clamp would reject.

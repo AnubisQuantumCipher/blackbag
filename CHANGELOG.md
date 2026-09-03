@@ -5,6 +5,26 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — Credential Exchange Format (CXF)
+
+- **`black-bag export --format cxf` and `import --format cxf`** — the FIDO
+  Alliance's standard for moving credentials, passkeys with their private keys
+  included, between managers. Every item carries a standard CXF credential
+  (basic-auth, totp, note, ssh-key, passkey) so another manager can read it,
+  plus a `_blackbag` extension that makes a Black-Bag-to-Black-Bag round trip
+  exact. A foreign CXF with no extension still imports its common types.
+  Offered in the deck's IMPORT and EXPORT choosers too.
+- Verified live: eight records including three passkeys with their private keys
+  exported to CXF and re-imported into a fresh vault, and a round-trip test
+  covering login, TOTP, note, SSH and passkey.
+
+### Fixed — passkeys did not survive an export
+
+- A latent gap the CXF work surfaced: the Black-Bag JSON export omitted the
+  passkey configuration (relying party, credential id, user handle), so a
+  passkey re-imported from an export lost everything but its private key. The
+  export now carries the config, and a round-trip test holds it there.
+
 ### Added — the vault as the freedesktop Secret Service
 
 - **`black-bag secretservice serve`** is a full `org.freedesktop.secrets` D-Bus

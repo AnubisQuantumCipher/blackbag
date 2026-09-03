@@ -131,7 +131,7 @@ Ordered by how much of §3 it leaves unbuilt.
 | 3.1 | `credProtect`, `credProps` | `credProps` yes; `credProtect` not persisted |
 | 3.2 | Virtual FIDO2 HID device over `/dev/uhid` | **done** — `black-bag key serve` presents the vault as a security key; CTAPHID + CTAP2 built and tested without a device, then driven end to end through the real kernel by an independent CTAP client and verified with `cryptography`. Needs the shipped udev rule + `uhid` module; `key doctor` diagnoses both |
 | 3.3 | `credentialsd` seam / `PasskeyProvider` trait | partial — the `ctap::authenticator::Backend` trait is the seam; `credentialsd` D-Bus registration is not wired |
-| 3.4 | CXF v1.0 import/export, 1PUX, KDBX | missing |
+| 3.4 | CXF v1.0 import/export, 1PUX, KDBX | **CXF done** — `export/import --format cxf`; standard credentials (basic-auth, totp, note, ssh-key, passkey-with-key) for interop plus a `_blackbag` extension for an exact round trip. Verified live: 8 records incl. 3 passkeys exported and re-imported. 1PUX/KDBX still missing |
 | 3.4 | Optional TPM sealing, `fprintd` | missing (correctly absent on this hardware, but no runtime detection either) |
 | 3.4 | `black-bag backup` | **done** — copies the sealed file (works while locked out), reads it back, records epoch + digest; `--list`/`--verify`; BACKUP section in the deck |
 | 3.5 | Per-client approval policy, "deny all agents" switch | **done** — per (client, item, capability), passphrase-proved, lockdown switch; ACCESS section in the deck shows and revokes it |

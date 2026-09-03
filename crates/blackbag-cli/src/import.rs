@@ -50,6 +50,9 @@ pub enum ImportFormat {
     /// This program's own JSON export. An export you cannot import is a
     /// backup you cannot restore.
     BlackBag,
+    /// FIDO Alliance Credential Exchange Format (CXF) v1.0 — the standard for
+    /// moving credentials, passkeys included, between managers.
+    Cxf,
 }
 
 /// Formats this build writes.
@@ -58,6 +61,8 @@ pub enum ImportFormat {
 pub enum ExportFormat {
     Json,
     Keepassxc,
+    /// FIDO Alliance Credential Exchange Format (CXF) v1.0.
+    Cxf,
 }
 
 /// What an import produced, before it is committed.
@@ -87,6 +92,7 @@ pub fn parse(format: ImportFormat, text: &str) -> Result<Imported> {
         ImportFormat::Chrome => chrome(text),
         ImportFormat::Csv => generic_csv(text),
         ImportFormat::BlackBag => black_bag_json(text),
+        ImportFormat::Cxf => cxf(text),
     }
 }
 
@@ -105,72 +111,76 @@ fn black_bag_json(text: &str) -> Result<Imported> {
 
     let mut out = Imported::default();
     for (n, item) in records.iter().enumerate() {
-        let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
-        let kind: Kind = match item.get("kind").and_then(|k| k.as_str()).unwrap_or("login").parse() {
-            Ok(k) => k,
-            Err(e) => {
-                out.skipped.push(format!("record {n} ({title}): {e}"));
-                continue;
-            }
-        };
-        let mut record = Record::new(kind, (!title.is_empty()).then(|| title.to_string()));
-
-        if let Some(tags) = item.get("tags").and_then(|t| t.as_array()) {
-            record.tags = tags
-                .iter()
-                .filter_map(|t| t.as_str().map(str::to_string))
-                .collect();
+        match record_from_export_item(item) {
+            Ok(record) => out.records.push(record),
+            Err(reason) => out.skipped.push(format!("record {n}: {reason}")),
         }
-        if let Some(attrs) = item.get("attributes").and_then(|a| a.as_object()) {
-            for (k, v) in attrs {
-                if let Some(v) = v.as_str() {
-                    set_attr_if(&mut record, k, v);
-                }
-            }
-        }
-        if let Some(secrets) = item.get("secrets").and_then(|s| s.as_object()) {
-            for (name, value) in secrets {
-                match decode_export_secret(value) {
-                    Some(bytes) => record.set_field(name, Secret::new(&bytes)),
-                    None => out
-                        .skipped
-                        .push(format!("record {n} ({title}): field '{name}' is not readable")),
-                }
-            }
-        }
-        if let Some(notes) = item.get("notes").and_then(|v| v.as_str()) {
-            set_notes_if(&mut record, notes);
-        }
-        if let Some(totp) = item.get("totp").filter(|t| !t.is_null()) {
-            let defaults = TotpConfig::default();
-            record.totp = Some(TotpConfig {
-                issuer: totp.get("issuer").and_then(|v| v.as_str()).map(str::to_string),
-                account: totp.get("account").and_then(|v| v.as_str()).map(str::to_string),
-                digits: totp
-                    .get("digits")
-                    .and_then(|v| v.as_u64())
-                    .map(|d| d as u8)
-                    .unwrap_or(defaults.digits),
-                step: totp
-                    .get("step")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.step),
-                algorithm: match totp.get("algorithm").and_then(|v| v.as_str()) {
-                    Some("sha256") => blackbag_core::record::TotpAlgorithm::Sha256,
-                    Some("sha512") => blackbag_core::record::TotpAlgorithm::Sha512,
-                    _ => blackbag_core::record::TotpAlgorithm::Sha1,
-                },
-                ..defaults
-            });
-        }
-
-        if let Err(e) = record.validate() {
-            out.skipped.push(format!("record {n} ({title}): {e}"));
-            continue;
-        }
-        out.records.push(record);
     }
     Ok(out)
+}
+
+/// Rebuild a record from one Black-Bag export object — the inverse of
+/// [`export_item_json`]. Shared with the CXF importer, whose `_blackbag`
+/// extension is exactly this object.
+fn record_from_export_item(item: &serde_json::Value) -> std::result::Result<Record, String> {
+    let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
+    let kind: Kind = item
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("login")
+        .parse()
+        .map_err(|e| format!("({title}): {e}"))?;
+    let mut record = Record::new(kind, (!title.is_empty()).then(|| title.to_string()));
+
+    if let Some(tags) = item.get("tags").and_then(|t| t.as_array()) {
+        record.tags = tags
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect();
+    }
+    if let Some(attrs) = item.get("attributes").and_then(|a| a.as_object()) {
+        for (k, v) in attrs {
+            if let Some(v) = v.as_str() {
+                set_attr_if(&mut record, k, v);
+            }
+        }
+    }
+    if let Some(secrets) = item.get("secrets").and_then(|s| s.as_object()) {
+        for (name, value) in secrets {
+            match decode_export_secret(value) {
+                Some(bytes) => record.set_field(name, Secret::new(&bytes)),
+                None => return Err(format!("({title}): field '{name}' is not readable")),
+            }
+        }
+    }
+    if let Some(notes) = item.get("notes").and_then(|v| v.as_str()) {
+        set_notes_if(&mut record, notes);
+    }
+    if let Some(totp) = item.get("totp").filter(|t| !t.is_null()) {
+        let defaults = TotpConfig::default();
+        record.totp = Some(TotpConfig {
+            issuer: totp.get("issuer").and_then(|v| v.as_str()).map(str::to_string),
+            account: totp.get("account").and_then(|v| v.as_str()).map(str::to_string),
+            digits: totp
+                .get("digits")
+                .and_then(|v| v.as_u64())
+                .map(|d| d as u8)
+                .unwrap_or(defaults.digits),
+            step: totp.get("step").and_then(|v| v.as_u64()).unwrap_or(defaults.step),
+            algorithm: match totp.get("algorithm").and_then(|v| v.as_str()) {
+                Some("sha256") => blackbag_core::record::TotpAlgorithm::Sha256,
+                Some("sha512") => blackbag_core::record::TotpAlgorithm::Sha512,
+                _ => blackbag_core::record::TotpAlgorithm::Sha1,
+            },
+            ..defaults
+        });
+    }
+    if let Some(pk) = item.get("passkey").filter(|p| !p.is_null()) {
+        record.passkey = serde_json::from_value(pk.clone())
+            .map_err(|e| format!("({title}): passkey config: {e}"))?;
+    }
+    record.validate().map_err(|e| format!("({title}): {e}"))?;
+    Ok(record)
 }
 
 /// A secret from the export: `{"encoding": "utf8"|"base64", "value": …}`.
@@ -183,6 +193,235 @@ fn decode_export_secret(value: &serde_json::Value) -> Option<Vec<u8>> {
         Some("utf8") => Some(text.as_bytes().to_vec()),
         _ => None,
     }
+}
+
+// ── CXF: FIDO Alliance Credential Exchange Format v1.0 ───────────────────────
+//
+// CXF is the standard for moving credentials — passwords, TOTP, SSH keys, and
+// crucially passkeys with their private keys — between managers. Two goals pull
+// in slightly different directions: interoperability (another manager should be
+// able to read what we write) and fidelity (a Black-Bag export re-imported into
+// Black-Bag should be byte-for-byte the same records). We serve both: every
+// item carries a standard CXF credential AND a `_blackbag` extension that is
+// the exact Black-Bag export object. Our own importer prefers the extension;
+// importing someone else's CXF falls back to the standard credentials.
+//
+// CXF v1.0 is newly finalized and no two implementations fully interoperate
+// yet, so this maps the credential types the vault actually holds and preserves
+// everything else through the extension rather than claiming coverage it cannot
+// demonstrate.
+
+use base64::Engine as _;
+
+fn b64url(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Base32 (RFC 4648, no padding) — TOTP secrets are carried this way in CXF.
+fn base32_encode(bytes: &[u8]) -> String {
+    base32::encode(base32::Alphabet::Rfc4648 { padding: false }, bytes)
+}
+
+/// One CXF credential for a record, by kind. Best-effort and standard; the
+/// `_blackbag` extension alongside it is what makes the round trip exact.
+fn cxf_credential(r: &Record) -> serde_json::Value {
+    use serde_json::json;
+    let attr = |name: &str| r.attribute(name).unwrap_or("").to_string();
+    let field_utf8 = |name: &str| {
+        r.field(name)
+            .and_then(|f| f.expose_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    };
+    match r.kind {
+        Kind::Login | Kind::Api | Kind::Bank | Kind::Wifi | Kind::Contact | Kind::Id => json!({
+            "type": "basic-auth",
+            "urls": r.attribute("url").map(|u| vec![u.to_string()]).unwrap_or_default(),
+            "username": { "fieldType": "string", "value": attr("username") },
+            "password": {
+                "fieldType": "concealed-string",
+                "value": field_utf8(r.fields.first().map(|f| f.name.as_str()).unwrap_or("password")),
+            },
+        }),
+        Kind::Totp => {
+            let seed = r.field("totp").map(|f| f.open());
+            let seed_bytes = seed.as_ref().map(|s| s.as_slice()).unwrap_or(&[]);
+            let t = r.totp.clone().unwrap_or_default();
+            json!({
+                "type": "totp",
+                "secret": base32_encode(seed_bytes),
+                "period": t.step,
+                "digits": t.digits,
+                "algorithm": t.algorithm.as_str(),
+                "username": t.account.unwrap_or_default(),
+                "issuer": t.issuer.unwrap_or_default(),
+            })
+        }
+        Kind::Note => json!({
+            "type": "note",
+            "content": r.notes.as_ref().and_then(|n| n.expose_str().ok()).map(|s| s.to_string()).unwrap_or_default(),
+        }),
+        Kind::Ssh => {
+            let seed = r.field(blackbag_core::ssh::SSH_SEED_FIELD).map(|f| f.open());
+            json!({
+                "type": "ssh-key",
+                "keyType": "ssh-ed25519",
+                "privateKey": {
+                    "fieldType": "concealed-string",
+                    "value": seed.map(|s| b64url(s.as_slice())).unwrap_or_default(),
+                },
+                "keyComment": attr("comment"),
+            })
+        }
+        Kind::Passkey => {
+            let cfg = r.passkey.clone();
+            let key = r.field(blackbag_core::passkey::PRIVATE_KEY_FIELD).map(|f| f.open());
+            json!({
+                "type": "passkey",
+                "credentialId": cfg.as_ref().map(|c| b64url(&c.credential_id)).unwrap_or_default(),
+                "rpId": cfg.as_ref().map(|c| c.rp_id.clone()).unwrap_or_default(),
+                "userName": cfg.as_ref().and_then(|c| c.user_name.clone()).unwrap_or_default(),
+                "userDisplayName": cfg.as_ref().and_then(|c| c.user_display_name.clone()).unwrap_or_default(),
+                "userHandle": cfg.as_ref().map(|c| b64url(&c.user_handle)).unwrap_or_default(),
+                "key": key.map(|k| b64url(k.as_slice())).unwrap_or_default(),
+                "algorithm": "ES256",
+            })
+        }
+        _ => json!({ "type": "note", "content": "" }),
+    }
+}
+
+fn render_cxf(records: &[Record]) -> Result<Zeroizing<String>> {
+    let items: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": b64url(r.id.as_bytes()),
+                "creationAt": r.created_at.timestamp(),
+                "modifiedAt": r.updated_at.timestamp(),
+                "title": r.title.clone().unwrap_or_default(),
+                "credentials": [cxf_credential(r)],
+                // The exact Black-Bag record, so our own re-import is lossless.
+                // Other managers ignore an unknown key; ours reads it.
+                "_blackbag": export_item_json(r),
+            })
+        })
+        .collect();
+
+    let doc = serde_json::json!({
+        "version": { "major": 1, "minor": 0 },
+        "exporterDisplayName": "Black-Bag",
+        "timestamp": chrono::Utc::now().timestamp(),
+        "accounts": [{
+            "id": b64url(b"black-bag"),
+            "userName": "",
+            "email": "",
+            "collections": [],
+            "items": items,
+        }],
+    });
+    Ok(Zeroizing::new(serde_json::to_string_pretty(&doc)?))
+}
+
+/// Parse a CXF document. Prefers each item's `_blackbag` extension for an exact
+/// round trip; otherwise maps the standard credential.
+fn cxf(text: &str) -> Result<Imported> {
+    let doc: serde_json::Value = serde_json::from_str(text).context("not a CXF document")?;
+    if doc.get("version").and_then(|v| v.get("major")).and_then(|m| m.as_u64()) != Some(1) {
+        bail!("this is not a CXF v1 document");
+    }
+    let mut out = Imported::default();
+    let accounts = doc.get("accounts").and_then(|a| a.as_array());
+    for account in accounts.into_iter().flatten() {
+        let items = account.get("items").and_then(|i| i.as_array());
+        for (n, item) in items.into_iter().flatten().enumerate() {
+            // The exact path.
+            if let Some(bb) = item.get("_blackbag") {
+                match record_from_export_item(bb) {
+                    Ok(record) => out.records.push(record),
+                    Err(reason) => out.skipped.push(format!("item {n}: {reason}")),
+                }
+                continue;
+            }
+            // The interop path: map the first standard credential we understand.
+            match record_from_cxf_item(item) {
+                Ok(Some(record)) => out.records.push(record),
+                Ok(None) => out
+                    .skipped
+                    .push(format!("item {n}: no credential type this build imports")),
+                Err(reason) => out.skipped.push(format!("item {n}: {reason}")),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Map a foreign CXF item's standard credential to a record. Covers the types
+/// a person is most likely to be bringing in: basic-auth, totp, note.
+fn record_from_cxf_item(item: &serde_json::Value) -> std::result::Result<Option<Record>, String> {
+    let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
+    let creds = item.get("credentials").and_then(|c| c.as_array());
+    let Some(creds) = creds else { return Ok(None) };
+    for cred in creds {
+        let cty = cred.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let val = |path: &[&str]| -> String {
+            let mut v = cred;
+            for p in path {
+                match v.get(p) {
+                    Some(next) => v = next,
+                    None => return String::new(),
+                }
+            }
+            v.as_str().unwrap_or("").to_string()
+        };
+        match cty {
+            "basic-auth" => {
+                let mut r = Record::new(Kind::Login, (!title.is_empty()).then(|| title.to_string()));
+                let user = val(&["username", "value"]);
+                if !user.is_empty() {
+                    set_attr_if(&mut r, "username", &user);
+                }
+                if let Some(urls) = cred.get("urls").and_then(|u| u.as_array()) {
+                    if let Some(u) = urls.first().and_then(|u| u.as_str()) {
+                        set_attr_if(&mut r, "url", u);
+                    }
+                }
+                let pw = val(&["password", "value"]);
+                if !pw.is_empty() {
+                    r.set_field("password", Secret::new(pw.as_bytes()));
+                }
+                r.validate().map_err(|e| format!("({title}): {e}"))?;
+                return Ok(Some(r));
+            }
+            "note" => {
+                let mut r = Record::new(Kind::Note, (!title.is_empty()).then(|| title.to_string()));
+                set_notes_if(&mut r, &val(&["content"]));
+                r.validate().map_err(|e| format!("({title}): {e}"))?;
+                return Ok(Some(r));
+            }
+            "totp" => {
+                let secret_b32 = val(&["secret"]);
+                let seed = base32::decode(
+                    base32::Alphabet::Rfc4648 { padding: false },
+                    &secret_b32.replace(' ', "").to_uppercase(),
+                )
+                .ok_or_else(|| format!("({title}): TOTP secret is not base32"))?;
+                let mut r = Record::new(Kind::Totp, (!title.is_empty()).then(|| title.to_string()));
+                r.set_field("totp", Secret::new(&seed));
+                r.totp = Some(TotpConfig {
+                    issuer: cred.get("issuer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string),
+                    account: cred.get("username").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string),
+                    digits: cred.get("digits").and_then(|v| v.as_u64()).map(|d| d as u8).unwrap_or(6),
+                    step: cred.get("period").and_then(|v| v.as_u64()).unwrap_or(30),
+                    ..TotpConfig::default()
+                });
+                r.validate().map_err(|e| format!("({title}): {e}"))?;
+                return Ok(Some(r));
+            }
+            _ => continue,
+        }
+    }
+    Ok(None)
 }
 
 // ── CSV ─────────────────────────────────────────────────────────────────────
@@ -821,51 +1060,12 @@ pub fn render(records: &[Record], format: ExportFormat) -> Result<Zeroizing<Stri
     match format {
         ExportFormat::Json => render_json(records),
         ExportFormat::Keepassxc => render_keepassxc(records),
+        ExportFormat::Cxf => render_cxf(records),
     }
 }
 
 fn render_json(records: &[Record]) -> Result<Zeroizing<String>> {
-    let mut items = Vec::with_capacity(records.len());
-    for r in records {
-        let mut secrets = serde_json::Map::new();
-        for f in &r.fields {
-            // A secret that is not UTF-8 — a raw TOTP seed, a binary key —
-            // is base64, and says so. An untagged fallback was
-            // indistinguishable from a value that merely looked like base64,
-            // so nothing could import this file back without guessing.
-            let value = match f.secret.expose_str() {
-                Ok(text) => serde_json::json!({ "encoding": "utf8", "value": text.to_string() }),
-                Err(_) => serde_json::json!({
-                    "encoding": "base64",
-                    "value": base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        f.secret.open().as_slice(),
-                    ),
-                }),
-            };
-            secrets.insert(f.name.clone(), value);
-        }
-        let notes = r
-            .notes
-            .as_ref()
-            .and_then(|n| n.expose_str().ok())
-            .map(|s| s.to_string());
-        items.push(serde_json::json!({
-            "id": r.id,
-            "kind": r.kind.as_str(),
-            "title": r.title,
-            "tags": r.tags,
-            "attributes": r.attributes.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<String, serde_json::Value>>(),
-            "secrets": secrets,
-            "notes": notes,
-            "totp": r.totp.as_ref().map(|t| serde_json::json!({
-                "issuer": t.issuer, "account": t.account, "digits": t.digits,
-                "step": t.step, "algorithm": t.algorithm.as_str(),
-            })),
-            "created_at": r.created_at,
-            "updated_at": r.updated_at,
-        }));
-    }
+    let items: Vec<serde_json::Value> = records.iter().map(export_item_json).collect();
     let doc = serde_json::json!({
         "format": "black-bag-export",
         "version": 1,
@@ -873,6 +1073,54 @@ fn render_json(records: &[Record]) -> Result<Zeroizing<String>> {
         "records": items,
     });
     Ok(Zeroizing::new(serde_json::to_string_pretty(&doc)?))
+}
+
+/// One record as the Black-Bag export object. The lossless representation, used
+/// both by our own JSON export and, verbatim, as the `_blackbag` extension that
+/// makes a CXF export round-trip exactly.
+fn export_item_json(r: &Record) -> serde_json::Value {
+    let mut secrets = serde_json::Map::new();
+    for f in &r.fields {
+        // A secret that is not UTF-8 — a raw TOTP seed, a binary key — is
+        // base64, and says so. An untagged fallback was indistinguishable from
+        // a value that merely looked like base64, so nothing could import this
+        // file back without guessing.
+        let value = match f.secret.expose_str() {
+            Ok(text) => serde_json::json!({ "encoding": "utf8", "value": text.to_string() }),
+            Err(_) => serde_json::json!({
+                "encoding": "base64",
+                "value": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    f.secret.open().as_slice(),
+                ),
+            }),
+        };
+        secrets.insert(f.name.clone(), value);
+    }
+    let notes = r
+        .notes
+        .as_ref()
+        .and_then(|n| n.expose_str().ok())
+        .map(|s| s.to_string());
+    serde_json::json!({
+        "id": r.id,
+        "kind": r.kind.as_str(),
+        "title": r.title,
+        "tags": r.tags,
+        "attributes": r.attributes.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "secrets": secrets,
+        "notes": notes,
+        "totp": r.totp.as_ref().map(|t| serde_json::json!({
+            "issuer": t.issuer, "account": t.account, "digits": t.digits,
+            "step": t.step, "algorithm": t.algorithm.as_str(),
+        })),
+        // The passkey configuration, when present. Without this a passkey does
+        // not survive an export round trip: its private key rides in `secrets`,
+        // but the relying party, credential id and user handle live here.
+        "passkey": r.passkey.as_ref().map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null)),
+        "created_at": r.created_at,
+        "updated_at": r.updated_at,
+    })
 }
 
 fn render_keepassxc(records: &[Record]) -> Result<Zeroizing<String>> {
@@ -1141,6 +1389,156 @@ mod tests {
         assert!(back.records[0].notes.is_none(), "the metadata block is not left in the notes");
         assert_eq!(back.records[1].kind, Kind::Note);
         assert_eq!(back.records[1].field("body").unwrap().expose_str().unwrap().as_str(), "line one\nline two");
+    }
+
+    #[test]
+    fn cxf_round_trips_the_kinds_it_exports() {
+        use blackbag_core::passkey::{Credential, NewCredential, PRIVATE_KEY_FIELD};
+
+        let mut login = Record::new(Kind::Login, Some("GitHub".into()));
+        login.set_attribute("username", "octocat");
+        login.set_attribute("url", "https://github.com");
+        login.set_field("password", Secret::from_str("hunter2"));
+
+        let mut totp = Record::new(Kind::Totp, Some("Bank 2FA".into()));
+        totp.set_field("totp", Secret::new(b"12345678901234567890"));
+        totp.totp = Some(TotpConfig {
+            issuer: Some("Bank".into()),
+            account: Some("me".into()),
+            digits: 6,
+            step: 30,
+            ..TotpConfig::default()
+        });
+
+        let mut note = Record::new(Kind::Note, Some("memo".into()));
+        note.set_field("body", Secret::from_str("line one\nline two"));
+
+        let mut ssh = Record::new(Kind::Ssh, Some("laptop".into()));
+        ssh.set_attribute("comment", "me@laptop");
+        ssh.set_field(blackbag_core::ssh::SSH_SEED_FIELD, Secret::new(&[7u8; 32]));
+
+        // A real passkey, private key and all.
+        let (created, _seed) = Credential::create(NewCredential {
+            rp_id: "example.com".into(),
+            rp_name: Some("Example".into()),
+            user_handle: b"user-handle".to_vec(),
+            user_name: Some("ada".into()),
+            user_display_name: Some("Ada".into()),
+            user_verified: true,
+            with_prf: false,
+            backed_up: false,
+        })
+        .unwrap();
+        let mut passkey = Record::new(Kind::Passkey, Some(created.credential.config.describe()));
+        passkey.passkey = Some(created.credential.config.clone());
+        passkey.set_field(PRIVATE_KEY_FIELD, Secret::new(created.credential.private_key()));
+
+        let originals = vec![login, totp, note, ssh, passkey];
+        let cxf = render(&originals, ExportFormat::Cxf).unwrap();
+
+        // It is valid CXF v1 with the standard shape a foreign reader expects.
+        let doc: serde_json::Value = serde_json::from_str(&cxf).unwrap();
+        assert_eq!(doc["version"]["major"], 1);
+        let items = doc["accounts"][0]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 5);
+        // The passkey item carries a standard passkey credential AND the key.
+        let pk = items.iter().find(|i| i["credentials"][0]["type"] == "passkey").unwrap();
+        assert_eq!(pk["credentials"][0]["rpId"], "example.com");
+        assert!(!pk["credentials"][0]["key"].as_str().unwrap().is_empty());
+
+        // And our own re-import is exact.
+        let back = parse(ImportFormat::Cxf, &cxf).unwrap();
+        assert_eq!(back.records.len(), 5, "{:?}", back.skipped);
+        let by_kind = |k: Kind| back.records.iter().find(|r| r.kind == k).unwrap();
+
+        let l = by_kind(Kind::Login);
+        assert_eq!(l.attribute("username"), Some("octocat"));
+        assert_eq!(l.field("password").unwrap().expose_str().unwrap().as_str(), "hunter2");
+
+        let t = by_kind(Kind::Totp);
+        assert_eq!(t.field("totp").unwrap().open().as_slice(), b"12345678901234567890");
+        assert_eq!(t.totp.as_ref().unwrap().issuer.as_deref(), Some("Bank"));
+
+        let s = by_kind(Kind::Ssh);
+        assert_eq!(s.field(blackbag_core::ssh::SSH_SEED_FIELD).unwrap().open().as_slice(), &[7u8; 32]);
+
+        let p = by_kind(Kind::Passkey);
+        assert_eq!(p.passkey.as_ref().unwrap().rp_id, "example.com");
+        assert_eq!(
+            p.field(PRIVATE_KEY_FIELD).unwrap().open().as_slice(),
+            created.credential.private_key(),
+            "the passkey private key survives the CXF round trip"
+        );
+    }
+
+    /// A foreign CXF (no `_blackbag` extension) still imports its common types.
+    #[test]
+    fn a_foreign_cxf_imports_by_its_standard_credentials() {
+        let doc = r#"{
+          "version": {"major":1,"minor":0},
+          "exporterDisplayName": "SomeOtherManager",
+          "accounts": [{
+            "id":"eA","items":[
+              {"title":"Mail","credentials":[
+                {"type":"basic-auth",
+                 "urls":["https://mail.example"],
+                 "username":{"fieldType":"string","value":"alice"},
+                 "password":{"fieldType":"concealed-string","value":"s3cret"}}]},
+              {"title":"VPN 2FA","credentials":[
+                {"type":"totp","secret":"GEZDGNBVGY3TQOJQ","period":30,"digits":6,"issuer":"VPN"}]},
+              {"title":"scratch","credentials":[
+                {"type":"note","content":"remember the milk"}]}
+            ]}
+          ]
+        }"#;
+        let back = parse(ImportFormat::Cxf, doc).unwrap();
+        assert_eq!(back.records.len(), 3, "{:?}", back.skipped);
+        let mail = back.records.iter().find(|r| r.title.as_deref() == Some("Mail")).unwrap();
+        assert_eq!(mail.kind, Kind::Login);
+        assert_eq!(mail.attribute("username"), Some("alice"));
+        assert_eq!(mail.field("password").unwrap().expose_str().unwrap().as_str(), "s3cret");
+        let vpn = back.records.iter().find(|r| r.title.as_deref() == Some("VPN 2FA")).unwrap();
+        assert_eq!(vpn.kind, Kind::Totp);
+        assert!(vpn.totp.is_some());
+        let scratch = back.records.iter().find(|r| r.title.as_deref() == Some("scratch")).unwrap();
+        assert_eq!(scratch.kind, Kind::Note);
+    }
+
+    /// The latent bug the CXF work surfaced: a passkey must survive the
+    /// Black-Bag JSON export too, config and private key both.
+    #[test]
+    fn a_passkey_survives_the_json_round_trip() {
+        use blackbag_core::passkey::{Credential, NewCredential, PRIVATE_KEY_FIELD};
+        let (created, _) = Credential::create(NewCredential {
+            rp_id: "example.com".into(),
+            rp_name: None,
+            user_handle: b"u".to_vec(),
+            user_name: Some("ada".into()),
+            user_display_name: None,
+            user_verified: true,
+            with_prf: false,
+            backed_up: false,
+        })
+        .unwrap();
+        let mut pk = Record::new(Kind::Passkey, Some("example.com".into()));
+        pk.passkey = Some(created.credential.config.clone());
+        pk.set_field(PRIVATE_KEY_FIELD, Secret::new(created.credential.private_key()));
+
+        let json = render(&[pk], ExportFormat::Json).unwrap();
+        let back = parse(ImportFormat::BlackBag, &json).unwrap();
+        assert_eq!(back.records.len(), 1, "{:?}", back.skipped);
+        let r = &back.records[0];
+        assert_eq!(r.passkey.as_ref().unwrap().rp_id, "example.com");
+        assert_eq!(
+            r.field(PRIVATE_KEY_FIELD).unwrap().open().as_slice(),
+            created.credential.private_key()
+        );
+    }
+
+    #[test]
+    fn cxf_refuses_a_non_cxf_document() {
+        assert!(parse(ImportFormat::Cxf, r#"{"format":"black-bag-export"}"#).is_err());
+        assert!(parse(ImportFormat::Cxf, "not json").is_err());
     }
 
     /// The shape the review found broken: an SSH key carrying both a

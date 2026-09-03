@@ -778,12 +778,14 @@ var IMPORT_FORMATS = [
   { key: "firefox",   label: "Firefox" },
   { key: "chrome",    label: "Chrome" },
   { key: "csv",       label: "Any CSV" },
-  { key: "black-bag", label: "Black-Bag" }
+  { key: "black-bag", label: "Black-Bag" },
+  { key: "cxf",       label: "Credential Exchange (CXF)" }
 ]
 
 var EXPORT_FORMATS = [
   { key: "json",      label: "Black-Bag JSON" },
-  { key: "keepassxc", label: "KeePassXC CSV" }
+  { key: "keepassxc", label: "KeePassXC CSV" },
+  { key: "cxf",       label: "Credential Exchange (CXF)" }
 ]
 
 var GEN_KINDS = [
