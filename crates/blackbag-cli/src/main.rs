@@ -307,6 +307,14 @@ enum AgentCommand {
         /// someone's behalf costs them a login that does not happen.
         #[arg(long)]
         refuse: bool,
+        /// Stand aside so the browser can reach a hardware key or a phone.
+        ///
+        /// While any extension holds the proxy, Chromium cannot reach either;
+        /// there is no pass-through. This is the way through: the request is
+        /// declined, the extension stands down for a minute, and the site is
+        /// retried.
+        #[arg(long, conflicts_with = "refuse")]
+        use_security_key: bool,
         /// Which credential to sign with, hex, when the request offers more
         /// than one.
         #[arg(long)]
@@ -1003,21 +1011,35 @@ fn cmd_agent(
         AgentCommand::PasskeyAnswer {
             nonce,
             refuse,
+            use_security_key,
             credential,
         } => {
-            let passphrase = if refuse {
-                Zeroizing::new(String::new())
-            } else {
+            // Only approving costs a passphrase. Saying "no" or "not with this
+            // authenticator" on someone's behalf denies them nothing they had.
+            let answering = !refuse && !use_security_key;
+            let passphrase = if answering {
                 tty::read_passphrase("Master passphrase, to approve: ")?
+            } else {
+                Zeroizing::new(String::new())
             };
             match session::ask(&Request::PasskeyAnswer {
                 nonce,
-                approve: !refuse,
+                approve: answering,
+                defer: use_security_key,
                 credential_id: credential,
                 passphrase,
             })? {
                 Response::Ok => {
-                    println!("{}", if refuse { "Refused." } else { "Approved." });
+                    println!(
+                        "{}",
+                        if use_security_key {
+                            "Standing aside for the browser's own path."
+                        } else if refuse {
+                            "Refused."
+                        } else {
+                            "Approved."
+                        }
+                    );
                     Ok(())
                 }
                 Response::Error { message } => bail!("{message}"),

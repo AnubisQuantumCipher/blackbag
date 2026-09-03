@@ -11,31 +11,57 @@
 const assert = require('node:assert');
 
 // The service worker touches `chrome` at load, so stub the surface it uses.
-globalThis.chrome = {
+// A stub browser, built so it does not have to be edited every time the
+// extension reaches for one more API.
+//
+// It was a hand-written literal once, and adding `chrome.alarms` to sw.js
+// broke this suite with "Cannot read properties of undefined" — a failure that
+// says nothing about the code under test. Anything not named below answers
+// with a namespace whose every member is a harmless no-op, so a new API is
+// only ever a real failure when the test actually depends on it.
+const noop = () => {};
+
+const listener = { addListener: noop, removeListener: noop, hasListener: () => false };
+const anyNamespace = () =>
+  new Proxy({}, {
+    get(_t, name) {
+      if (typeof name !== 'string') return undefined;
+      if (name.startsWith('on')) return listener;
+      return async () => undefined;
+    },
+  });
+
+const stub = {
   webAuthenticationProxy: {
     attach: async () => undefined,
     detach: async () => undefined,
-    onCreateRequest: { addListener() {} },
-    onGetRequest: { addListener() {} },
-    onIsUvpaaRequest: { addListener() {} },
-    onRequestCanceled: { addListener() {} },
-    onRemoteSessionStateChange: { addListener() {} },
+    onCreateRequest: listener,
+    onGetRequest: listener,
+    onIsUvpaaRequest: listener,
+    onRequestCanceled: listener,
+    onRemoteSessionStateChange: listener,
   },
   runtime: {
-    onStartup: { addListener() {} },
-    onInstalled: { addListener() {} },
-    onMessage: { addListener() {} },
-    onConnect: { addListener() {} },
-    sendNativeMessage() {},
+    onStartup: listener,
+    onInstalled: listener,
+    onMessage: listener,
+    onConnect: listener,
+    sendNativeMessage: noop,
     connectNative() {
-      return { onMessage: { addListener() {} }, onDisconnect: { addListener() {} },
-               postMessage() {}, disconnect() {} };
+      return { onMessage: listener, onDisconnect: listener,
+               postMessage: noop, disconnect: noop };
     },
     getURL: p => 'chrome-extension://test/' + p,
   },
-  storage: { session: { set: async () => {}, get: async () => ({}), remove: async () => {} } },
-  windows: { create: async () => {} },
+  storage: {
+    session: { set: async () => {}, get: async () => ({}), remove: async () => {} },
+    local: { set: async () => {}, get: async () => ({}), remove: async () => {} },
+  },
 };
+
+globalThis.chrome = new Proxy(stub, {
+  get: (target, name) => (name in target ? target[name] : anyNamespace()),
+});
 
 const {
   b64urlToBytes,

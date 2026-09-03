@@ -119,6 +119,15 @@ enum Outgoing {
         #[serde(skip_serializing_if = "Option::is_none")]
         prf_second: Option<String>,
     },
+    /// The human asked for the browser's own path — a hardware key, or a
+    /// phone.
+    ///
+    /// Its own reply rather than an `Error` with distinguishing prose, because
+    /// the extension has to *act* on it: while it holds the proxy nothing in
+    /// Chromium can reach a security key, so it must stand down for long
+    /// enough to plug one in. A security decision taken by comparing error
+    /// strings breaks the first time the wording is improved.
+    UseSecurityKey,
     /// Everything that went wrong, including a refusal. The extension turns
     /// this into a DOMException, and the page cannot tell "you said no" from
     /// "there was no such credential" — which is the correct amount for a web
@@ -226,6 +235,7 @@ fn handle_inner(incoming: Incoming, output: &mut impl Write) -> Result<Outgoing>
             match session::ask(&Request::PasskeyAnswer {
                 nonce,
                 approve: false,
+                defer: false,
                 credential_id: None,
                 passphrase: Default::default(),
             })? {
@@ -286,6 +296,7 @@ fn collect_until_answered(nonce: &str, output: &mut impl Write) -> Result<Outgoi
                     prf_second,
                 })
             }
+            Response::PasskeyUseSecurityKey => return Ok(Outgoing::UseSecurityKey),
             Response::Error { message } => return Ok(Outgoing::Error { message }),
             other => bail!("unexpected reply to collect: {other:?}"),
         }

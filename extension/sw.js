@@ -148,21 +148,99 @@ function serialize(work) {
 }
 
 async function attach() {
-  if (attached || attachBlocked) return;
+  // Standing aside means standing aside. A startup event, an install, or the
+  // popup's own status read would otherwise grab the proxy straight back and
+  // the security key would never get a look in.
+  if (Date.now() < (await standDownRemaining())) return;
+  // No `if (attached) return`. Attaching when already attached is harmless and
+  // resolves undefined, and the flag is in-memory state about a fact that
+  // lives in the browser — see `detach`.
   const error = await chrome.webAuthenticationProxy.attach();
   if (error) {
     // Almost always: another passkey extension got there first.
     attachBlocked = error;
-    attached = false;
+    await setAttached(false);
     return;
   }
-  attached = true;
+  attachBlocked = null;
+  await setAttached(true);
 }
 
+/**
+ * Give the proxy back.
+ *
+ * DELIBERATELY unguarded. This used to begin `if (!attached) return`, and that
+ * turned the security-key choice into a no-op: `attached` is a variable in a
+ * Manifest V3 service worker, the worker is torn down and revived freely, and
+ * a revived worker starts with `attached === false` while Chromium still has
+ * the extension attached — which is exactly why requests kept arriving. So the
+ * one moment somebody most needed us out of the way was the moment we did
+ * nothing. Measured live: stand aside, ask again immediately, and our own
+ * ceremony screen came up.
+ *
+ * Detaching when not attached resolves with an error string rather than
+ * throwing, so calling it unconditionally costs nothing.
+ */
 async function detach() {
-  if (!attached) return;
-  await chrome.webAuthenticationProxy.detach();
-  attached = false;
+  // The resolved value is not ignored, for the same reason `attach`'s is not:
+  // this API reports failure by resolving with a string. Silently dropping it
+  // is how "we stood aside" became something we believed and had not done.
+  const error = await chrome.webAuthenticationProxy.detach();
+  await chrome.storage.session.set({ lastDetach: error ?? 'ok' });
+  if (error) {
+    console.warn('Black-Bag: detach refused:', error);
+    return false;
+  }
+  await setAttached(false);
+  return true;
+}
+
+/**
+ * Remember attachment where a torn-down worker cannot forget it.
+ *
+ * Session storage, not local: it is a fact about this browser session, and a
+ * stale "attached" carried across a restart would be a lie in the popup.
+ */
+async function setAttached(on) {
+  attached = on;
+  await chrome.storage.session.set({ attached: on });
+}
+
+/**
+ * When the current stand-down ends, as a timestamp; 0 when there is none.
+ *
+ * Read from session storage rather than from the variable alone: this worker
+ * is torn down freely, and a stand-down that evaporated with it would let the
+ * next event re-attach in the middle of somebody reaching for their key.
+ */
+async function standDownRemaining() {
+  const stored = (await chrome.storage.session.get('standDownUntil')).standDownUntil ?? 0;
+  return Math.max(standDownUntil, stored);
+}
+
+/**
+ * The kill switch, and the way back.
+ *
+ * OFF hands the proxy to Chromium's own passkey path and stays off — no timer,
+ * because a switch that turned itself back on would not be a switch. ON clears
+ * any stand-down as well, since asking for it back is an explicit answer to
+ * the question a stand-down was waiting on.
+ */
+async function setEnabled(on) {
+  await chrome.storage.local.set({ enabled: on });
+  if (on) {
+    standDownUntil = 0;
+    await chrome.storage.session.remove('standDownUntil');
+    attachBlocked = null;
+    await serialize(attach);
+  } else {
+    await serialize(detach);
+  }
+}
+
+/** Whether the owner has left this extension switched on. Default: yes. */
+async function isEnabled() {
+  return (await chrome.storage.local.get('enabled')).enabled !== false;
 }
 
 // ── ceremonies ──────────────────────────────────────────────────────────────
@@ -191,7 +269,75 @@ async function awaitAnswer(port, requestId, nonce) {
   const entry = live.get(requestId);
   if (!entry || entry.cancelled) throw new Error('the request was cancelled');
   if (reply.type === 'result') return reply;
+  if (reply.type === 'use_security_key') throw new StandDown();
   throw new Error(reply.message ?? 'Black-Bag did not answer');
+}
+
+/**
+ * The person asked for the browser's own path instead.
+ *
+ * A class rather than a message, because `answer` has to *act* on it and a
+ * security decision taken by comparing prose breaks the first time somebody
+ * improves the wording.
+ */
+class StandDown extends Error {
+  constructor() {
+    super('Black-Bag stood aside so you can use a security key.');
+    this.name = 'StandDown';
+  }
+}
+
+/**
+ * How long to stay out of the way.
+ *
+ * Long enough to find a key, plug it in, and press it; short enough that
+ * forgetting to press it does not leave the profile without a passkey provider
+ * for the rest of the session. A minute is the figure the owner set.
+ */
+const STAND_DOWN_MS = 60_000;
+let standDownUntil = 0;
+
+/**
+ * Give the proxy back to Chromium for a minute.
+ *
+ * There is no pass-through: while any extension is attached, nothing in
+ * Chromium can reach a hardware key or a phone. Standing down is the only way
+ * to let one through, and re-attaching afterwards is what stops this being a
+ * one-way switch a person has to undo by hand.
+ *
+ * The timer is `setTimeout` in a worker that may well be torn down before it
+ * fires, so `standDownUntil` is the real record: every path that would attach
+ * checks it. The timeout is only the fast path.
+ */
+async function standDown() {
+  standDownUntil = Date.now() + STAND_DOWN_MS;
+  await chrome.storage.session.set({ standDownUntil });
+  await serialize(detach);
+  // An ALARM, not setTimeout.
+  //
+  // A Manifest V3 service worker is torn down after about thirty seconds of
+  // looking idle, and a worker waiting out a minute with nothing to do looks
+  // idle from the first second. `setTimeout` went with it — measured: the
+  // extension stood aside correctly and then never came back, because nothing
+  // was left alive to bring it back. Nor could anything else: while detached,
+  // no ceremony arrives to wake the worker, so this is the one path that can
+  // end a stand-down. An alarm is the documented way to be woken.
+  await chrome.alarms.create(REATTACH_ALARM, { when: Date.now() + STAND_DOWN_MS + 500 });
+}
+
+/** The alarm that ends a stand-down. */
+const REATTACH_ALARM = 'blackbag-reattach';
+
+/** Re-attach, but only once standing down has actually run its course. */
+async function reattachIfDue() {
+  if (Date.now() < (await standDownRemaining())) return;
+  await chrome.alarms.clear(REATTACH_ALARM);
+  standDownUntil = 0;
+  await chrome.storage.session.remove('standDownUntil');
+  // Do not undo the kill switch on the way back. Cleared first regardless, so
+  // a stand-down taken before the switch was thrown does not linger.
+  if (!(await isEnabled())) return;
+  await attach();
 }
 
 // NOTE: this extension does NOT build clientDataJSON, and must not start.
@@ -342,16 +488,35 @@ async function onGet(info) {
  */
 async function answer(info, work, complete) {
   let outcome;
+  let standingDown = false;
   try {
     const responseJson = JSON.stringify(await work(info));
     await complete({ requestId: info.requestId, responseJson });
     outcome = { ok: true };
   } catch (e) {
     console.warn('Black-Bag:', e);
-    // The page may say more than the site may. A site learns only
-    // NotAllowedError, because "you refused", "no such credential" and "the
-    // vault is locked" are each a fact about the contents of a vault.
-    outcome = { ok: false, message: String(e.message ?? e) };
+    // Standing aside is not a failure, and the page is told so — but the SITE
+    // still learns only NotAllowedError, because "use a security key instead"
+    // is a fact about what is in someone's vault too.
+    if (e instanceof StandDown) {
+      // NOTE the order: the request is completed below, and only then do we
+      // stand aside. Chromium refuses to detach while a proxied request is
+      // still outstanding — measured, the detach resolved with an error, was
+      // dropped on the floor, and the very next request came straight back to
+      // us. Standing aside has to be the last thing that happens.
+      standingDown = true;
+      outcome = {
+        ok: false,
+        standDown: true,
+        message: 'Black-Bag has stood aside for a minute. Ask the site to try again '
+               + 'and Chromium will offer your security key or phone.',
+      };
+    } else {
+      // The page may say more than the site may. A site learns only
+      // NotAllowedError, because "you refused", "no such credential" and "the
+      // vault is locked" are each a fact about the contents of a vault.
+      outcome = { ok: false, message: String(e.message ?? e) };
+    }
     try {
       await complete({
         requestId: info.requestId,
@@ -368,6 +533,8 @@ async function answer(info, work, complete) {
   } finally {
     live.delete(info.requestId);
   }
+  // After the request is finished with, never before. See the note above.
+  if (standingDown) await standDown();
   return outcome;
 }
 
@@ -458,124 +625,6 @@ chrome.runtime.onConnect.addListener(port => {
     .finally(() => chrome.storage.session.remove(String(requestId)));
 });
 
-/**
- * Answer a request, turning any failure into a DOMException.
- *
- * NotAllowedError for everything, deliberately. A page must not be able to
- * tell "you refused" from "there is no such credential" from "the vault is
- * locked" — each of those is a fact about the contents of someone's vault, and
- * a site that could distinguish them could enumerate it.
- */
-async function answer(info, work, complete) {
-  let outcome;
-  try {
-    const responseJson = JSON.stringify(await work(info));
-    await complete({ requestId: info.requestId, responseJson });
-    outcome = { ok: true };
-  } catch (e) {
-    console.warn('Black-Bag:', e);
-    // The page may say more than the site may. A site learns only
-    // NotAllowedError, because "you refused", "no such credential" and "the
-    // vault is locked" are each a fact about the contents of a vault.
-    outcome = { ok: false, message: String(e.message ?? e) };
-    try {
-      await complete({
-        requestId: info.requestId,
-        error: { name: 'NotAllowedError', message: 'Black-Bag did not complete this request.' },
-      });
-    } catch (also) {
-      // Completing can itself fail — Chromium refuses a response for a request
-      // it has already abandoned. Nested, because an exception thrown from the
-      // handler for an exception escapes this function entirely, and then the
-      // outcome is never recorded and the page that is waiting for it waits
-      // forever. That is not hypothetical: it is what this code did.
-      console.warn('Black-Bag: could not report the failure either:', also);
-    }
-  } finally {
-    live.delete(info.requestId);
-  }
-  return outcome;
-}
-
-// ── events ──────────────────────────────────────────────────────────────────
-//
-// Registered synchronously at load. A listener added inside an async callback
-// is not registered when the service worker is revived to deliver an event,
-// and the event is lost.
-
-chrome.webAuthenticationProxy.onCreateRequest.addListener(info => park(info, 'create'));
-chrome.webAuthenticationProxy.onGetRequest.addListener(info => park(info, 'assert'));
-
-/**
- * Park a request and put a full-screen page in front of the person.
- *
- * The ceremony is NOT run here. A Manifest V3 service worker is torn down when
- * it looks idle, and waiting for a human to decide looks idle — measured, the
- * worker went silent mid-ceremony and the page that asked waited forever for an
- * answer nobody could deliver. So the worker only records the job and opens
- * `ceremony.html`; that page is a live extension context, and it asks the
- * worker to do the work while it is on screen to keep it alive.
- */
-async function park(info, operation) {
-  try {
-    const details = JSON.parse(info.requestDetailsJson);
-    const caller = callerOrigin(details);
-    if (!caller) throw new Error('Chromium did not report a caller origin');
-
-    await chrome.storage.session.set({
-      [String(info.requestId)]: {
-        operation,
-        origin: caller.origin,
-        rpName: (operation === 'create' ? details.rp?.name : null) ?? null,
-        requestDetailsJson: info.requestDetailsJson,
-      },
-    });
-    jobs.set(info.requestId, { info, operation });
-
-    await chrome.windows.create({
-      url: chrome.runtime.getURL(`ceremony.html?requestId=${info.requestId}`),
-      type: 'popup',
-      state: 'fullscreen',
-    });
-  } catch (e) {
-    console.warn('Black-Bag:', e);
-    await chrome.webAuthenticationProxy[
-      operation === 'create' ? 'completeCreateRequest' : 'completeGetRequest'
-    ]({
-      requestId: info.requestId,
-      error: { name: 'NotAllowedError', message: 'Black-Bag did not complete this request.' },
-    });
-  }
-}
-
-
-// The ceremony page asks for the work to happen while it is open.
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== 'run') return false;
-  const job = jobs.get(message.requestId);
-  if (!job) {
-    sendResponse({ ok: false, message: 'This request is no longer waiting.' });
-    return false;
-  }
-  jobs.delete(message.requestId);
-  const complete =
-    job.operation === 'create'
-      ? d => chrome.webAuthenticationProxy.completeCreateRequest(d)
-      : d => chrome.webAuthenticationProxy.completeGetRequest(d);
-  // The outcome is written to session storage as well as returned. A reply
-  // travels down a channel that dies with this worker, and this worker is
-  // waiting on a human — so the answer has to survive it being torn down. The
-  // page reads storage; the direct reply is just the fast path.
-  answer(job.info, job.operation === 'create' ? onCreate : onGet, complete)
-    .then(async outcome => {
-      await chrome.storage.session.set({ [`outcome:${message.requestId}`]: outcome });
-      try { sendResponse(outcome); } catch { /* the page may already be gone */ }
-    })
-    .finally(() => chrome.storage.session.remove(String(message.requestId)));
-  // Keep the message channel open for the asynchronous reply.
-  return true;
-});
-
 chrome.webAuthenticationProxy.onIsUvpaaRequest.addListener(async info => {
   // Truthfully: a platform authenticator is available exactly when Black-Bag
   // is running, whether or not the vault happens to be open this second.
@@ -610,8 +659,59 @@ chrome.webAuthenticationProxy.onRemoteSessionStateChange.addListener(() => {
   serialize(attach);
 });
 
-chrome.runtime.onStartup.addListener(() => serialize(attach));
-chrome.runtime.onInstalled.addListener(() => serialize(attach));
+/** Attach on the way in, unless the owner switched it off. */
+async function attachIfEnabled() {
+  if (await isEnabled()) await attach();
+}
+
+// Every revival of this worker, not only startup and install.
+//
+// `onStartup` and `onInstalled` do not fire when the worker is merely revived
+// to deliver an event, so the in-memory flags began every revival wrong. This
+// reads back what was true and reconciles: attaching is idempotent, and
+// `attach` itself refuses while standing aside.
+serialize(async () => {
+  attached = (await chrome.storage.session.get('attached')).attached === true;
+  await attachIfEnabled();
+});
+
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === REATTACH_ALARM) serialize(reattachIfDue);
+});
+
+chrome.runtime.onStartup.addListener(() => serialize(attachIfEnabled));
+chrome.runtime.onInstalled.addListener(() => serialize(attachIfEnabled));
+
+// The popup asks what is going on, and can switch the provider off.
+//
+// Reading is not attaching: the popup used to call `attach()` to find out
+// whether it was attached, which meant opening it took the proxy back from
+// Chromium mid-stand-down.
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'state') {
+    (async () => {
+      const until = await standDownRemaining();
+      const session = await chrome.storage.session.get(['lastDetach', 'attached']);
+      sendResponse({
+        enabled: await isEnabled(),
+        // What was remembered, not what this worker happens to hold: a revived
+        // worker starts with the flag false while Chromium still has us.
+        attached: session.attached === true,
+        blocked: attachBlocked ?? null,
+        standDownSecs: Math.max(0, Math.ceil((until - Date.now()) / 1000)),
+        // Empty until a stand-down has been attempted. "ok" means Chromium
+        // took the proxy back; anything else is what it said instead.
+        lastDetach: session.lastDetach ?? '',
+      });
+    })();
+    return true;
+  }
+  if (message?.type === 'enable') {
+    setEnabled(message.on === true).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  return false;
+});
 serialize(attach);
 
 // Exported for the test harness; unused in the browser.

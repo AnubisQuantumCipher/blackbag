@@ -180,6 +180,17 @@ pub enum State {
     Approved { credential_id: Vec<u8> },
     /// A human refused it, or it expired.
     Refused { reason: &'static str },
+    /// A human wants the browser's own path instead — a hardware key, or a
+    /// phone.
+    ///
+    /// Distinct from a refusal because the caller has to act on it: while an
+    /// extension holds the proxy, nothing in Chromium can reach a security
+    /// key, so the only way to let one through is to stand down for a moment.
+    /// A refusal and "let something else handle it" would otherwise be one
+    /// string that the extension had to pattern-match, and a security decision
+    /// taken by string comparison is one that breaks the first time the
+    /// wording is improved.
+    Deferred,
 }
 
 impl Ceremony {
@@ -355,13 +366,27 @@ impl Desk {
 
     /// Refuse a ceremony.
     pub fn refuse(&mut self, nonce: &str, reason: &'static str, now: DateTime<Utc>) -> Result<()> {
+        self.set_state(nonce, State::Refused { reason }, now)
+    }
+
+    /// Stand aside so the browser's own path can run.
+    ///
+    /// Costs no passphrase, and must not: saying "not with this authenticator"
+    /// on someone's behalf denies them nothing they had. The worst a hostile
+    /// caller achieves is making a login take a second attempt, which is the
+    /// same thing `refuse` already allows.
+    pub fn defer(&mut self, nonce: &str, now: DateTime<Utc>) -> Result<()> {
+        self.set_state(nonce, State::Deferred, now)
+    }
+
+    fn set_state(&mut self, nonce: &str, state: State, now: DateTime<Utc>) -> Result<()> {
         self.expire(now);
         let ceremony = self
             .pending
             .iter_mut()
             .find(|c| c.nonce == nonce)
             .ok_or_else(|| anyhow!("no passkey request is waiting with that id"))?;
-        ceremony.state = State::Refused { reason };
+        ceremony.state = state;
         Ok(())
     }
 

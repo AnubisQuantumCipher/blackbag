@@ -17,3 +17,10 @@ node "$out"
 # The structural invariants run alongside the unit assertions: both are
 # "the deck's logic", and a split that has to be remembered gets forgotten.
 python3 ./structure.py
+
+# The extension's tests run here too: they are the same surface as far as a
+# person changing the passkey path is concerned, and a suite you have to
+# remember to run separately is one that gets run separately once.
+node ../../../extension/tests/encoding.test.js
+node ../../../extension/tests/structure.test.js
+node ../../../extension/tests/api-surface.test.js

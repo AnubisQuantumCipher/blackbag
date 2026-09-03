@@ -153,6 +153,28 @@ Item {
     answerProcess.running = true
   }
 
+  /// Stand aside so the browser can reach a hardware key or a phone.
+  ///
+  /// While Black-Bag is the passkey provider, nothing in Chromium can reach
+  /// either — there is no pass-through, and that is a property of the browser's
+  /// API rather than a choice made here. So the way to use a security key is
+  /// for this to get out of the way for a minute and for the site to be asked
+  /// again. The extension does the standing down; this only says so.
+  ///
+  /// Costs no passphrase, for the same reason refusing does not: saying "not
+  /// with this authenticator" on someone's behalf denies them nothing they
+  /// had. The worst a hostile caller achieves is a login that takes a second
+  /// attempt.
+  function useSecurityKey() {
+    if (consent.busy || !consent.ceremony) { consent.lapse(); return }
+    consent.errorText = ""
+    consent.busy = true
+    answerProcess.approving = false
+    answerProcess.command = ["black-bag", "agent", "passkey-answer",
+                             String(consent.ceremony.nonce), "--use-security-key"]
+    answerProcess.running = true
+  }
+
   Process {
     id: answerProcess
     property bool approving: true
@@ -201,6 +223,15 @@ Item {
     enabled: consent.open_
     context: Qt.WindowShortcut
     onActivated: consent.refuse()
+  }
+
+  // Not a bare letter and not Return: this stands the provider down for a
+  // minute, so it is a deliberate chord like the other two answers.
+  Shortcut {
+    sequences: ["Ctrl+K"]
+    enabled: consent.open_ && !consent.busy
+    context: Qt.WindowShortcut
+    onActivated: consent.useSecurityKey()
   }
 
   // Pick between accounts without reaching for the mouse.
@@ -555,6 +586,12 @@ Item {
         onActivated: consent.refuse()
       }
       ConsentButton {
+        label: "SECURITY KEY  ^K"
+        tone: Util.alpha(Color.foreground, 0.7)
+        tappable: !consent.busy
+        onActivated: consent.useSecurityKey()
+      }
+      ConsentButton {
         label: consent.busy ? "WORKING…" : "APPROVE  ^Y"
         tone: Color.accent
         tappable: !consent.busy && consent.secondsLeft > 0
@@ -568,9 +605,8 @@ Item {
     anchors.right: parent.right
     anchors.bottom: parent.bottom
     anchors.margins: metric.space(28)
-    text: consent.choices.length > 1
-      ? "^↑↓ choose  ·  ^Y approve  ·  esc refuse"
-      : "^Y approve  ·  esc refuse"
+    text: (consent.choices.length > 1 ? "^↑↓ choose  ·  " : "")
+        + "^Y approve  ·  ^K security key  ·  esc refuse"
     color: Util.alpha(Color.foreground, 0.4)
     font.family: metric.font.family
     font.pixelSize: metric.font.caption

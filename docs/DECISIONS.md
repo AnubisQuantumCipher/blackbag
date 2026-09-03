@@ -36,6 +36,38 @@ Chromium can reach a hardware key or a phone, and there is no pass-through.
 - *Real fix, later:* drive real keys from the daemon with `libwebauthn`
   (linux-credentials) so one picker offers vault / security key / phone. Not now.
 
+### The stopgap: done, and watched working
+
+`^K` on the consent screen (or the SECURITY KEY button). It costs no
+passphrase, for the same reason refusing does not: saying "not with this
+authenticator" on someone's behalf denies them nothing they had.
+
+Verified in Brave, both halves: with the extension attached, a registration
+was stood aside — the site got `NotAllowedError`, the very next request
+reached Chromium's own path instead of us, and a minute later a request
+reached us again without anyone touching anything.
+
+Three things had to be got right, and each was wrong first:
+
+1. **The order.** Chromium refuses to detach while a proxied request is still
+   outstanding, and reports it by *resolving* with an error string. Detaching
+   before completing the request looked like it worked and did nothing.
+2. **`attached` is not a fact this process owns.** It was a variable in a
+   service worker, and a revived worker starts with it `false` while Chromium
+   still has the extension attached — which is why requests kept arriving.
+   `detach()` is unconditional now, and attachment is remembered in session
+   storage.
+3. **`setTimeout` cannot end a stand-down.** The worker is torn down after
+   about thirty seconds of looking idle, and a worker waiting out a minute
+   looks idle from the first second. Nothing else can wake it either: while
+   detached, no ceremony arrives. It takes an alarm, so the extension now asks
+   for the `alarms` permission and nothing else changed.
+
+**The popup gained the kill switch** at the same time, since it is the same
+capability without the timer. Reading its state no longer attaches — it used
+to call `attach()` to find out whether it was attached, so opening the popup
+took the proxy back in the middle of somebody reaching for their key.
+
 ## D2 — Backup-eligible and backup-state flags
 
 Owner's ruling: *"you're right, I was wrong."*

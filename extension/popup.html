@@ -51,17 +51,31 @@
     color: color-mix(in srgb, var(--fg) 55%, transparent);
   }
   .note b { color: var(--fg); font-weight: 700; }
+  button {
+    margin-top: 12px;
+    width: 100%;
+    padding: 8px 0;
+    font: inherit;
+    font-weight: 700;
+    letter-spacing: 1.4px;
+    background: transparent;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.danger { color: var(--urgent); }
+  button.go { color: var(--accent); }
 </style>
 
 <h1>BLACK-BAG</h1>
 <div class="sub">PASSKEY PROVIDER</div>
 
-<div class="row"><span class="k">provider</span><span class="v unknown" id="attached">checking…</span></div>
+<div class="row"><span class="k">provider</span><span class="v unknown" id="provider">checking…</span></div>
 <div class="row"><span class="k">vault</span><span class="v unknown" id="vault">checking…</span></div>
 
-<div class="note" id="note">
-  Every signature is approved by you <b>in Black-Bag</b>, not here. This page
-  cannot approve anything.
-</div>
+<div class="note" id="note">checking…</div>
+
+<button id="toggle" disabled>…</button>
 
 <script src="popup.js"></script>

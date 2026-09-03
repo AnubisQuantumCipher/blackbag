@@ -5,6 +5,67 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — a way through when you want your security key
+
+- **`^K` on the consent screen** returns `NotAllowedError` to the site, hands
+  the proxy back to Chromium for a minute so a hardware key or a phone can
+  actually be reached, and re-attaches on its own. While any extension holds
+  the passkey proxy, nothing in Chromium can reach either — there is no
+  pass-through, and that is a property of the browser's API rather than a
+  choice made here. Costs no passphrase, for the same reason refusing does
+  not: saying "not with this authenticator" on someone's behalf denies nobody
+  anything they had.
+- **A kill switch in the extension's popup**, which is the same capability
+  without the timer, and a mode indicator that says which of attached, off,
+  standing aside, or blocked by another extension is true right now.
+- **`docs/COMPAT.md`** — what Black-Bag depends on in other people's software,
+  quoted from their source with the line numbers it was read at: Chromium
+  writing the caller origin itself and refusing a pre-filled one, its
+  conditional-mediation refusal, and the ungated permission. The site matrix is
+  deliberately empty until each row is a ceremony somebody completed.
+
+### Fixed — the extension, three ways, each found by running it
+
+- **Every login opened two full-screen ceremony windows.** A large block of
+  `sw.js` had been pasted twice: the request listeners were registered twice,
+  and the stale copy of every function silently won, because a duplicate
+  function declaration in JavaScript is a redefinition rather than an error.
+  Two identical fullscreen windows stacked look exactly like one.
+- **Standing aside did nothing at all**, three times over: the detach happened
+  before the request was completed and Chromium refuses that (reporting it by
+  *resolving* with an error string, which was dropped); `detach()` was guarded
+  on an in-memory `attached` flag that a revived service worker starts with
+  false while Chromium still has the extension attached; and the re-attach was
+  a `setTimeout` in a worker that is torn down long before a minute is up, with
+  nothing else able to wake it because no ceremony arrives while detached. It
+  takes an alarm — hence the one new permission.
+- **Opening the popup took the proxy back.** It called `attach()` to find out
+  whether it was attached, so checking the status mid-stand-down cancelled the
+  stand-down. It asks the worker now.
+- **The kill switch worked exactly once from the keyboard.** Disabling a
+  focused element hands focus to the document.
+
+### Changed — a reply from another build says so
+
+- `session::ask` turns an unknown response variant into "these are different
+  versions" rather than passing serde's wording through. "unknown variant
+  `passkey_use_security_key`, expected one of …" is accurate and sends a reader
+  hunting for a protocol bug; what it means is that a browser spawned the
+  *installed* binary as its native messaging host while a freshly built agent
+  was serving.
+
+### Added — checks earned by the above
+
+- **`extension/tests/structure.test.js`** — one listener per event, one
+  definition per function, no surface that can approve, no permission that is
+  not used, and reading state does not change it. Every rule was checked
+  against the code that broke it.
+- **`extension/tests/api-surface.test.js`** — the API members `sw.js` calls and
+  the table in `docs/COMPAT.md` must be the same set. Documentation that has
+  quietly stopped matching sends the next reader to check the wrong thing.
+- The `chrome` stub in the encoding tests is a Proxy now, so reaching for one
+  more browser API is only a failure when a test actually depends on it.
+
 ### Added — nothing reads a secret without being asked about, once, per use
 
 - **An approval is per (program, item, capability).** Reading a value onto the

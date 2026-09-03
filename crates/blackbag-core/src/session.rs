@@ -234,6 +234,11 @@ pub enum Request {
     PasskeyAnswer {
         nonce: String,
         approve: bool,
+        /// Stand aside and let the browser's own path handle this — a hardware
+        /// key, or a phone. Needs no passphrase, for the same reason a refusal
+        /// does not: it denies nobody anything they had.
+        #[serde(default)]
+        defer: bool,
         #[serde(default)]
         credential_id: Option<String>,
         #[serde(default)]
@@ -323,6 +328,10 @@ pub enum Response {
         granted: Vec<crate::policy::Grant>,
         lockdown: bool,
     },
+    /// The human chose the browser's own path. The caller must stand down for
+    /// long enough that a hardware key or a phone can be reached, then tell
+    /// the site to try again.
+    PasskeyUseSecurityKey,
     Ok,
     Error { message: String },
 }
@@ -1580,10 +1589,18 @@ impl Agent {
 
             Request::PasskeyAnswer {
                 nonce,
+                defer,
                 approve,
                 credential_id,
                 passphrase,
             } => {
+                // Checked before `approve`, so a caller that sets both gets the
+                // weaker outcome rather than a signature.
+                if defer {
+                    self.consent.defer(&nonce, Utc::now())?;
+                    self.publish()?;
+                    return Ok(Response::Ok);
+                }
                 if !approve {
                     self.consent
                         .refuse(&nonce, "you refused this request", Utc::now())?;
@@ -1684,6 +1701,11 @@ impl Agent {
                 let credential_id = match ceremony.state {
                     State::Approved { credential_id } => credential_id,
                     State::Refused { reason } => bail!("{reason}"),
+                    // Its own reply, not an error string: the extension has to
+                    // act on this — stand down so a hardware key can be
+                    // reached — and a security decision taken by comparing
+                    // prose breaks the first time the prose is improved.
+                    State::Deferred => return Ok(Response::PasskeyUseSecurityKey),
                     State::AwaitingHuman => bail!("that request has not been answered"),
                 };
 
@@ -2212,7 +2234,87 @@ pub fn ask_at(path: &Path, request: &Request) -> Result<Response> {
     if line.trim().is_empty() {
         bail!("agent closed the connection without replying");
     }
-    Ok(serde_json::from_str(&line)?)
+    serde_json::from_str(&line).map_err(|e| {
+        // An unknown variant means the agent is a different build from this
+        // one — not a corrupt message. Say so, because the raw serde error
+        // ("unknown variant `passkey_use_security_key`, expected one of …")
+        // is an accurate sentence that sends a reader looking in entirely the
+        // wrong place. Measured: a browser spawned the installed binary as its
+        // native host while a freshly built agent was serving, and the whole
+        // afternoon went on the wrong hypothesis.
+        if e.to_string().contains("unknown variant") {
+            anyhow!(
+                "this build of black-bag ({}) does not understand what the agent \
+                 replied — they are different versions. Restart the agent from \
+                 the same binary as this one, or reinstall: {e}",
+                env!("CARGO_PKG_VERSION")
+            )
+        } else {
+            anyhow!("could not read the agent's reply: {e}")
+        }
+    })
+}
+
+/// A reply this build does not understand is a version mismatch, and says so.
+///
+/// The raw serde error is accurate and useless: "unknown variant
+/// `passkey_use_security_key`" reads like a corrupt message and sends a reader
+/// hunting for a protocol bug. What it actually means is that two copies of
+/// this program, built at different times, are talking to each other — which
+/// is easy to arrange by accident, because a browser spawns the *installed*
+/// binary as its native messaging host while a developer is running a freshly
+/// built agent.
+#[cfg(test)]
+mod version_mismatch_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn a_reply_from_another_build_names_the_problem() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = String::new();
+                let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut discard);
+                // A variant from a future build.
+                // The tag is `result`, which is what the wire actually uses.
+                let _ = stream.write_all(b"{\"result\":\"something_newer\"}\n");
+            }
+        });
+
+        let err = ask_at(&sock, &Request::Status).unwrap_err().to_string();
+        assert!(
+            err.contains("different versions"),
+            "the mismatch has to be named, not spelled out in serde's words: {err}"
+        );
+        assert!(
+            err.contains(env!("CARGO_PKG_VERSION")),
+            "and it has to say which build this is: {err}"
+        );
+    }
+
+    /// A genuinely malformed reply is still reported as malformed, not
+    /// misdiagnosed as a version skew.
+    #[test]
+    fn a_torn_reply_is_not_blamed_on_the_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = String::new();
+                let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut discard);
+                let _ = stream.write_all(b"{not json at all\n");
+            }
+        });
+
+        let err = ask_at(&sock, &Request::Status).unwrap_err().to_string();
+        assert!(err.contains("could not read the agent's reply"), "{err}");
+        assert!(!err.contains("different versions"), "{err}");
+    }
 }
 
 /// Whether an agent is currently listening.
@@ -2844,6 +2946,7 @@ mod passkey_agent_tests {
             &Request::PasskeyAnswer {
                 nonce: nonce.clone(),
                 approve: true,
+                defer: false,
                 credential_id: None,
                 passphrase: Zeroizing::new(PASS.into()),
             },
@@ -2883,6 +2986,7 @@ mod passkey_agent_tests {
                 &Request::PasskeyAnswer {
                     nonce: nonce.clone(),
                     approve: true,
+                    defer: false,
                     credential_id: Some(allow.to_string()),
                     passphrase: Zeroizing::new(PASS.into()),
                 },
@@ -2987,6 +3091,7 @@ mod passkey_agent_tests {
                 &Request::PasskeyAnswer {
                     nonce: nonce.clone(),
                     approve: true,
+                    defer: false,
                     credential_id: Some(cred.to_string()),
                     passphrase: Zeroizing::new(PASS.into()),
                 },
@@ -3011,6 +3116,101 @@ mod passkey_agent_tests {
             0,
             "a credential minted after the backup is not in it, and must not claim to be"
         );
+    }
+
+    /// Standing aside is its own answer, and it is not a signature.
+    ///
+    /// The extension has to act on it — detach so a hardware key can be
+    /// reached — which is why it comes back as its own reply rather than as an
+    /// error string the caller would have to pattern-match on.
+    #[test]
+    fn standing_aside_for_a_security_key_signs_nothing() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = make_one(&sock, "example.com");
+
+        let Response::PasskeyRegistered { nonce, .. } = begin(
+            &sock,
+            Operation::Assert,
+            "https://example.com",
+            "example.com",
+            vec![id.clone()],
+        ) else {
+            panic!("assert was not registered")
+        };
+
+        // No passphrase: saying "not with this authenticator" denies nobody
+        // anything they had, so it must not cost one.
+        assert!(matches!(
+            ask_at(
+                &sock,
+                &Request::PasskeyAnswer {
+                    nonce: nonce.clone(),
+                    approve: false,
+                    defer: true,
+                    credential_id: None,
+                    passphrase: Zeroizing::new(String::new()),
+                },
+            )
+            .unwrap(),
+            Response::Ok
+        ));
+
+        assert!(
+            matches!(
+                ask_at(&sock, &Request::PasskeyCollect { nonce: nonce.clone() }).unwrap(),
+                Response::PasskeyUseSecurityKey
+            ),
+            "the caller must be able to tell this from a refusal without reading prose"
+        );
+
+        // Single use, like every other answered ceremony: it cannot be
+        // collected again and turned into something else. The agent reports a
+        // refusal as a Response::Error rather than a transport failure, so
+        // that is what to look for.
+        assert!(
+            matches!(
+                ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap(),
+                Response::Error { .. }
+            ),
+            "an answered ceremony is collected exactly once"
+        );
+    }
+
+    /// A caller that sets both gets the weaker outcome, never a signature.
+    #[test]
+    fn deferring_beats_approving_when_a_caller_asks_for_both() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = make_one(&sock, "example.com");
+
+        let Response::PasskeyRegistered { nonce, .. } = begin(
+            &sock,
+            Operation::Assert,
+            "https://example.com",
+            "example.com",
+            vec![id.clone()],
+        ) else {
+            panic!("assert was not registered")
+        };
+
+        ask_at(
+            &sock,
+            &Request::PasskeyAnswer {
+                nonce: nonce.clone(),
+                // Both set, and the passphrase correct: still no signature.
+                approve: true,
+                defer: true,
+                credential_id: Some(id),
+                passphrase: Zeroizing::new(PASS.into()),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap(),
+            Response::PasskeyUseSecurityKey
+        ));
     }
 
     #[test]
@@ -3041,6 +3241,7 @@ mod passkey_agent_tests {
             &Request::PasskeyAnswer {
                 nonce: nonce.clone(),
                 approve: true,
+                defer: false,
                 credential_id: Some(id),
                 passphrase: Zeroizing::new(PASS.into()),
             },
@@ -3095,6 +3296,7 @@ mod passkey_agent_tests {
                 &Request::PasskeyAnswer {
                     nonce: nonce.clone(),
                     approve: true,
+                    defer: false,
                     credential_id: Some(id.clone()),
                     passphrase: Zeroizing::new(guess.into()),
                 },
@@ -3136,6 +3338,7 @@ mod passkey_agent_tests {
             &Request::PasskeyAnswer {
                 nonce: nonce.clone(),
                 approve: true,
+                defer: false,
                 credential_id: Some(id),
                 passphrase: Zeroizing::new(PASS.into()),
             },
@@ -3180,6 +3383,7 @@ mod passkey_agent_tests {
             &Request::PasskeyAnswer {
                 nonce: nonce.clone(),
                 approve: false,
+                defer: false,
                 credential_id: None,
                 passphrase: Zeroizing::new(String::new()),
             },
@@ -3328,6 +3532,7 @@ mod passkey_reveal_tests {
             &Request::PasskeyAnswer {
                 nonce: nonce.clone(),
                 approve: true,
+                defer: false,
                 credential_id: None,
                 passphrase: Zeroizing::new(PASS.into()),
             },

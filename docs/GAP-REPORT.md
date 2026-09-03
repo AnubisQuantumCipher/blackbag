@@ -124,7 +124,7 @@ Ordered by how much of §3 it leaves unbuilt.
 | 3.1 | `isUserVerifyingPlatformAuthenticatorAvailable` | partial — answered, but from host reachability, not vault state |
 | 3.1 | Conditional mediation | **impossible on the proxy route** (§1 above); needs the injection lane |
 | 3.1 | Signal API (`signalUnknownCredential` etc.) | missing |
-| 3.1 | Fallback to the browser's own path when the user declines | missing — we return `NotAllowedError` (D1 records the stopgap) |
+| 3.1 | Fallback to the browser's own path when the user declines | **done** — `^K` on the consent screen returns `NotAllowedError`, detaches for a minute so a hardware key can be reached, and re-attaches on an alarm; watched working in Brave |
 | 3.1 | `excludeCredentials`, `residentKey`, `userVerification` levels, `AbortSignal` | partial — allowCredentials and UV honoured; the rest not implemented |
 | 3.1 | Ed25519 (-8) and RS256 (-257) | missing — ES256 only |
 | 3.1 | **BE=1 and BS=1** | **done, D2** — BE=1 always; BS computed from a real backup and read live on every ceremony, so it turns off again when the copy is deleted |
@@ -140,7 +140,7 @@ Ordered by how much of §3 it leaves unbuilt.
 | 3.6 | `org.freedesktop.secrets` | missing |
 | 3.6 | Autotype via `wtype` | missing (clipboard fill works) |
 | 4 | `webauthn-rs` relying-party integration test | **done** — 7 tests in `tests/webauthn_rs_relying_party.rs` drive whole ceremonies against a real relying party; three are negative controls, so the positives mean something |
-| 4 | `docs/COMPAT.md` site matrix | missing |
+| 4 | `docs/COMPAT.md` site matrix | **written** — Chromium's origin injection, its conditional-mediation refusal and the permission gate are quoted with line numbers, and `extension/tests/api-surface.test.js` fails when the code and that file drift. The site matrix itself is deliberately empty until each row is a ceremony somebody completed |
 | 4 | Fresh-box CI, PKGBUILD | missing |
 | 4 | `cargo audit`, `cargo deny`, `cargo-fuzz` | missing (clippy is clean and enforced) |
 
