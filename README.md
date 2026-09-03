@@ -178,6 +178,18 @@ test that clears the buffer first and asserts the page is still released.
 
 ## Install
 
+On Arch/Omarchy, build the package straight from the checkout:
+
+```sh
+cd packaging && makepkg -si
+```
+
+That installs `black-bag`, the `blackbag-desktop` deck, the udev rule and module
+conf for the virtual security key, and the plugin under `/usr/share/blackbag`.
+The Secret Service activation file ships as an example — installing it is a
+deliberate step (see `black-bag secretservice doctor`).
+
+
 ```bash
 git clone <this repo> ~/Projects/blackbag
 cd ~/Projects/blackbag

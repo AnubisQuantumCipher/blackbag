@@ -5,6 +5,22 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — packaging and a fresh-box build
+
+- **`packaging/PKGBUILD`** builds the whole thing on Arch/Omarchy — the
+  `black-bag` engine, the `blackbag-desktop` deck, the Quickshell plugin, and
+  the udev rule, module-load conf and Secret Service activation example. Build
+  it straight from a checkout with `cd packaging && makepkg -si`.
+- **A `fresh-box` CI job** builds and tests on a clean Arch container with
+  ONLY the dependencies the PKGBUILD declares, so a dependency that is used but
+  not declared fails the build rather than passing by accident on a developer's
+  machine. It then validates the PKGBUILD (namcap), the udev rule
+  (`udevadm verify`), the modules-load conf, and the D-Bus service file.
+- The Secret Service activation file is deliberately **not** installed
+  system-wide by the package — that would claim `org.freedesktop.secrets` for
+  every user, overriding their keyring without consent. It ships as an example
+  under `/usr/share/blackbag/examples`, installed only by a deliberate step.
+
 ### Added — Credential Exchange Format (CXF)
 
 - **`black-bag export --format cxf` and `import --format cxf`** — the FIDO

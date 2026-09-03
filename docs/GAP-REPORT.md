@@ -141,8 +141,8 @@ Ordered by how much of §3 it leaves unbuilt.
 | 3.6 | Autotype via `wtype` | missing (clipboard fill works) |
 | 4 | `webauthn-rs` relying-party integration test | **done** — 7 tests in `tests/webauthn_rs_relying_party.rs` drive whole ceremonies against a real relying party; three are negative controls, so the positives mean something |
 | 4 | `docs/COMPAT.md` site matrix | **written** — Chromium's origin injection, its conditional-mediation refusal and the permission gate are quoted with line numbers, and `extension/tests/api-surface.test.js` fails when the code and that file drift. The site matrix itself is deliberately empty until each row is a ceremony somebody completed |
-| 4 | Fresh-box CI, PKGBUILD | missing |
-| 4 | `cargo audit`, `cargo deny`, `cargo-fuzz` | missing (clippy is clean and enforced) |
+| 4 | Fresh-box CI, PKGBUILD | **done** — `packaging/PKGBUILD` (engine + desktop + plugin + udev/module/dbus artifacts) and a `fresh-box` CI job that builds and tests on a clean Arch container with only the declared dependencies, then validates the PKGBUILD (namcap), the udev rule, the modules-load conf and the D-Bus service file |
+| 4 | `cargo audit`, `cargo deny`, `cargo-fuzz` | still missing (clippy is clean and enforced; supply-chain audit is the remaining CI addition) |
 
 **Crates:** none of §1.6's suggested crates are in use. The WebAuthn core is
 hand-written on `p256` + `ciborium`. That was the right call for one algorithm

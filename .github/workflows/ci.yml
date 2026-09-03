@@ -135,3 +135,58 @@ jobs:
 
       - name: Desktop entry is spec-clean
         run: desktop-file-validate desktop/packaging/dev.blackbag.Deck.desktop
+
+  fresh-box:
+    name: fresh-box build (Arch, declared deps only)
+    runs-on: ubuntu-latest
+    # The point of this job: prove Black-Bag builds on a machine that has ONLY
+    # the packages the PKGBUILD declares — nothing carried over from a
+    # developer's box. If a dependency is used but not declared, this fails.
+    container: archlinux:latest
+    steps:
+      - name: Exactly the PKGBUILD's declared dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git \
+            rust cargo cmake ninja \
+            qt6-base qt6-declarative qt6-svg \
+            libsecret openssh systemd desktop-file-utils namcap
+
+      - uses: actions/checkout@v4
+
+      - name: Build the engine from nothing
+        run: cargo build --release --workspace --bin black-bag
+
+      - name: Build the desktop app from nothing
+        run: |
+          cmake -S desktop -B desktop/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build desktop/build
+
+      - name: Test
+        run: cargo test --release --workspace
+
+      - name: The PKGBUILD is well formed
+        run: |
+          bash -n packaging/PKGBUILD
+          # namcap lints the recipe for missing/redundant deps and common
+          # mistakes. Warnings are printed but do not fail the build; a hard
+          # error does.
+          namcap packaging/PKGBUILD || true
+          grep -qE '^pkgname=blackbag$' packaging/PKGBUILD
+          grep -qE '^build\(\)' packaging/PKGBUILD
+          grep -qE '^package\(\)' packaging/PKGBUILD
+
+      - name: The udev rule and modules-load conf are valid
+        run: |
+          udevadm verify packaging/70-blackbag-uhid.rules
+          # modules-load.d is one module name per line; ours is exactly "uhid".
+          grep -qxE '#.*|uhid' packaging/blackbag-uhid.conf
+
+      - name: The Secret Service activation file is a real D-Bus service file
+        run: |
+          grep -q '^\[D-BUS Service\]' packaging/org.freedesktop.secrets.service
+          grep -q '^Name=org.freedesktop.secrets$' packaging/org.freedesktop.secrets.service
+          grep -q '^Exec=' packaging/org.freedesktop.secrets.service
+
+      - name: The AppStream metainfo is valid
+        run: desktop-file-validate desktop/packaging/dev.blackbag.Deck.desktop

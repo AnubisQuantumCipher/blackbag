@@ -1,0 +1,82 @@
+# Maintainer: Khephri Labs <khephri.labs@proton.me>
+#
+# Black-Bag: a hardened, RAM-resident credential vault for Omarchy, with
+# passkeys (browser proxy + virtual FIDO2 key), an SSH agent, a freedesktop
+# Secret Service, and a Quickshell deck.
+#
+# Build straight from a checkout:
+#   cd packaging && makepkg -si
+pkgname=blackbag
+pkgver=2.5.0
+pkgrel=1
+pkgdesc="Hardened RAM-resident credential vault: passkeys, SSH agent, Secret Service, Quickshell deck"
+arch=('x86_64' 'aarch64')
+url="https://github.com/AnubisQuantumCipher/blackbag"
+license=('MIT OR Apache-2.0')
+depends=('qt6-base' 'qt6-declarative' 'qt6-svg')
+makedepends=('rust' 'cargo' 'cmake' 'ninja' 'git')
+optdepends=(
+  'quickshell: the bar widget and cockpit plugin'
+  'brave-bin: the passkey browser extension host'
+  'openssh: use the SSH agent'
+  'libsecret: talk to the Secret Service'
+)
+# Built from the enclosing checkout; PKGBUILD lives in packaging/.
+source=()
+sha256sums=()
+
+_root="${startdir}/.."
+
+build() {
+  cd "$_root"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --release --frozen --workspace --bin black-bag
+  cmake -S desktop -B "$srcdir/desktop-build" -G Ninja -DCMAKE_BUILD_TYPE=Release
+  cmake --build "$srcdir/desktop-build"
+}
+
+check() {
+  cd "$_root"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo test --release --frozen --workspace
+}
+
+package() {
+  cd "$_root"
+
+  # Engines.
+  install -Dm755 "$srcdir/target/release/black-bag" "$pkgdir/usr/bin/black-bag"
+  install -Dm755 "$srcdir/desktop-build/blackbag-desktop" "$pkgdir/usr/bin/blackbag-desktop"
+
+  # Desktop integration.
+  install -Dm644 desktop/packaging/dev.blackbag.Deck.desktop \
+    "$pkgdir/usr/share/applications/dev.blackbag.Deck.desktop"
+  install -Dm644 desktop/packaging/dev.blackbag.Deck.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/dev.blackbag.Deck.metainfo.xml"
+  install -Dm644 desktop/packaging/black-bag.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/black-bag.svg"
+
+  # Lane B: the virtual FIDO2 key needs /dev/uhid, granted by uaccess (NOT the
+  # input group), and the module loaded at boot.
+  install -Dm644 packaging/70-blackbag-uhid.rules \
+    "$pkgdir/usr/lib/udev/rules.d/70-blackbag-uhid.rules"
+  install -Dm644 packaging/blackbag-uhid.conf \
+    "$pkgdir/usr/lib/modules-load.d/blackbag-uhid.conf"
+
+  # The Quickshell plugin, shipped read-only for the user to copy into
+  # ~/.config/omarchy/plugins (its install.sh does this).
+  install -d "$pkgdir/usr/share/blackbag/plugin"
+  cp -a plugin/khephri.blackbag/. "$pkgdir/usr/share/blackbag/plugin/"
+
+  # The Secret Service activation file is NOT installed system-wide: it would
+  # claim org.freedesktop.secrets for every user, overriding their keyring
+  # without consent. It ships as an example the user installs deliberately.
+  install -Dm644 packaging/org.freedesktop.secrets.service \
+    "$pkgdir/usr/share/blackbag/examples/org.freedesktop.secrets.service"
+
+  # Licences and docs.
+  for f in README.md SECURITY.md docs/COMPAT.md docs/DECISIONS.md; do
+    install -Dm644 "$f" "$pkgdir/usr/share/doc/$pkgname/$(basename "$f")"
+  done
+}
