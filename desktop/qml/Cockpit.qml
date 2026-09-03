@@ -267,6 +267,7 @@ Item {
     // send, and no way forward. Abandoning it closes it and hands the deck
     // back its own unlock screen, which is the only honest outcome.
     if (onboardSheet.open_) onboardSheet.abandon()
+    if (recoverSheet.open_) recoverSheet.clear()
   }
 
   // Focus the passphrase box only when it is actually on screen and usable.
@@ -914,13 +915,13 @@ Item {
       // while you are typing into a field.
       Shortcut {
         sequences: ["Esc"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_
         context: Qt.WindowShortcut
         onActivated: root.backOut()
       }
       Shortcut {
         sequences: ["Ctrl+L"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && root.unlocked
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && root.unlocked
         context: Qt.WindowShortcut
         onActivated: root.doLock()
       }
@@ -954,16 +955,25 @@ Item {
 
       Shortcut {
         sequences: ["Ctrl+R"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_
         context: Qt.WindowShortcut
         onActivated: {
           refreshProcess.running = true
           if (root.unlocked) root.refreshRecords()
         }
       }
+      // The way back in, from the sealed screen. Only when there is one.
+      Shortcut {
+        sequences: ["Ctrl+K"]
+        enabled: root.opened && !root.unlocked && !recordEditor.open_
+                 && !onboardSheet.open_ && !recoverSheet.open_
+                 && Model.canRecover(root.status)
+        context: Qt.WindowShortcut
+        onActivated: recoverSheet.begin()
+      }
       Shortcut {
         sequences: ["Ctrl+B"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && root.unlocked
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && root.unlocked
         context: Qt.WindowShortcut
         onActivated: root.requestBreachCheck()
       }
@@ -2793,6 +2803,28 @@ Item {
             textFormat: Text.PlainText
             renderType: Text.NativeRendering
           }
+
+          // The way back in. Shown only when this vault actually has a
+          // recipient whose key is held outside it — the deck used to be
+          // able to *mint* a recovery key in first run and then had no way
+          // to use one, which locked a GUI-only owner out of their own vault
+          // while they were holding the thing that opens it.
+          Text {
+            Layout.fillWidth: true
+            Layout.topMargin: metric.space(4)
+            visible: sealed.verdict.hasVault && !root.unlocking
+                     && Model.canRecover(root.status)
+            text: "forgotten it?  unlock with a recovery key  ·  ^K"
+            color: Util.alpha(Color.accent, recoverHover.hovered ? 1.0 : 0.55)
+            font.family: metric.font.family
+            font.pixelSize: metric.font.caption
+            textFormat: Text.PlainText
+            renderType: Text.NativeRendering
+            Accessible.role: Accessible.Button
+            Accessible.name: "unlock with a recovery key"
+            HoverHandler { id: recoverHover; cursorShape: Qt.PointingHandCursor }
+            TapHandler { onTapped: recoverSheet.begin() }
+          }
         }
 
         Text {
@@ -2804,6 +2836,9 @@ Item {
               return "⏎ create a vault  ·  esc close  ·  ⌘/ctrl +− size"
             if (!sealed.verdict.hasVault) return "esc close"
             if (sealed.blocked) return "detach the debugger to continue  ·  esc close"
+            if (Model.canRecover(root.status))
+              return "⏎ " + sealed.verdict.verb
+                   + "  ·  ^K recovery key  ·  esc close  ·  ⌘/ctrl +− size"
             // Advertised here because this is the screen people meet first,
             // and a surface that is the wrong size is only fixable by someone
             // who knows it can be resized.
@@ -2816,6 +2851,31 @@ Item {
           renderType: Text.NativeRendering
         }
       }
+
+    // ── the way back in ───────────────────────────────────────────────────
+    // Offered only when status.json actually lists a recipient whose private
+    // key is held outside the vault. A deck that invites you to recover a
+    // vault that cannot be recovered is worse than one that stays quiet.
+    Recover {
+      id: recoverSheet
+      motionMs: root.motionMs
+      uiScale: root.uiScale
+      homeDir: root.homeDir
+      recoverableLabels: Model.recoverableLabels(root.status)
+
+      // `recovery use` has just proved this passphrase opens the file, so the
+      // deck unlocks with it rather than asking a second time.
+      onRecovered: function (passphrase) {
+        refreshProcess.running = true
+        if (passphrase.length > 0) {
+          root.passphrase = passphrase
+          root.beginUnlock()
+        } else {
+          Qt.callLater(function () { root.focusPass() })
+        }
+      }
+      onDismissed: Qt.callLater(function () { root.focusPass() })
+    }
 
     // ── first run ─────────────────────────────────────────────────────────
     Onboard {

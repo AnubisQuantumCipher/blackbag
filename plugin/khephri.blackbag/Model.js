@@ -705,6 +705,22 @@ function recipientRows(status) {
   return out
 }
 
+// The labels of recipients whose private key is held outside the vault. A
+// vault with none of these cannot be opened without its passphrase, and the
+// deck must not offer a way back in that does not exist.
+function recoverableLabels(status) {
+  var out = []
+  var recips = asList(status ? status.recipients : null)
+  for (var i = 0; i < recips.length; i++)
+    if (recips[i] && recips[i].key_held_externally === true)
+      out.push(String(recips[i].label))
+  return out
+}
+
+function canRecover(status) {
+  return recoverableLabels(status).length > 0
+}
+
 // ── hygiene ──────────────────────────────────────────────────────────────────
 //
 // The engine serialises `Issue` externally tagged, which is two shapes:

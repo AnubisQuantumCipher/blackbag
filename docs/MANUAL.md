@@ -331,6 +331,37 @@ footer never asserts a clipboard state that has long since changed. Every
 button in the deck takes focus with `Tab`, shows a focus ring, and can be
 pressed with `Space` or `Enter`.
 
+### When you cannot remember the passphrase
+
+The sealed screen offers a way back in — *forgotten it? unlock with a recovery
+key · ^K* — but **only when this vault actually has a recipient whose private
+key is held outside it**. A vault with none cannot be recovered, and the deck
+does not pretend otherwise.
+
+`Ctrl+K`, or clicking the line, opens a two-step sheet:
+
+1. **The key file.** It defaults to where first run writes it,
+   `~/black-bag-recovery.key`, and says so — along with the fact that a USB
+   path usually starts `/run/media/` or `/media/`, because the home directory
+   is the one place the key should not have stayed. The sheet also lists the
+   labels this vault will accept, straight from `status.json`.
+2. **A new master passphrase**, twice, with a *show* toggle and a live
+   readout of how many characters are still needed. Twelve is the floor here,
+   as in first run.
+
+It then runs `black-bag recovery use`, which opens the vault with the key,
+mints a fresh data key, re-encrypts everything, re-wraps both recipients and
+sets the new passphrase. **Your recovery key keeps working** — it is
+re-wrapped under the new data key. The old passphrase stops working, which
+cannot be undone, and the sheet says so before you commit. `Esc` backs out at
+any point, including while the engine is working.
+
+Until 2.5.0 none of this existed in the deck: first run would talk you into
+minting a recovery key and the app then had no way to use one, so an owner who
+only ever opened the app was locked out of their own vault while holding the
+thing that opens it. The CLI could always do it (`black-bag recovery use
+--key <file>`), which was no help to someone who does not use a terminal.
+
 ### Copying, showing, and 2FA
 
 `Enter` copies the selected record's primary secret field to the clipboard via
@@ -466,6 +497,7 @@ Deck, with the record list focused:
 | `Backspace` | clear the kind filter |
 | `u` | focus the passphrase field (only while locked) |
 | `Ctrl+B` | check breaches — press twice; the first press arms and explains |
+| `Ctrl+K` | unlock with a recovery key (sealed screen; only when the vault has one) |
 | `Ctrl+L` | lock the agent now |
 | `Ctrl+R` | re-publish status and re-read the record list |
 | `Esc` | step back (see below) |

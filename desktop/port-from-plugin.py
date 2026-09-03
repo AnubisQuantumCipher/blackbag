@@ -153,6 +153,7 @@ import qs.Ui""",
 # handed $HOME by whichever surface owns it rather than asking the environment
 # itself, so this is the whole of its port.
 ONBOARD_EDITS = list(EDITOR_EDITS)
+RECOVER_EDITS = list(EDITOR_EDITS)
 
 # DeckMetrics wraps the host's Style singleton, so only the import differs.
 METRICS_EDITS = [
@@ -198,6 +199,10 @@ def main():
                            EDITOR_EDITS, "Editor.qml"),
         "Onboard.qml": port((PLUGIN / "Onboard.qml").read_text(),
                             ONBOARD_EDITS, "Onboard.qml"),
+        # The recovery sheet is host-neutral for the same reason the first-run
+        # sheet is: it is handed $HOME rather than asking for it.
+        "Recover.qml": port((PLUGIN / "Recover.qml").read_text(),
+                            RECOVER_EDITS, "Recover.qml"),
         "DeckMetrics.qml": port((PLUGIN / "DeckMetrics.qml").read_text(),
                                 METRICS_EDITS, "DeckMetrics.qml",
                                 rename_textfield=False),

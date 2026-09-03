@@ -108,6 +108,27 @@ eq(lockReasonLabel(""), "", "no reason")
   eq(sortHygiene(null), [], "no report sorts to nothing")
 }
 
+// ── the way back in ──────────────────────────────────────────────────────────
+{
+  const withKey = status({ recipients: [
+    { label: "passphrase", kind: "passphrase", key_held_externally: false },
+    { label: "offsite", kind: "hybrid-x25519-mlkem1024", key_held_externally: true }
+  ] })
+  eq(recoverableLabels(withKey), ["offsite"], "only externally-held keys count")
+  eq(canRecover(withKey), true, "a vault with a recovery recipient can be recovered")
+
+  const passphraseOnly = status({ recipients: [
+    { label: "passphrase", kind: "passphrase", key_held_externally: false }
+  ] })
+  eq(recoverableLabels(passphraseOnly), [], "a passphrase recipient is not a way back in")
+  eq(canRecover(passphraseOnly), false, "and the deck must not offer one")
+  eq(canRecover(status()), false, "no recipients at all")
+  eq(canRecover(null), false, "no status at all")
+  // Array-like from QML, the marshalling case asList exists for.
+  eq(recoverableLabels({ recipients: { length: 1, 0: { label: "usb", key_held_externally: true } } }),
+     ["usb"], "array-like recipients from QML")
+}
+
 // ── posture: session key ─────────────────────────────────────────────────────
 {
   const rows = postureRows(status({ host: { mlock_working: true, core_dumps_disabled: true, swap_devices: [],

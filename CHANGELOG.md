@@ -122,6 +122,32 @@ test that fails on the old behaviour.
   denied, private devices, no IPC, `UMask=0077`. Validated as a transient
   unit before it replaced the installed one.
 
+### Added — the deck can finally use a recovery key
+
+The first-run sheet would talk you into minting a recovery key, and the deck
+then had no way to use one. A person who only ever opens the app, and who
+forgets the passphrase, was locked out of their own vault by the surface that
+had asked them to make the key — the key sitting on their desk, which opens
+it. The CLI could always do it, which is no help to someone who does not use
+a terminal.
+
+- **`Ctrl+K` on the sealed screen**, and a visible *forgotten it? unlock with
+  a recovery key* line, shown **only when `status.json` lists a recipient
+  whose private key is held outside the vault**. A deck that offers to
+  recover a vault that cannot be recovered would be worse than a quiet one.
+- A two-step sheet: the key file (defaulting to where first run writes it,
+  and naming the labels this vault accepts), then a new master passphrase
+  twice with a show toggle and a live character count. It runs
+  `black-bag recovery use`, so the vault is re-keyed and the recovery key is
+  re-wrapped and keeps working.
+- The passphrase reaches the engine on stdin, never argv. Nothing is retained:
+  `clear()` runs on every exit path and the deck's own `clearSecrets()` calls
+  it. `Esc` always works, including while the engine is busy, and a
+  two-minute watchdog releases the sheet if the engine never answers.
+- Verified headless end to end: the offer appears, the sheet drives, the
+  vault is re-keyed, the deck unlocks itself with the new passphrase, the old
+  one stops working and the recovery key still opens the vault.
+
 ### Fixed — what an adversarial review of the above then found
 
 Everything in this release was put through a multi-agent review in which each

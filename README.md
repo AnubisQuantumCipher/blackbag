@@ -113,6 +113,14 @@ report until lock.
 
 **Import and export.** Bitwarden, KeePassXC, Firefox, Chrome and any CSV in;
 JSON or KeePassXC CSV out, plaintext by declaration and 0600 by construction.
+The JSON export imports back whole, so a backup is restorable.
+
+**A way back in that does not need a terminal.** The deck could mint a
+recovery key in first run and had no way to use one — so an owner who only
+opens the app was locked out of their own vault while holding the thing that
+opens it. `Ctrl+K` on the sealed screen now takes the key file and a new
+passphrase, re-keys the vault, and lets you straight in. The offer appears
+only when the vault actually has a recovery recipient.
 
 ![The breach check, done](docs/screenshots/breach.png)
 
