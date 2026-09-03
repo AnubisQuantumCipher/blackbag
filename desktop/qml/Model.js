@@ -26,11 +26,12 @@ var KIND_GLYPH = {
   id:       "▣",
   contact:  "✦",
   note:     "▭",
-  recovery: "✚"
+  recovery: "✚",
+  passkey:  "⚿"
 }
 
 var KIND_ORDER = ["login", "totp", "api", "ssh", "pgp", "wallet",
-                  "bank", "wifi", "id", "contact", "note", "recovery"]
+                  "bank", "wifi", "id", "contact", "note", "recovery", "passkey"]
 
 function kindGlyph(kind) {
   return KIND_GLYPH[String(kind)] || "·"
@@ -74,7 +75,24 @@ var KIND_TEMPLATE = {
   note:     { label: "Secure note",  attrs: [],
               secrets: ["body"], multiline: ["body"] },
   recovery: { label: "Recovery kit", attrs: ["description"],
-              secrets: ["payload"], multiline: ["payload"] }
+              secrets: ["payload"], multiline: ["payload"] },
+  // A passkey is never authored by hand: the browser mints it and the agent
+  // stores it. `secrets` is empty not because it holds none, but because its
+  // key material is not revealable — the engine refuses to hand it back, so
+  // offering a COPY button for it would be offering something that cannot
+  // happen.
+  passkey:  { label: "Passkey",      attrs: ["relying_party", "username"],
+              secrets: [], sealed: true }
+}
+
+/// Kinds whose secret fields are never revealed, copied or shown.
+///
+/// A passkey's private key has exactly one use and it happens inside the
+/// agent. `Request::Reveal` refuses it; this is the deck agreeing rather than
+/// drawing buttons that produce an error.
+function kindIsSealed(kind) {
+  var t = KIND_TEMPLATE[String(kind)]
+  return !!(t && t.sealed)
 }
 
 function templateFor(kind) {
@@ -106,10 +124,17 @@ function fieldLabel(name) {
   return map[String(name)] || String(name).replace(/_/g, " ")
 }
 
+/// The kinds a person can create by hand.
+///
+/// Not every kind: a passkey is minted by a browser ceremony and its private
+/// key never passes through a human's hands, so offering "new passkey" in the
+/// editor would offer a form nobody can fill in. The census still counts them,
+/// because a zero there is a measured zero.
 function kindChoices() {
   var out = []
   for (var i = 0; i < KIND_ORDER.length; i++) {
     var k = KIND_ORDER[i]
+    if (kindIsSealed(k)) continue
     out.push({ kind: k, glyph: kindGlyph(k), label: kindLabel(k) })
   }
   return out

@@ -195,7 +195,7 @@ eq(orDash(null), "—", "null is dash")
 
 // census must always return all twelve kinds so a zero is a measured zero
 const c = census([["login", 3], ["totp", 2]])
-eq(c.length, 12, "census covers every kind")
+eq(c.length, 13, "census covers every kind")
 eq(c[0], { kind: "login", glyph: "◉", count: 3 }, "census login")
 eq(c.find(r => r.kind === "wifi").count, 0, "census absent kind is 0")
 eq(totalRecords([["login", 3], ["totp", 2]]), 5, "total records")
@@ -406,7 +406,11 @@ eq(hygieneCount(null), 0, "no report counts zero rather than crashing")
 eq(templateFor("login").secrets, ["password"], "login asks for a password")
 eq(templateFor("contact").attrs.indexOf("phones") >= 0, true, "contact takes phone numbers")
 eq(templateFor("totp").totp, true, "totp is flagged as a 2FA kind")
-eq(kindChoices().length, 12, "every kind is offered in the picker")
+eq(kindChoices().length, 12, "every authorable kind is offered in the picker")
+eq(kindChoices().some(c => c.kind === "passkey"), false,
+   "a passkey is not authorable by hand and is not offered")
+eq(kindIsSealed("passkey"), true, "a passkey's key material is sealed")
+eq(kindIsSealed("login"), false, "an ordinary password is not")
 eq(isMultiline("note", "body"), true, "a note body is multiline")
 eq(isMultiline("login", "password"), false, "a password is not")
 

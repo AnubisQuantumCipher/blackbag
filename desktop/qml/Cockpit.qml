@@ -1536,7 +1536,7 @@ Item {
                     ? Model.totalRecords(agentCounts()) + " RECORDS" : "SEALED")
                 }
                 Repeater {
-                  // All twelve kinds, always, so a zero reads as a measured
+                  // All thirteen kinds, always, so a zero reads as a measured
                   // zero rather than as a row that happened not to be drawn.
                   model: root.unlocked ? Model.census(agentCounts()) : []
                   delegate: RowLayout {
@@ -2109,6 +2109,13 @@ Item {
                     RowLayout {
                       Layout.fillWidth: true
                       spacing: metric.spacing.sm
+                      // A passkey's key material is never handed back: the
+                      // engine refuses `Reveal` for it. Drawing COPY and SHOW
+                      // here would be drawing two buttons whose only outcome
+                      // is an error — and implying the key is exportable when
+                      // the whole point of it is that it is not.
+                      visible: !Model.kindIsSealed(
+                        root.selectedRecord ? root.selectedRecord.kind : "")
                       ActionButton {
                         label: "COPY"
                         tone: Color.accent
@@ -2120,6 +2127,20 @@ Item {
                         onActivated: root.showField(root.selectedRecord, modelData.name)
                       }
                       Item { Layout.fillWidth: true }
+                    }
+
+                    // Say why, rather than leaving a gap where two buttons were.
+                    Text {
+                      Layout.fillWidth: true
+                      visible: Model.kindIsSealed(
+                        root.selectedRecord ? root.selectedRecord.kind : "")
+                      text: "used to sign, in the agent — never shown, never copied"
+                      color: Util.alpha(Color.foreground, 0.45)
+                      font.family: metric.font.family
+                      font.pixelSize: metric.font.caption
+                      wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                      textFormat: Text.PlainText
+                      renderType: Text.NativeRendering
                     }
 
                     // The reveal, visible only while its countdown runs.

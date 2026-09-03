@@ -474,12 +474,23 @@ impl RecordDraft {
         }
 
         // A field the draft no longer lists is a field the user removed.
-        let kept: HashSet<&str> = self
+        //
+        // With one exception, and it is not a nicety. A passkey's key material
+        // is never authored, never revealed and therefore never present in a
+        // draft, so the ordinary rule would read its absence as a deletion and
+        // prune it — leaving a passkey record that still looks like a passkey
+        // and can never sign again. Silently, and with no way back. So the
+        // fields that make a passkey a passkey survive any draft.
+        let mut kept: HashSet<&str> = self
             .secrets
             .iter()
             .map(|(n, _)| n.as_str())
             .chain(self.totp.is_some().then_some("totp"))
             .collect();
+        if record.kind == Kind::Passkey {
+            kept.insert(crate::passkey::PRIVATE_KEY_FIELD);
+            kept.insert(crate::passkey::PRF_SEED_FIELD);
+        }
         for field in &record.fields {
             if !kept.contains(field.name.as_str()) {
                 changed.push(field.name.clone());
@@ -971,6 +982,18 @@ impl Agent {
                     .vault
                     .get(id)
                     .ok_or_else(|| anyhow!("record not found"))?;
+                // A passkey's private key has exactly one legitimate use, and it
+                // happens inside this process. There is no version of "show me
+                // the key" or "copy the key to the clipboard" that helps its
+                // owner, and both put an unexportable credential somewhere it
+                // can be exported. Refused at the engine rather than merely
+                // hidden in the deck, because hiding a button is not a control.
+                if record.kind == crate::record::Kind::Passkey {
+                    bail!(
+                        "a passkey's key material is never revealed; it is used \
+                         to sign, in the agent, and nowhere else"
+                    );
+                }
                 let secret = record
                     .field(&field)
                     .ok_or_else(|| anyhow!("no field named {field}"))?;
@@ -2363,5 +2386,147 @@ mod passkey_agent_tests {
             vec![],
         );
         assert!(matches!(r, Response::Error { .. }), "{r:?}");
+    }
+}
+
+#[cfg(test)]
+mod passkey_reveal_tests {
+    use super::tests::spawn_test_agent;
+    use super::*;
+    use crate::consent::Operation;
+
+    /// A passkey's private key must not be reachable through the one path that
+    /// returns secret bytes.
+    #[test]
+    fn a_passkey_private_key_is_never_revealed() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        ask_at(
+            &sock,
+            &Request::Unlock {
+                passphrase: Zeroizing::new("agent test passphrase".into()),
+            },
+        )
+        .unwrap();
+
+        // Mint one through the real ceremony.
+        let Response::PasskeyRegistered { nonce, .. } = ask_at(
+            &sock,
+            &Request::PasskeyBegin {
+                operation: Operation::Create,
+                origin: "https://example.com".into(),
+                rp_id: "example.com".into(),
+                rp_name: None,
+                allow_credentials: vec![],
+                client_data_json: hex(b"{}"),
+                user_handle: Some(hex(b"u")),
+                user_name: Some("ada".into()),
+                user_display_name: None,
+                want_prf: true,
+                prf_first_salt: None,
+                prf_second_salt: None,
+            },
+        )
+        .unwrap() else {
+            panic!("create was not registered")
+        };
+        ask_at(
+            &sock,
+            &Request::PasskeyApprove {
+                nonce: nonce.clone(),
+                credential_id: None,
+            },
+        )
+        .unwrap();
+        ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap();
+
+        let Response::Records { records } = ask_at(
+            &sock,
+            &Request::List {
+                kind: Some("passkey".into()),
+                query: None,
+            },
+        )
+        .unwrap() else {
+            panic!("list failed")
+        };
+        assert_eq!(records.len(), 1);
+        let id = records[0].id.clone();
+
+        for field in ["private_key", "prf_seed"] {
+            let reply = ask_at(
+                &sock,
+                &Request::Reveal {
+                    id: id.clone(),
+                    field: field.into(),
+                },
+            )
+            .unwrap();
+            match reply {
+                Response::Error { message } => {
+                    assert!(message.contains("never revealed"), "{message}")
+                }
+                other => panic!("{field} was revealed: {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod passkey_edit_tests {
+    use super::*;
+    use crate::passkey::{PRF_SEED_FIELD, PRIVATE_KEY_FIELD};
+    use crate::record::{Kind, Record, Secret};
+
+    /// Editing a passkey's title must not destroy the passkey.
+    ///
+    /// `apply_to` prunes every field a draft does not list, and a passkey's key
+    /// material is never in a draft because it is never authored and never
+    /// revealed. Without the guard this test covers, renaming a passkey would
+    /// leave a record that still says "passkey" and can never sign again.
+    #[test]
+    fn editing_a_passkey_keeps_the_key_that_makes_it_one() {
+        let mut record = Record::new(Kind::Passkey, Some("old title".into()));
+        record.set_field(PRIVATE_KEY_FIELD, Secret::new(b"the-private-key"));
+        record.set_field(PRF_SEED_FIELD, Secret::new(b"the-prf-seed"));
+
+        let draft = RecordDraft {
+            kind: "passkey".into(),
+            title: Some("new title".into()),
+            ..Default::default()
+        };
+        draft.apply_to(&mut record).unwrap();
+
+        assert_eq!(record.title.as_deref(), Some("new title"));
+        assert_eq!(
+            record.field(PRIVATE_KEY_FIELD).map(|f| f.open().to_vec()),
+            Some(b"the-private-key".to_vec()),
+            "the private key must survive an edit"
+        );
+        assert_eq!(
+            record.field(PRF_SEED_FIELD).map(|f| f.open().to_vec()),
+            Some(b"the-prf-seed".to_vec()),
+            "so must the PRF seed, or every site using it loses its data"
+        );
+    }
+
+    /// The exemption is narrow: an ordinary record still prunes.
+    #[test]
+    fn an_ordinary_record_still_drops_a_field_the_draft_omits() {
+        let mut record = Record::new(Kind::Login, Some("t".into()));
+        record.set_field("password", Secret::new(b"hunter2"));
+        record.set_field("private_key", Secret::new(b"not a passkey"));
+
+        let draft = RecordDraft {
+            kind: "login".into(),
+            title: Some("t".into()),
+            secrets: vec![("password".into(), Zeroizing::new("hunter2".into()))],
+            ..Default::default()
+        };
+        draft.apply_to(&mut record).unwrap();
+        assert!(record.field("password").is_some());
+        assert!(
+            record.field("private_key").is_none(),
+            "the passkey exemption must not leak to other kinds"
+        );
     }
 }
