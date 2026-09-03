@@ -468,6 +468,9 @@ fn default_secret_fields(kind: Kind) -> &'static [&'static str] {
         Kind::Contact => &[],
         Kind::Note => &["body"],
         Kind::Recovery => &["payload"],
+        // A passkey is minted by a browser ceremony, never typed at a
+        // prompt. There is no secret here a human could supply.
+        Kind::Passkey => &[],
     }
 }
 
@@ -1492,7 +1495,10 @@ mod tests {
             // an empty slice rather than a bogus field name.
             let fields = default_secret_fields(kind);
             match kind {
-                Kind::Contact | Kind::Totp => assert!(fields.is_empty()),
+                // Nothing a human types at a prompt: a contact has no secret, a
+                // TOTP secret arrives as an otpauth:// URI, and a passkey's
+                // private key is minted by the browser ceremony.
+                Kind::Contact | Kind::Totp | Kind::Passkey => assert!(fields.is_empty()),
                 _ => assert!(!fields.is_empty(), "{kind} has no default secret field"),
             }
         }

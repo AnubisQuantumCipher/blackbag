@@ -5,6 +5,47 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — passkeys, and the WebAuthn core that makes them possible
+
+- **`Kind::Passkey` and `crates/blackbag-core/src/passkey.rs`** — ES256
+  credential creation and assertion, COSE key encoding, `fmt: "none"`
+  attestation, authenticator-data assembly, and the WebAuthn PRF. Private keys
+  live in the vault in locked memory and are signed with in-process; nothing
+  outside ever holds key material.
+- **Verified against an implementation that shares no code with ours.**
+  `cargo run --example passkey_vector` emits a real registration and assertion;
+  `crates/blackbag-core/tests/passkey_cross_check.py` parses them with Python's
+  `cbor2` and `cryptography` the way a relying party does — walking the
+  authenticator data by offset, rebuilding the P-256 key from the COSE
+  coordinates alone, verifying the signature over
+  `authData || SHA-256(clientDataJSON)` — and accepts them. Our own tests only
+  prove the two halves of one library agree with each other.
+- **Origin binding is enforced here, because nothing else enforces it.**
+  Chromium's proxy API does not check that a returned assertion names the
+  origin it asked about, that the `rpIdHash` matches, or that the signature
+  verifies — measured, not assumed. `Credential::assert` refuses to sign unless
+  the relying-party id is a registrable-domain suffix of the caller origin, the
+  suffix match lands on a label boundary, and the origin is a secure context.
+- **No signature counter**, deliberately: WebAuthn L3 §6.1.1 makes it a SHOULD
+  and §7.2 skips the clone check when it is zero. On a vault that can be
+  restored from backup a counter invents clone warnings and hands relying
+  parties a correlation handle.
+
+### Fixed — the rollback tripwire could be disarmed with `rm`
+
+- **The witness failed open.** `Witness::load` ended in
+  `.ok().and_then(..).unwrap_or_default()`, so an unreadable, truncated or
+  malformed witness silently became an *empty* one — and an empty witness has
+  seen no epochs, so `check` reported no rollback. Deleting or corrupting a
+  file turned the anti-rollback mechanism off, which is strictly easier than
+  the restore-an-old-vault attack it exists to catch. It now distinguishes
+  absent (first run, benign) from unusable (reported), and the decision is
+  tested against its own file rather than the one every other test shares.
+- **`ed25519-dalek` was a declared dependency with no references anywhere** —
+  pure supply-chain surface on a security-critical path. Removed. The workspace
+  MSRV was also declared as 1.82 while `ml-kem` 0.3.2 requires 1.85.
+
+
 ### Added — the deck can now manage the vault, not just its records
 
 - **A management sheet on `Ctrl+M`** with six sections: passphrase, recovery

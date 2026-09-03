@@ -7,7 +7,7 @@ version = "2.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["sicarii <khephri.labs@proton.me>"]
-rust-version = "1.82"
+rust-version = "1.85"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -25,7 +25,15 @@ zeroize = { version = "1", features = ["derive", "serde"] }
 # between this and x25519-dalek below.
 ml-kem = { version = "0.3.2", features = ["zeroize", "getrandom"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
-ed25519-dalek = { version = "2", features = ["std"] }
+# P-256 for WebAuthn. ES256 (COSE alg -7) is the one algorithm every
+# relying party accepts, so a passkey provider that supports only one
+# supports this one. `ecdsa` gives the DER signature encoding WebAuthn
+# requires; `pkcs8` gives the SPKI form Chromium demands back in
+# `response.publicKey`.
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+# Used directly on the passkey key-generation path so no RNG object has
+# to cross the rand_core 0.6/0.10 boundary between `rand` and `p256`.
+getrandom = "0.2"
 ciborium = { version = "0.2", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

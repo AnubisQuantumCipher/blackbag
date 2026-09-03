@@ -706,7 +706,7 @@ fn field_role(name: &str) -> FieldRole {
 /// digits because the bank made it four; telling the owner to lengthen it is
 /// advice they cannot take.
 ///
-/// Matched exhaustively so a thirteenth [`Kind`] cannot inherit an answer here
+/// Matched exhaustively so a fourteenth [`Kind`] cannot inherit an answer here
 /// by default.
 fn numeric_pin_is_issued(kind: Kind) -> bool {
     match kind {
@@ -720,7 +720,8 @@ fn numeric_pin_is_issued(kind: Kind) -> bool {
         | Kind::Wifi
         | Kind::Contact
         | Kind::Note
-        | Kind::Recovery => false,
+        | Kind::Recovery
+        | Kind::Passkey => false,
     }
 }
 
@@ -736,7 +737,8 @@ fn rotatable(kind: Kind) -> bool {
         | Kind::Id
         | Kind::Contact
         | Kind::Note
-        | Kind::Recovery => false,
+        | Kind::Recovery
+        | Kind::Passkey => false,
     }
 }
 
@@ -754,7 +756,8 @@ fn second_factor_expected(kind: Kind) -> bool {
         | Kind::Id
         | Kind::Contact
         | Kind::Note
-        | Kind::Recovery => false,
+        | Kind::Recovery
+        | Kind::Passkey => false,
     }
 }
 

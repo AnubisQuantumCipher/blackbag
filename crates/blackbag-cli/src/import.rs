@@ -402,6 +402,7 @@ fn primary_field_for(kind: Kind) -> &'static str {
         Kind::Contact => "notes",
         Kind::Note => "body",
         Kind::Recovery => "payload",
+        Kind::Passkey => "private_key",
     }
 }
 

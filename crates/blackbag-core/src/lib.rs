@@ -11,6 +11,7 @@ pub mod generate;
 pub mod harden;
 pub mod hygiene;
 pub mod memlock;
+pub mod passkey;
 pub mod record;
 pub mod secmem;
 pub mod session;

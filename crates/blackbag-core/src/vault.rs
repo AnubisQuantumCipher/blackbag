@@ -781,13 +781,13 @@ fn write_vault_file(path: &Path, file: &VaultFile) -> Result<()> {
 /// 0.4.x could not detect at all.
 pub struct Witness;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct WitnessFile {
     #[serde(default)]
     entries: Vec<WitnessEntry>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct WitnessEntry {
     vault_id: Uuid,
     epoch: u64,
@@ -823,17 +823,47 @@ impl Witness {
         });
     }
 
-    fn load() -> WitnessFile {
-        Self::path()
-            .ok()
-            .and_then(|p| fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+    /// Read the witness, distinguishing "there isn't one yet" from "there is
+    /// one and it is not usable".
+    ///
+    /// This used to be `.ok().and_then(..).unwrap_or_default()`, which folded
+    /// every failure into an EMPTY witness. An empty witness has seen no
+    /// epochs, so `check` reported no rollback: the tripwire could be disarmed
+    /// by corrupting the file, which is strictly easier than the attack it
+    /// exists to catch. A missing file is still first-run and still fine — it
+    /// is the difference between missing and unreadable that has to survive.
+    fn load() -> Result<WitnessFile> {
+        Self::load_from(&Self::path()?)
+    }
+
+    /// The decision itself, against an explicit path, so it can be tested
+    /// without corrupting the witness every other test in this binary shares.
+    fn load_from(path: &Path) -> Result<WitnessFile> {
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WitnessFile::default())
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "the rollback witness at {} could not be read ({e}); \
+                     refusing to treat that as 'no rollback'",
+                    path.display()
+                ))
+            }
+        };
+        serde_json::from_str(&raw).map_err(|e| {
+            anyhow!(
+                "the rollback witness at {} is malformed ({e}); refusing to \
+                 treat that as 'no rollback'",
+                path.display()
+            )
+        })
     }
 
     /// Record `epoch` as the newest seen. Never lowers a stored value.
     pub fn record(_vault_path: &Path, vault_id: Uuid, epoch: u64) -> Result<()> {
-        let mut file = Self::load();
+        let mut file = Self::load()?;
         match file.entries.iter_mut().find(|e| e.vault_id == vault_id) {
             Some(entry) => {
                 if epoch > entry.epoch {
@@ -860,15 +890,22 @@ impl Witness {
 
     /// True when the vault's epoch is *behind* what we last saw.
     pub fn check(_vault_path: &Path, vault_id: Uuid, epoch: u64) -> Result<bool> {
-        Ok(Self::load()
+        Ok(Self::load()?
             .entries
             .iter()
             .find(|e| e.vault_id == vault_id)
             .is_some_and(|e| epoch < e.epoch))
     }
 
+    /// The highest epoch this machine remembers for `vault_id`.
+    ///
+    /// `None` covers both "never seen" and "the witness is unusable" — this is
+    /// the pre-unlock status path, which must not fail the whole status
+    /// document over a tripwire it cannot verify. `check` is the one that
+    /// refuses, and it runs with the vault open.
     pub fn seen_epoch(vault_id: Uuid) -> Option<u64> {
         Self::load()
+            .ok()?
             .entries
             .iter()
             .find(|e| e.vault_id == vault_id)
@@ -1273,5 +1310,75 @@ mod tests {
         Vault::init(&path, PASS, MEM).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "vault must not be group/world readable");
+    }
+}
+
+#[cfg(test)]
+mod witness_integrity_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Root ignores the permission bits, so that half of the test is
+    /// meaningless there and is skipped rather than quietly asserted.
+    fn nix_running_as_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// The rollback tripwire must not be disarmed by deleting or corrupting the
+    /// file it keeps its state in.
+    ///
+    /// `Witness::load` used to end in `.ok().and_then(..).unwrap_or_default()`,
+    /// so an unreadable, truncated or malformed witness silently became an
+    /// EMPTY witness — and an empty witness has seen no epochs, so `check`
+    /// reported no rollback. The whole mechanism could be turned off with `rm`,
+    /// which is a strictly easier move than the restore-an-old-vault attack it
+    /// exists to catch.
+    #[test]
+    fn a_corrupt_witness_is_not_silently_treated_as_a_clean_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("witness.json");
+
+        // Absent is first-run, and stays benign.
+        assert!(
+            Witness::load_from(&path).unwrap().entries.is_empty(),
+            "a witness that does not exist yet is an empty one, not an error"
+        );
+
+        // Present and readable round-trips.
+        let vault_id = Uuid::new_v4();
+        std::fs::write(
+            &path,
+            serde_json::to_string(&WitnessFile {
+                entries: vec![WitnessEntry {
+                    vault_id,
+                    epoch: 9,
+                    updated_at: Utc::now(),
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(Witness::load_from(&path).unwrap().entries[0].epoch, 9);
+
+        // Corrupt the way a tamperer would, and it must refuse rather than
+        // read as an empty witness that has seen nothing.
+        std::fs::write(&path, b"{ this is not json").unwrap();
+        let verdict = Witness::load_from(&path);
+        assert!(
+            verdict.is_err(),
+            "a corrupt witness must be reported, not silently treated as \
+             'no rollback'; got {verdict:?}"
+        );
+
+        // Unreadable must refuse too — the same disarm with different syntax.
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if !nix_running_as_root() {
+            assert!(
+                Witness::load_from(&path).is_err(),
+                "an unreadable witness must be reported, not treated as clean"
+            );
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 }

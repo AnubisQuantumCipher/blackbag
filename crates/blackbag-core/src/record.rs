@@ -129,10 +129,11 @@ pub enum Kind {
     Contact,
     Note,
     Recovery,
+    Passkey,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 12] = [
+    pub const ALL: [Kind; 13] = [
         Kind::Login,
         Kind::Totp,
         Kind::Api,
@@ -145,6 +146,7 @@ impl Kind {
         Kind::Contact,
         Kind::Note,
         Kind::Recovery,
+        Kind::Passkey,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -161,6 +163,7 @@ impl Kind {
             Kind::Contact => "contact",
             Kind::Note => "note",
             Kind::Recovery => "recovery",
+            Kind::Passkey => "passkey",
         }
     }
 }
@@ -187,6 +190,7 @@ impl std::str::FromStr for Kind {
             "contact" => Kind::Contact,
             "note" => Kind::Note,
             "recovery" => Kind::Recovery,
+            "passkey" => Kind::Passkey,
             other => bail!("unknown record kind: {other}"),
         })
     }
