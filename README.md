@@ -231,6 +231,9 @@ black-bag backup --to /run/media/you/stick/vault.cbor   # a sealed copy, no pass
 black-bag backup --verify            # re-read every recorded copy, byte for byte
 black-bag audit --verify             # who asked for what, and whether the chain still holds
 
+black-bag key doctor                 # can this machine present a virtual security key?
+black-bag key serve                  # present the vault as a FIDO2 key — no extension needed
+
 black-bag agent breach --online      # k-anonymity check against Pwned Passwords
 black-bag import --from bitwarden.json --format bitwarden --dry-run
 black-bag export --to out.csv --format keepassxc --plaintext-ok

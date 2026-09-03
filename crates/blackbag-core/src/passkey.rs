@@ -165,6 +165,37 @@ pub fn rp_id_is_valid_for_origin(rp_id: &str, origin: &str) -> bool {
     is_registrable_domain_suffix_of_or_equal_to(&rp, &host)
 }
 
+/// Whether a name is one somebody could actually own.
+///
+/// Used where there is no origin to compare against — CTAP carries none — so
+/// the only check available is that the relying party is not itself a public
+/// suffix. Without it a caller could mint a credential scoped to `com`, which
+/// would then work on every site there is.
+///
+/// `localhost` is the one carve-out, because WebAuthn makes it: development
+/// has to work. Every other single-label name is refused here even though
+/// [`rp_id_is_valid_for_origin`] accepts one — and the asymmetry is the point.
+/// There, a browser vouched for the origin, so a page at `https://portal`
+/// claiming `portal` is checked against something. Here nothing was vouched
+/// for, and a single label that is not `localhost` is indistinguishable from a
+/// public suffix the list has not heard of.
+pub fn rp_id_is_registrable(rp_id: &str) -> bool {
+    use public_suffix::EffectiveTLDProvider;
+    let rp = rp_id.trim_end_matches('.').to_ascii_lowercase();
+    if rp.is_empty() || rp.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    if rp == "localhost" || rp.ends_with(".localhost") {
+        return true;
+    }
+    // A name with no registrable domain under it IS a public suffix, or sits
+    // inside one. `com`, `co.uk` and `github.io` all land here, and so does a
+    // bare `portal`.
+    public_suffix::DEFAULT_PROVIDER
+        .effective_tld_plus_one(&rp)
+        .is_ok()
+}
+
 /// HTML's "is a registrable domain suffix of or is equal to", which WebAuthn
 /// Level 3 §5.1.3 step 8 defers to for deciding whether a page may claim a
 /// relying-party id.
@@ -434,14 +465,48 @@ impl Credential {
             );
         }
 
+        // WebAuthn Level 3 §6.3.3: the signature is over
+        // authenticatorData || SHA-256(clientDataJSON).
+        self.assert_prehashed(&Sha256::digest(client_data_json), user_verified, backed_up)
+    }
+
+    /// Sign a client-data hash somebody else computed.
+    ///
+    /// # This is a signing oracle, and that is not an accident
+    ///
+    /// It signs 32 bytes it was handed, in a fixed position of the signed
+    /// message, without seeing what was hashed. Nothing here can check the
+    /// origin, because **CTAP does not carry one**: an authenticator is given a
+    /// relying-party id and a hash, and that is all it will ever be given. A
+    /// hardware key is in exactly this position, and so is this function.
+    ///
+    /// So the origin binding on that path is the *browser's*, not ours. What
+    /// stands between a hostile caller and a signature is the ceremony: a
+    /// registered request, on screen, naming the relying party, approved with
+    /// the master passphrase, collected once by the process that registered
+    /// it. That is a stronger user-presence test than a touch, and it is the
+    /// only thing standing there.
+    ///
+    /// **It must never be reachable from the browser-extension lane.** There
+    /// the agent builds `clientDataJSON` itself precisely so the origin a
+    /// person read and the origin a relying party verifies are one string;
+    /// routing that lane through here would throw the property away and leave
+    /// a caller free to choose the signed bytes.
+    pub fn assert_prehashed(
+        &self,
+        client_data_hash: &[u8],
+        user_verified: bool,
+        backed_up: bool,
+    ) -> Result<Asserted> {
+        if client_data_hash.len() != 32 {
+            bail!("a client data hash is 32 bytes");
+        }
         let authenticator_data =
             authenticator_data(&self.config.rp_id, base_flags(user_verified, backed_up), None);
 
-        // WebAuthn Level 3 §6.3.3: the signature is over
-        // authenticatorData || SHA-256(clientDataJSON).
         let mut signed = Vec::with_capacity(authenticator_data.len() + 32);
         signed.extend_from_slice(&authenticator_data);
-        signed.extend_from_slice(&Sha256::digest(client_data_json));
+        signed.extend_from_slice(client_data_hash);
 
         let signing = signing_key_from(self.key.as_slice())?;
         let signature: DerSignature = signing.sign(&signed);
@@ -925,6 +990,43 @@ mod tests {
             "compute.amazonaws.com",
             "https://ec2-1-2-3-4.eu-west-1.compute.amazonaws.com"
         ));
+    }
+
+    /// With no origin to check against — which is every CTAP request — the
+    /// only question left is whether the relying party is a name somebody
+    /// could own.
+    #[test]
+    fn a_relying_party_with_no_origin_to_check_must_still_be_ownable() {
+        for good in [
+            "example.com",
+            "login.example.com",
+            "example.co.uk",
+            "localhost",
+            "app.localhost",
+        ] {
+            assert!(rp_id_is_registrable(good), "{good} is ownable");
+        }
+        for bad in ["com", "co.uk", "github.io", "", "192.168.1.5", "::1"] {
+            assert!(!rp_id_is_registrable(bad), "{bad} is not a relying party");
+        }
+    }
+
+    /// A bare single label is accepted WITH an origin and refused without one,
+    /// and that asymmetry is deliberate: with an origin the browser vouched
+    /// for the name, and without one it is indistinguishable from a public
+    /// suffix the list has not heard of.
+    #[test]
+    fn a_single_label_is_ownable_only_when_an_origin_vouched_for_it() {
+        assert!(
+            rp_id_is_valid_for_origin("portal", "https://portal"),
+            "a browser said this page is at https://portal"
+        );
+        assert!(
+            !rp_id_is_registrable("portal"),
+            "nobody said anything, so nothing is known about `portal`"
+        );
+        // localhost is the carve-out WebAuthn itself makes.
+        assert!(rp_id_is_registrable("localhost"));
     }
 
     #[test]

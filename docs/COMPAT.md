@@ -148,7 +148,9 @@ request the browser would otherwise handle itself.
 | `chrome.runtime.connectNative` keeping the worker alive | MV3 | An open port is the documented keepalive. Without it the worker is torn down mid-ceremony and the site waits forever — measured. |
 | 4-byte native-endian length prefix, 1 MB cap | native messaging | The host framing. A larger message is dropped silently. |
 | `public-suffix` 0.1.3's embedded list | `blackbag-core` | A stale list under-blocks: a newly delegated suffix would be claimable as a relying party until the crate is updated. |
-| `/dev/uhid` | lane B, when it lands | Needs a `TAG+="uaccess"` udev rule. Never the `input` group — that would give every process the user runs raw keyboard access. |
+| `/dev/uhid` | lane B (`black-bag key serve`) | Needs a `TAG+="uaccess"` udev rule **and** the `uhid` module loaded — the static node is root-only, so it cannot autoload the driver on a non-root open. Never the `input` group. `key doctor` diagnoses both. |
+| `struct uhid_event` layout | lane B | The ABI marshalling uses byte offsets **measured with `offsetof`** on this machine, pinned by a compile-time `const _` block. A layout written from memory put `rd_size` after the descriptor and the kernel answered `EINVAL` with nothing else. If a future kernel changes the struct, that block fails to compile. |
+| CTAPHID report descriptor | lane B | The FIDO U2F HID descriptor from the CTAP appendix (usage page `0xF1D0`). A browser matches a security key on exactly this; `udevadm` confirmed the kernel tags the device `ID_FIDO_TOKEN=1`. |
 
 ---
 

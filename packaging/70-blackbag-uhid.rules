@@ -1,0 +1,27 @@
+# Let the person logged in at this seat create a virtual FIDO2 security key.
+#
+# /dev/uhid is root-only by default. Black-Bag needs it to present the vault
+# as a security key, which is what makes passkeys work in applications no
+# browser extension can reach.
+#
+# WHY uaccess AND NOT THE input GROUP
+#
+# The obvious way to grant a device is to give it to a group and put yourself
+# in that group. Do not do that here. `input` carries read access to every
+# input device on the machine, so joining it would give EVERY program you run
+# — every dependency of every script — the ability to read your keystrokes,
+# including the master passphrase this whole project exists to protect. That
+# is a far larger grant than the one being asked for, and it is permanent.
+#
+# TAG+="uaccess" instead hands the device to whoever is currently logged in at
+# a local seat, through systemd-logind's ACLs. It follows the session: when
+# you log out, it goes. Nobody is added to anything.
+#
+# Install:
+#   sudo install -m644 packaging/70-blackbag-uhid.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+#
+# Check with `black-bag key doctor`, which says what is still missing.
+#
+# Remove by deleting the file and reloading. Nothing else changes.
+KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess"

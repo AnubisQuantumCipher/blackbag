@@ -222,6 +222,7 @@ dependencies = [
  "ciborium",
  "clap",
  "fd-lock",
+ "getrandom 0.2.17",
  "is-terminal",
  "libc",
  "ml-kem",

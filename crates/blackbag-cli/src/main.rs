@@ -1,6 +1,7 @@
 //! `black-bag` — hardened credential storage for Omarchy.
 
 mod passkey_host;
+mod uhid;
 mod clipboard;
 mod import;
 mod tty;
@@ -62,6 +63,20 @@ enum Command {
     Agent(AgentCommand),
     /// Show who asked for what, and whether the record still holds.
     Audit(AuditArgs),
+    /// Present this vault as a virtual FIDO2 security key.
+    ///
+    /// Every browser and every application already knows how to talk to a
+    /// security key, so this needs no extension and works where an extension
+    /// cannot go — Electron applications, Firefox, `ssh -sk`.
+    ///
+    /// It also changes who binds the origin, and that is worth knowing before
+    /// you rely on it. CTAP carries no origin: an authenticator is handed a
+    /// relying-party id and a hash of bytes it never sees. So on this route
+    /// the browser binds the origin, exactly as it does for a hardware key —
+    /// no worse than the plastic, and no better. The browser extension route
+    /// is the one where Black-Bag itself builds the signed bytes.
+    #[command(subcommand)]
+    Key(KeyCommand),
     /// Copy this vault somewhere else, and say what is known about the copies.
     ///
     /// The copy is the sealed file, unchanged: it is already encrypted, and
@@ -427,6 +442,19 @@ struct AuditArgs {
     verify: bool,
 }
 
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// Present the key and answer it until stopped.
+    Serve {
+        /// What the device calls itself. Shows up in `lsusb`-style listings
+        /// and in some browsers' pickers.
+        #[arg(long, default_value = "Black-Bag")]
+        name: String,
+    },
+    /// Say whether this machine can present one, and what is stopping it.
+    Doctor,
+}
+
 #[derive(Args)]
 struct BackupArgs {
     /// Where to write the copy. Put it on something that is not this disk.
@@ -563,6 +591,8 @@ fn run(hardening: harden::HardenReport) -> Result<()> {
         Command::Agent(cmd) => cmd_agent(&path, cmd, hardening),
         Command::Audit(args) => cmd_audit(args),
         Command::Backup(args) => cmd_backup(&path, args),
+        Command::Key(KeyCommand::Serve { name }) => uhid::serve(&name),
+        Command::Key(KeyCommand::Doctor) => uhid::doctor(),
         Command::Doctor(args) => cmd_doctor(&path, args, hardening),
         Command::Status(args) => cmd_status(&path, args, hardening),
         Command::Gen(cmd) => cmd_gen(cmd),

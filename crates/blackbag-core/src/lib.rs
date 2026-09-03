@@ -9,6 +9,7 @@ pub mod backup;
 pub mod audit;
 pub mod breach;
 pub mod consent;
+pub mod ctap;
 pub mod crypto;
 pub mod generate;
 pub mod harden;

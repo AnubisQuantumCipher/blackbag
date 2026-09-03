@@ -201,8 +201,60 @@ CXF, then packaging.
   `dumpable=0` and `ptrace_scope=1` are the only things in the way. Black-Bag
   should be friendly to that setup, and document it.
 
-## D5 — Lane B device permissions (for later)
+## D5 — Lane B device permissions
 
 Grant `/dev/uhid` with a udev rule using `TAG+="uaccess"`, **not** by adding the
 user to the `input` group. Group membership would give every process the user
 runs raw keyboard access — a much larger grant than the one being asked for.
+
+### Done, and watched working through the kernel
+
+`black-bag key serve` presents the vault as a virtual FIDO2 security key over
+`/dev/uhid`, so every browser and application that already speaks to a security
+key can use it — no extension, and it reaches where an extension cannot:
+Electron apps, Firefox, `ssh -sk`.
+
+**The permission worked exactly as D5 said**, once one more thing was true.
+`packaging/70-blackbag-uhid.rules` is `KERNEL=="uhid", SUBSYSTEM=="misc",
+TAG+="uaccess"`. Installed, it grants the device — via systemd-logind's ACLs —
+to whoever is logged in at the seat; measured, `/dev/uhid` gained
+`user:sicarii:rw-` and nobody was added to any group. The rule follows the
+login session and leaves when it does.
+
+The one thing not obvious in advance: **the `uhid` module has to be loaded
+first.** `/dev/uhid` exists as a static node whether or not the driver is, and
+opening it is what would normally autoload the driver — but the static node is
+root-only, so a non-root open fails with `EACCES` before autoload happens, and
+until the driver is loaded there is no device for udev to apply the rule to.
+`packaging/blackbag-uhid.conf` loads it at boot; `black-bag key doctor`
+diagnoses every step of this and says what to do about each.
+
+### The security boundary is different on this lane, and stated in the open
+
+CTAP carries **no origin**. An authenticator is handed a relying-party id and a
+32-byte hash of bytes it never sees. So on this lane the *browser* binds the
+origin, exactly as it does for a hardware key — no worse than the plastic, and
+no better. The browser-extension lane is the one where Black-Bag itself builds
+the signed bytes and the origin a person approved is the origin the relying
+party verifies by construction.
+
+Three things keep this honest rather than papering over it:
+
+- The consent screen shows the relying party and says, in red, "through the
+  virtual security key · no web address was given". It never invents a
+  plausible-looking origin from the relying-party id.
+- `Ceremony` records exactly one binding — an origin *or* a client-data hash,
+  never both and never neither — and `register` refuses anything else. A
+  browser ceremony therefore can never reach the prehashed signing path, where
+  a caller would get to choose the signed bytes.
+- With no origin to check the relying party against, the one check still
+  possible — that it is a name somebody could own, not a public suffix like
+  `com` — is enforced, so a page cannot mint a credential scoped to every site
+  under a suffix.
+
+Everything above the device is tested without one (CTAPHID framing, CTAP2
+encoding, the command surface, the loop over a fake wire, the agent binding);
+the ABI marshalling is checked byte-for-byte against `offsetof` measured from
+`linux/uhid.h`; and the whole stack was driven end to end by an independent
+Python CTAP client through the real kernel, its signatures verified with
+`cryptography`, approved on the deck's own consent screen.

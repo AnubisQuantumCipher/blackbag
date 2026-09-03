@@ -97,8 +97,22 @@ pub fn socket_path() -> Result<PathBuf> {
 }
 
 /// What the cockpit can ask for.
+///
+/// **Unknown fields are refused.** Serde's default is to ignore them, and for
+/// this protocol that is the wrong default: both ends are meant to be the same
+/// binary, and a field an older agent has never heard of is not a field it can
+/// safely ignore. Measured — a newer client sent `client_data_hash` to an
+/// older agent, the field was silently dropped, and the request was then read
+/// as a *browser* request with an empty origin. It failed loudly by luck. The
+/// next such field might not.
+///
+/// The limit, stated because it is real: serde's internally-tagged
+/// representation still accepts stray keys alongside a **unit** variant, and
+/// `deny_unknown_fields` does not change that. Every variant that carries data
+/// is covered, which is where a dropped field could matter — a unit variant
+/// has nothing to lose.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     /// Liveness plus lock state.
     Status,
@@ -188,6 +202,12 @@ pub enum Request {
     /// signature by itself.
     PasskeyBegin {
         operation: crate::consent::Operation,
+        /// CTAP only: the client-data hash, hex. Mutually exclusive with
+        /// `origin` and `challenge` — the agent enforces that, because a
+        /// ceremony that was half of each would leave it ambiguous which bytes
+        /// get signed.
+        #[serde(default)]
+        client_data_hash: Option<String>,
         /// The caller origin as the browser reported it, not as any client
         /// chose to describe itself.
         origin: String,
@@ -1482,6 +1502,7 @@ impl Agent {
             // has answered. See `consent.rs`.
             Request::PasskeyBegin {
                 operation,
+                client_data_hash,
                 origin,
                 rp_id,
                 rp_name,
@@ -1497,18 +1518,55 @@ impl Agent {
             } => {
                 use crate::consent::{Ceremony, Choice, Operation, State};
 
-                // The origin is the browser's, and the relying party must be a
-                // registrable-domain suffix of it. Checked HERE and not only in
-                // the signing code, so a ceremony that could never be signed is
-                // never put in front of a human in the first place.
-                if !crate::passkey::rp_id_is_valid_for_origin(&rp_id, &origin) {
-                    bail!(
-                        "relying party {rp_id} is not valid for origin {origin}"
-                    );
-                }
-                if challenge.trim().is_empty() {
-                    bail!("a passkey ceremony must carry the relying party's challenge");
-                }
+                let client_data_hash = client_data_hash.as_deref().map(unhex).transpose()?;
+
+                // Two lanes, two bindings, and the checks differ because what
+                // is knowable differs.
+                let (origin, challenge) = match &client_data_hash {
+                    // CTAP. There is no origin on the wire — see
+                    // `Ceremony::client_data_hash` — so there is nothing to
+                    // check the relying party against, and pretending
+                    // otherwise would be inventing a fact. What CAN be checked
+                    // is that the relying party is a name somebody could
+                    // actually own: a page must not be able to mint a
+                    // credential scoped to `com`.
+                    Some(hash) => {
+                        if hash.len() != 32 {
+                            bail!("a client data hash is 32 bytes");
+                        }
+                        // Refused, not quietly dropped. A caller that sent
+                        // both is confused about which lane it is on, and
+                        // discarding half of what it said would leave it
+                        // believing an origin was checked when none was.
+                        if !origin.is_empty() || !challenge.is_empty() {
+                            bail!(
+                                "a request bound by a client data hash carries no \
+                                 origin and no challenge; this one carries both"
+                            );
+                        }
+                        if !crate::passkey::rp_id_is_registrable(&rp_id) {
+                            bail!(
+                                "{rp_id} is a public suffix, not a relying party: a \
+                                 credential scoped to it would work on every site under it"
+                            );
+                        }
+                        (String::new(), String::new())
+                    }
+                    // The browser lane. The origin is the browser's, and the
+                    // relying party must be a registrable-domain suffix of it.
+                    // Checked HERE and not only in the signing code, so a
+                    // ceremony that could never be signed is never put in front
+                    // of a human in the first place.
+                    None => {
+                        if !crate::passkey::rp_id_is_valid_for_origin(&rp_id, &origin) {
+                            bail!("relying party {rp_id} is not valid for origin {origin}");
+                        }
+                        if challenge.trim().is_empty() {
+                            bail!("a passkey ceremony must carry the relying party's challenge");
+                        }
+                        (origin, challenge)
+                    }
+                };
                 let rp_id = rp_id.trim_end_matches('.').to_ascii_lowercase();
 
                 let allow: Vec<Vec<u8>> = allow_credentials
@@ -1560,6 +1618,7 @@ impl Agent {
                 let nonce = hex(&raw);
 
                 let ceremony = Ceremony {
+                    client_data_hash,
                     nonce: nonce.clone(),
                     operation,
                     origin,
@@ -1774,12 +1833,19 @@ impl Agent {
                         self.publish()?;
 
                         Ok(Response::PasskeyResult {
-                            client_data_json: hex(&client_data_json(
-                                "webauthn.create",
-                                &ceremony.challenge,
-                                &ceremony.origin,
-                                ceremony.cross_origin,
-                            )),
+                            // Empty on the CTAP lane: the client hashed the
+                            // bytes itself and we never saw them, so there is
+                            // nothing honest to hand back. Handing back
+                            // something plausible would be worse than nothing.
+                            client_data_json: match &ceremony.client_data_hash {
+                                Some(_) => String::new(),
+                                None => hex(&client_data_json(
+                                    "webauthn.create",
+                                    &ceremony.challenge,
+                                    &ceremony.origin,
+                                    ceremony.cross_origin,
+                                )),
+                            },
                             credential_id: hex(&created.credential.config.credential_id),
                             authenticator_data: hex(&created.authenticator_data),
                             // A registration has no assertion signature.
@@ -1820,22 +1886,37 @@ impl Agent {
                             _ => false,
                         };
 
-                        // Re-checked at the moment of signing, not merely when
-                        // the ceremony was registered: the vault can be
-                        // refreshed from disk in between.
-                        let client_data = client_data_json(
-                            "webauthn.get",
-                            &ceremony.challenge,
-                            &ceremony.origin,
-                            ceremony.cross_origin,
-                        );
-                        let asserted =
-                            credential.assert(
-                                &ceremony.origin,
-                                &client_data,
-                                user_verified,
-                                backed_up,
-                            )?;
+                        // Two lanes, two bindings. The branch is on the
+                        // ceremony's own recorded binding, which `register`
+                        // guarantees is exactly one of the two — so a browser
+                        // ceremony can never reach the prehashed path, where a
+                        // caller would get to choose the signed bytes.
+                        let (client_data, asserted) = match &ceremony.client_data_hash {
+                            Some(hash) => (
+                                // Nothing to hand back: the client already has
+                                // the bytes it hashed, and we never saw them.
+                                Vec::new(),
+                                credential.assert_prehashed(hash, user_verified, backed_up)?,
+                            ),
+                            None => {
+                                // Re-checked at the moment of signing, not
+                                // merely when the ceremony was registered: the
+                                // vault can be refreshed from disk in between.
+                                let client_data = client_data_json(
+                                    "webauthn.get",
+                                    &ceremony.challenge,
+                                    &ceremony.origin,
+                                    ceremony.cross_origin,
+                                );
+                                let asserted = credential.assert(
+                                    &ceremony.origin,
+                                    &client_data,
+                                    user_verified,
+                                    backed_up,
+                                )?;
+                                (client_data, asserted)
+                            }
+                        };
 
                         // The PRF is evaluated only when the credential
                         // actually carries a seed AND the relying party asked.
@@ -2253,6 +2334,57 @@ pub fn ask_at(path: &Path, request: &Request) -> Result<Response> {
             anyhow!("could not read the agent's reply: {e}")
         }
     })
+}
+
+/// A field this build does not understand is refused, not ignored.
+#[cfg(test)]
+mod unknown_field_tests {
+    use super::*;
+
+    /// Serde's default is to ignore an unknown field, and for this protocol
+    /// that is the wrong default.
+    ///
+    /// Measured: a newer client sent `client_data_hash` to an older agent, the
+    /// field vanished, and the request was then read as a browser request with
+    /// an empty origin. That one failed loudly because the origin check caught
+    /// it. A field whose absence merely weakened something would not have.
+    #[test]
+    fn an_unknown_field_is_refused_rather_than_dropped() {
+        // A variant that HAS fields. Serde's internally-tagged representation
+        // ignores stray keys alongside a unit variant no matter what is asked
+        // of it, and a unit variant has nothing to lose anyway — the risk is
+        // entirely in the variants that carry data.
+        for json in [
+            r#"{"op":"reveal","id":"x","field":"password","from_a_newer_build":1}"#,
+            r#"{"op":"passkey_begin","operation":"create","origin":"https://e.com",
+                 "rp_id":"e.com","allow_credentials":[],"challenge":"Yg",
+                 "cross_origin":false,"client_data_hash_v2":"aa"}"#,
+        ] {
+            let err = serde_json::from_str::<Request>(json)
+                .map(|r| format!("{r:?}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("unknown field"),
+                "an unknown field must be refused, not dropped: {err}"
+            );
+        }
+    }
+
+    /// And the ordinary shapes still parse, including the optional ones that
+    /// are genuinely allowed to be absent.
+    #[test]
+    fn the_shapes_this_build_knows_still_parse() {
+        for json in [
+            r#"{"op":"status"}"#,
+            r#"{"op":"reveal","id":"x","field":"password"}"#,
+            r#"{"op":"totp_code","id":"x"}"#,
+            r#"{"op":"list"}"#,
+        ] {
+            serde_json::from_str::<Request>(json)
+                .unwrap_or_else(|e| panic!("{json} should parse: {e}"));
+        }
+    }
 }
 
 /// A reply this build does not understand is a version mismatch, and says so.
@@ -2917,6 +3049,7 @@ mod passkey_agent_tests {
             sock,
             &Request::PasskeyBegin {
                 operation: op,
+                client_data_hash: None,
                 origin: origin.into(),
                 rp_id: rp.into(),
                 rp_name: Some("Test RP".into()),
@@ -3211,6 +3344,205 @@ mod passkey_agent_tests {
             ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap(),
             Response::PasskeyUseSecurityKey
         ));
+    }
+
+    /// The CTAP lane, end to end through the agent.
+    ///
+    /// A ceremony bound by a client-data hash carries no origin and no
+    /// challenge, is approved the same way as any other, and signs the hash it
+    /// was given rather than bytes it built.
+    #[test]
+    fn a_ceremony_bound_by_a_hash_signs_that_hash() {
+        use p256::ecdsa::signature::Verifier;
+        use p256::pkcs8::DecodePublicKey;
+
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+
+        let hash = [0x5au8; 32];
+        let begin = |op: Operation, allow: Vec<String>| {
+            ask_at(
+                &sock,
+                &Request::PasskeyBegin {
+                    operation: op,
+                    client_data_hash: Some(hex(&hash)),
+                    origin: String::new(),
+                    rp_id: "example.com".into(),
+                    rp_name: Some("Example".into()),
+                    allow_credentials: allow,
+                    challenge: String::new(),
+                    cross_origin: false,
+                    user_handle: Some(hex(b"user-handle")),
+                    user_name: Some("ada".into()),
+                    user_display_name: Some("Ada".into()),
+                    want_prf: false,
+                    prf_first_salt: None,
+                    prf_second_salt: None,
+                },
+            )
+            .unwrap()
+        };
+        let answer_and_collect = |nonce: String, cred: Option<String>| {
+            ask_at(
+                &sock,
+                &Request::PasskeyAnswer {
+                    nonce: nonce.clone(),
+                    approve: true,
+                    defer: false,
+                    credential_id: cred,
+                    passphrase: Zeroizing::new(PASS.into()),
+                },
+            )
+            .unwrap();
+            ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap()
+        };
+
+        let Response::PasskeyRegistered { nonce, .. } = begin(Operation::Create, vec![]) else {
+            panic!("create was not registered")
+        };
+        let Response::PasskeyResult {
+            credential_id,
+            client_data_json,
+            public_key_der,
+            ..
+        } = answer_and_collect(nonce, None)
+        else {
+            panic!("create did not complete")
+        };
+        assert!(
+            client_data_json.is_empty(),
+            "we never saw the bytes that were hashed, so we hand back nothing"
+        );
+        let der = unhex(&public_key_der.expect("a public key")).unwrap();
+
+        // Now assert, and check the signature is over authData || the hash we
+        // supplied — not over anything this agent invented.
+        let Response::PasskeyRegistered { nonce, .. } =
+            begin(Operation::Assert, vec![credential_id.clone()])
+        else {
+            panic!("assert was not registered")
+        };
+        let Response::PasskeyResult {
+            authenticator_data,
+            signature,
+            ..
+        } = answer_and_collect(nonce, Some(credential_id))
+        else {
+            panic!("assert did not complete")
+        };
+
+        let auth_data = unhex(&authenticator_data).unwrap();
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&hash);
+
+        let key = p256::ecdsa::VerifyingKey::from_public_key_der(&der).unwrap();
+        let sig = p256::ecdsa::DerSignature::try_from(unhex(&signature).unwrap().as_slice())
+            .unwrap();
+        key.verify(&signed, &sig)
+            .expect("the signature must be over the hash the client supplied");
+
+        // And not over some other hash, which is what makes the above mean
+        // anything.
+        let mut wrong = auth_data;
+        wrong.extend_from_slice(&[0x5b; 32]);
+        assert!(key.verify(&wrong, &sig).is_err());
+    }
+
+    /// A ceremony may be bound one way or the other, never both and never
+    /// neither. Both would leave it ambiguous which bytes get signed.
+    #[test]
+    fn a_ceremony_cannot_be_bound_two_ways_or_none() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+
+        let attempt = |hash: Option<String>, origin: &str, challenge: &str| {
+            ask_at(
+                &sock,
+                &Request::PasskeyBegin {
+                    operation: Operation::Create,
+                    client_data_hash: hash,
+                    origin: origin.into(),
+                    rp_id: "example.com".into(),
+                    rp_name: None,
+                    allow_credentials: vec![],
+                    challenge: challenge.into(),
+                    cross_origin: false,
+                    user_handle: Some(hex(b"u")),
+                    user_name: None,
+                    user_display_name: None,
+                    want_prf: false,
+                    prf_first_salt: None,
+                    prf_second_salt: None,
+                },
+            )
+            .unwrap()
+        };
+
+        // A hash AND an origin.
+        assert!(
+            matches!(
+                attempt(Some(hex(&[1u8; 32])), "https://example.com", "Y2g"),
+                Response::Error { .. }
+            ),
+            "two bindings is one too many"
+        );
+        // Neither.
+        assert!(matches!(attempt(None, "", ""), Response::Error { .. }));
+        // A hash of the wrong length.
+        assert!(matches!(
+            attempt(Some(hex(&[1u8; 31])), "", ""),
+            Response::Error { .. }
+        ));
+        // And the honest one still works.
+        assert!(matches!(
+            attempt(Some(hex(&[1u8; 32])), "", ""),
+            Response::PasskeyRegistered { .. }
+        ));
+    }
+
+    /// With no origin to compare against, the only check left is that the
+    /// relying party is a name somebody could own. Without it, a caller could
+    /// mint a credential scoped to `com`.
+    #[test]
+    fn a_public_suffix_is_refused_on_the_ctap_lane_too() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+
+        let attempt = |rp: &str| {
+            ask_at(
+                &sock,
+                &Request::PasskeyBegin {
+                    operation: Operation::Create,
+                    client_data_hash: Some(hex(&[3u8; 32])),
+                    origin: String::new(),
+                    rp_id: rp.into(),
+                    rp_name: None,
+                    allow_credentials: vec![],
+                    challenge: String::new(),
+                    cross_origin: false,
+                    user_handle: Some(hex(b"u")),
+                    user_name: None,
+                    user_display_name: None,
+                    want_prf: false,
+                    prf_first_salt: None,
+                    prf_second_salt: None,
+                },
+            )
+            .unwrap()
+        };
+
+        for rp in ["com", "co.uk", "github.io"] {
+            assert!(
+                matches!(attempt(rp), Response::Error { .. }),
+                "{rp} is a public suffix and must not be a relying party"
+            );
+        }
+        for rp in ["example.com", "example.co.uk", "localhost"] {
+            assert!(
+                matches!(attempt(rp), Response::PasskeyRegistered { .. }),
+                "{rp} is a name somebody can own"
+            );
+        }
     }
 
     #[test]
@@ -3510,6 +3842,7 @@ mod passkey_reveal_tests {
             &sock,
             &Request::PasskeyBegin {
                 operation: Operation::Create,
+                client_data_hash: None,
                 origin: "https://example.com".into(),
                 rp_id: "example.com".into(),
                 rp_name: None,

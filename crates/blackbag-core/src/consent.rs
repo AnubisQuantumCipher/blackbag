@@ -136,6 +136,22 @@ pub struct Ceremony {
     pub challenge: String,
     /// Whether the caller was a cross-origin iframe, for `crossOrigin`.
     pub cross_origin: bool,
+    /// Set when the signed bytes are a hash we were HANDED rather than bytes
+    /// we built, which is the only thing CTAP ever supplies.
+    ///
+    /// This is the one place the two lanes genuinely differ, so it is a field
+    /// rather than a convention. On the browser-extension lane the agent
+    /// builds `clientDataJSON` from an origin the browser vouched for, and the
+    /// origin a person approved is the origin the relying party verifies *by
+    /// construction*. Over CTAP there is no origin on the wire at all: an
+    /// authenticator gets a relying-party id and a 32-byte hash and cannot see
+    /// what was hashed. The browser binds the origin there, exactly as it does
+    /// for a hardware key — no worse than the plastic, and no better.
+    ///
+    /// `register` enforces that exactly one of the two bindings is present, so
+    /// a ceremony can never be half of each, and the consent screen can tell
+    /// which it is looking at instead of showing an origin it does not have.
+    pub client_data_hash: Option<Vec<u8>>,
     /// Create-only: who the credential will be for.
     pub user_handle: Option<Vec<u8>>,
     pub user_name: Option<String>,
@@ -211,6 +227,11 @@ impl Ceremony {
             nonce: self.nonce.clone(),
             operation: self.operation,
             origin: self.origin.clone(),
+            // So the screen can say "a program on this machine, through the
+            // virtual security key" instead of naming an origin nobody told
+            // us. A prompt that invented one would be the exact lie this
+            // project exists not to tell.
+            via_security_key: self.client_data_hash.is_some(),
             rp_id: self.rp_id.clone(),
             rp_name: self.rp_name.clone(),
             account: self
@@ -235,7 +256,17 @@ impl Ceremony {
 pub struct Summary {
     pub nonce: String,
     pub operation: Operation,
+    /// The caller origin, when a browser vouched for one. Empty when the
+    /// request arrived over CTAP, where no origin exists on the wire.
     pub origin: String,
+    /// True when this came through the virtual security key rather than the
+    /// browser extension.
+    ///
+    /// The screen must render the two differently. Over CTAP there is no
+    /// origin to show, and inventing a plausible one — from the relying-party
+    /// id, say — would put a string in front of somebody that nothing checked.
+    #[serde(default)]
+    pub via_security_key: bool,
     pub rp_id: String,
     pub rp_name: Option<String>,
     pub account: Option<String>,
@@ -287,6 +318,27 @@ impl Desk {
         }
         if ceremony.operation == Operation::Assert && ceremony.choices.is_empty() {
             bail!("no credential in this vault matches that request");
+        }
+        // Exactly one binding, never both and never neither. Both would leave
+        // it ambiguous which bytes get signed; neither would mean nothing
+        // binds the signature to a request at all.
+        match &ceremony.client_data_hash {
+            Some(hash) => {
+                if hash.len() != 32 {
+                    bail!("a client data hash is 32 bytes");
+                }
+                if !ceremony.origin.is_empty() || !ceremony.challenge.is_empty() {
+                    bail!(
+                        "a ceremony bound by a client data hash carries no origin \
+                         and no challenge: there is nothing here to build them from"
+                    );
+                }
+            }
+            None => {
+                if ceremony.origin.is_empty() || ceremony.challenge.is_empty() {
+                    bail!("a ceremony needs an origin and a challenge, or a client data hash");
+                }
+            }
         }
         ceremony.state = State::AwaitingHuman;
         ceremony.registered_at = now;
@@ -506,6 +558,7 @@ mod tests {
 
     fn ceremony(nonce: &str, choices: Vec<Choice>) -> Ceremony {
         Ceremony {
+            client_data_hash: None,
             nonce: nonce.into(),
             operation: Operation::Assert,
             origin: "https://bank.example".into(),

@@ -67,6 +67,12 @@ Item {
   signal changed()
   signal dismissed()
 
+  /// Whether this arrived through the virtual security key rather than a
+  /// browser. Decides whether there is an origin to show at all.
+  readonly property bool viaSecurityKey:
+    consent.ceremony !== null && consent.ceremony !== undefined
+      && consent.ceremony.via_security_key === true
+
   readonly property bool isCreate: consent.ceremony
     && String(consent.ceremony.operation) === "create"
 
@@ -277,8 +283,14 @@ Item {
       Layout.fillWidth: true
       spacing: metric.space(2)
       Text {
-        text: consent.isCreate ? "A SITE WANTS TO CREATE A PASSKEY"
-                               : "A SITE WANTS YOU TO SIGN IN"
+        // "A site" only when a browser told us which one. Over the virtual
+        // security key nothing on the wire names a site, so the wording does
+        // not claim one.
+        text: consent.viaSecurityKey
+          ? (consent.isCreate ? "SOMETHING WANTS TO CREATE A PASSKEY"
+                              : "SOMETHING WANTS YOU TO SIGN IN")
+          : (consent.isCreate ? "A SITE WANTS TO CREATE A PASSKEY"
+                              : "A SITE WANTS YOU TO SIGN IN")
         color: Util.alpha(Color.foreground, 0.5)
         font.family: metric.font.family
         font.pixelSize: metric.font.caption
@@ -289,8 +301,16 @@ Item {
     }
 
     // ── the origin, which is the whole point ────────────────────────────────
+    //
+    // Except over the virtual security key, where there IS no origin. CTAP
+    // carries a relying-party id and a hash and nothing else, so the browser
+    // binds the origin there — exactly as it does for a hardware key. Showing
+    // a plausible-looking origin derived from the relying-party id would put a
+    // string in front of somebody that nothing checked, which is the one thing
+    // this screen must never do.
     Rectangle {
       Layout.fillWidth: true
+      visible: !consent.viaSecurityKey
       implicitHeight: originCol.implicitHeight + metric.space(28)
       radius: metric.cornerRadius
       color: Util.alpha(Color.accent, 0.07)
@@ -328,6 +348,62 @@ Item {
           font.family: metric.font.family
           font.pixelSize: metric.font.caption
           elide: Text.ElideRight
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+        }
+      }
+    }
+
+    // What is shown INSTEAD of an origin, on the security-key route.
+    Rectangle {
+      Layout.fillWidth: true
+      visible: consent.viaSecurityKey
+      implicitHeight: keyCol.implicitHeight + metric.space(28)
+      radius: metric.cornerRadius
+      color: Util.alpha(Color.urgent, 0.07)
+      border.width: Math.max(1, metric.spacing.hairline)
+      border.color: Util.alpha(Color.urgent, 0.45)
+
+      ColumnLayout {
+        id: keyCol
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.leftMargin: metric.space(20)
+        anchors.rightMargin: metric.space(20)
+        spacing: metric.space(4)
+
+        Text {
+          Layout.fillWidth: true
+          text: consent.ceremony ? String(consent.ceremony.rp_id) : ""
+          color: Color.foreground
+          font.family: metric.font.family
+          font.pixelSize: metric.font.title
+          font.bold: true
+          elide: Text.ElideMiddle
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+        }
+        Text {
+          Layout.fillWidth: true
+          text: "through the virtual security key · no web address was given"
+          color: Util.alpha(Color.urgent, 0.85)
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
+          wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+          textFormat: Text.PlainText
+          renderType: Text.NativeRendering
+        }
+        Text {
+          Layout.fillWidth: true
+          text: "A security key is only ever told which site to sign for, never "
+              + "where the request came from — so your browser is what checks "
+              + "that, as it does for any key on a keyring. Black-Bag has "
+              + "nothing to check here and will not pretend otherwise."
+          color: Util.alpha(Color.foreground, 0.55)
+          font.family: metric.font.family
+          font.pixelSize: metric.font.caption
+          wrapMode: Text.WrapAtWordBoundaryOrAnywhere
           textFormat: Text.PlainText
           renderType: Text.NativeRendering
         }
@@ -492,11 +568,16 @@ Item {
     // ── the honest sentence ─────────────────────────────────────────────────
     Text {
       Layout.fillWidth: true
+      // "that origin" only where one was shown. On the security-key route
+      // there is none, so the sentence names what there IS: the relying party.
       text: consent.isCreate
         ? "Approving stores a new passkey in this vault and tells the site it exists. "
         + "Nothing else is sent."
-        : "Approving signs a challenge from that origin. It proves you hold this "
-        + "passkey, and it logs you in there."
+        : (consent.viaSecurityKey
+           ? "Approving signs a challenge for that relying party. It proves you hold "
+           + "this passkey, and it logs you in wherever your browser sent it."
+           : "Approving signs a challenge from that origin. It proves you hold this "
+           + "passkey, and it logs you in there.")
       color: Util.alpha(Color.foreground, 0.55)
       font.family: metric.font.family
       font.pixelSize: metric.font.caption

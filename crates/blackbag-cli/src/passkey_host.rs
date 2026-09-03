@@ -206,6 +206,8 @@ fn handle_inner(incoming: Incoming, output: &mut impl Write) -> Result<Outgoing>
             };
             let reply = session::ask(&Request::PasskeyBegin {
                 operation,
+                // The browser lane always has an origin.
+                client_data_hash: None,
                 origin: args.origin,
                 rp_id: args.rp_id,
                 rp_name: args.rp_name,

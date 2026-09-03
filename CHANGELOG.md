@@ -5,6 +5,70 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — the vault as a virtual security key (lane B)
+
+- **`black-bag key serve`** presents the vault as a virtual FIDO2 security key
+  over `/dev/uhid`. Every browser and application that already talks to a
+  security key can use it with no extension, which reaches where the extension
+  cannot: Electron apps, Firefox, `ssh -sk`. Watched working end to end through
+  the real kernel — an independent Python CTAP client drove INIT, PING,
+  getInfo, makeCredential and getAssertion, and verified the signatures with
+  `cryptography`, approved on the deck's own consent screen.
+- **`black-bag key doctor`** says whether this machine can present one and what
+  is stopping it — the device, the module, the permission — with the exact
+  commands to fix each.
+- **`packaging/70-blackbag-uhid.rules`** grants `/dev/uhid` to whoever is
+  logged in at the seat via `TAG+="uaccess"`, **not** the `input` group, which
+  would give every program you run raw access to your keyboard.
+  **`packaging/blackbag-uhid.conf`** loads the `uhid` module at boot, which has
+  to happen first: the static `/dev/uhid` node is root-only, so a non-root open
+  fails before it can autoload the driver, and until the driver is loaded there
+  is no device for udev to grant.
+- The whole CTAP stack is built in layers that test without a device —
+  `ctap::hid` (CTAPHID framing), `ctap::cbor` (CTAP2 encoding), and
+  `ctap::authenticator` (the commands) — and the CTAPHID loop is driven over a
+  fake wire. The `/dev/uhid` ABI marshalling is the only device-bound part, and
+  its byte offsets were **measured with `offsetof`** against `linux/uhid.h` and
+  pinned in a compile-time assertion block.
+
+### Security — the CTAP lane binds the origin differently, and says so
+
+- **CTAP carries no origin.** An authenticator is handed a relying-party id and
+  a hash of bytes it never sees, so on this lane the *browser* binds the origin
+  — exactly as it does for a hardware key, no worse and no better. The
+  browser-extension lane remains the one where Black-Bag builds the signed
+  bytes itself.
+- The consent screen renders the two differently: over the security key it
+  shows the relying party and says, in red, "through the virtual security key ·
+  no web address was given", and never fabricates a plausible origin from the
+  relying-party id.
+- A ceremony records **exactly one** binding — an origin or a client-data hash,
+  never both and never neither — enforced at registration. A browser ceremony
+  therefore cannot reach the prehashed signing path, where a caller would get
+  to choose the signed bytes.
+- With no origin to check against, the relying party must still be a name
+  somebody could own: a public suffix like `com` or `co.uk` is refused, so a
+  page cannot mint a credential scoped to every site under it. A bare
+  single-label name is accepted **only** with an origin the browser vouched for
+  — never on the CTAP lane, where nothing vouched for it.
+
+### Fixed — two ways the device could have failed silently
+
+- **A cloned descriptor could destroy the device.** The keepalive path wrapped
+  a cloned fd in a `Device`, whose `Drop` sends `UHID_DESTROY` — so the first
+  keepalive of the first ceremony tore the key down mid-request. Sending a
+  report is a free function on a plain `File` now; only the one owning value is
+  a `Device`.
+- **An unknown request field was silently dropped.** A newer client sent
+  `client_data_hash` to an older agent, serde ignored it, and the request was
+  read as a browser request with an empty origin. `Request` now refuses unknown
+  fields; a version mismatch is named as one rather than passed through as
+  serde's wording.
+- **`getInfo` claimed `U2F_V2`** while the INIT capabilities set NMSG (no U2F).
+  A client that believed the version list would try the one command that is
+  refused. The version list no longer claims it, pinned by a test that the two
+  must agree.
+
 ### Added — a way through when you want your security key
 
 - **`^K` on the consent screen** returns `NotAllowedError` to the site, hands
