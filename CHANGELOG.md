@@ -5,6 +5,49 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — an SSH agent backed by the vault
+
+- **`black-bag ssh serve`** binds `$SSH_AUTH_SOCK` and serves the vault's SSH
+  keys, so `git push`, `ssh`, and everything that shells out to them use a key
+  that lives encrypted in the vault instead of unguarded in `~/.ssh`. Verified
+  against real OpenSSH: `ssh-add -l` lists the key, `ssh-add -T` signs a
+  challenge that OpenSSH itself then verifies (exit 0), and the fingerprint
+  matches `ssh-keygen -lf` byte for byte.
+- **`black-bag ssh generate`** mints an Ed25519 key in the vault and prints its
+  `authorized_keys` line; **`black-bag ssh list`** shows what the vault holds.
+- **First-use approval, through the deck.** The first time a key signs, the deck
+  raises an approval sheet and it costs the master passphrase; after that the
+  key is remembered until the vault locks — the same `Reveal` model, and the
+  same `Capability::SshSign` the policy already carried. `ssh` blocks on the
+  socket while you answer, so from its side the key simply takes a moment.
+- Built in layers that test without a socket: `ssh::wire` (the SSH wire format
+  and the Ed25519 key/signature blobs), `ssh::agent` (the agent protocol), and
+  `ssh::key` (Ed25519, deterministic). The full first-use → approve → sign →
+  verify flow is an agent integration test as well as a live OpenSSH one.
+
+### Fixed — a modal prompt could not receive a keystroke when it auto-raised
+
+- The deck's main key handler claimed keyboard focus unconditionally, so a
+  prompt raised by a **status update** rather than a keypress — which is how an
+  SSH signing prompt appears while you are in your terminal — could not get
+  focus, and silently swallowed everything typed into it. The handler now
+  yields focus whenever the approval or passkey-consent sheet is up. This
+  hardens every prompt, not just the SSH one.
+- Ed25519 keys are stored as their 32-byte seed only; the public half is derived
+  on demand, so a stored public key can never drift from its private key.
+
+### Security — the SSH lane names the key, never a host
+
+- CTAP-style origin binding does not exist for SSH: the agent is asked to prove
+  a key, and `ssh` decides which host that key reaches. The approval prompt says
+  exactly that — it shows the key's `SHA256:` fingerprint (which a person can
+  check against `ssh-keygen -lf`) and states plainly that Black-Bag proves the
+  key is yours while `ssh` chooses where it is used.
+- The signing approval is keyed under one fixed `ssh-agent` identity so the
+  deck (which approves) and the daemon (which signs) — different processes —
+  meet at a single grant, and it reads as `ssh-agent` in the ACCESS panel, which
+  is the truth. Revoking it or locking the vault withdraws it.
+
 ### Added — the vault as a virtual security key (lane B)
 
 - **`black-bag key serve`** presents the vault as a virtual FIDO2 security key

@@ -278,6 +278,47 @@ pub enum Request {
     },
     /// Deny every program until told otherwise, or lift that.
     Lockdown { on: bool },
+
+    /// Mint a new Ed25519 SSH key in the vault and return its public half.
+    ///
+    /// Minting goes through the agent because the agent owns the open vault;
+    /// the private seed is generated here, stored, and never leaves.
+    SshGenerate {
+        #[serde(default)]
+        comment: String,
+    },
+    /// The SSH keys the vault holds, as public blobs and comments. Public
+    /// information, so it needs no approval — an `authorized_keys` line is not
+    /// a secret.
+    SshIdentities,
+    /// Sign `data` with the SSH key named by `key_blob`.
+    ///
+    /// No passphrase here: the sign originates from `ssh` over the agent
+    /// socket, where there is no human to type one. The first use of a key is
+    /// approved out of band — the deck shows it and takes the passphrase, and
+    /// this verb returns `ApprovalRequired` until then. After that the approval
+    /// is remembered until the vault locks, exactly like `Reveal`.
+    SshSign {
+        /// The SSH public-key blob, hex.
+        key_blob: String,
+        /// The bytes to sign, hex.
+        data: String,
+    },
+    /// Approve an SSH key for signing, with the passphrase. What the deck calls
+    /// when a person answers the prompt — by the fingerprint it was shown,
+    /// which is the thing a human can actually check.
+    SshApprove {
+        fingerprint: String,
+        #[serde(default)]
+        passphrase: Zeroizing<String>,
+    },
+    /// Drop a pending SSH approval without granting it.
+    ///
+    /// Needs no passphrase, for the same reason a refusal never does: dropping
+    /// a request denies nobody anything they had. The daemon calls it when it
+    /// gives up waiting, so a prompt does not linger on screen for a sign that
+    /// `ssh` has already stopped waiting for.
+    SshDismiss { fingerprint: String },
     /// Stop the agent.
     Shutdown,
 }
@@ -293,6 +334,11 @@ pub enum Response {
     Detail(RecordView),
     /// The one reply that carries secret bytes. Wiped with the reply.
     Secret { value: Zeroizing<String> },
+    /// The SSH keys the vault holds.
+    SshIdentities { keys: Vec<SshIdentityView> },
+    /// An SSH signature blob, hex. Not secret — it is what goes on the wire to
+    /// the server — but returned only after the key was approved.
+    SshSignature { blob: String },
     Totp { code: String, ttl_secs: u64, step: u64 },
     Saved { id: String },
     /// Several records were written in one save.
@@ -707,6 +753,8 @@ pub struct AgentStatus {
     /// blanking a prompt the agent is currently showing.
     #[serde(default)]
     pub pending_passkeys: Vec<crate::consent::Summary>,
+    #[serde(default)]
+    pub pending_ssh: Vec<SshPendingView>,
     pub record_count: usize,
     pub counts_by_kind: Vec<(String, usize)>,
     pub rollback_suspected: bool,
@@ -714,6 +762,22 @@ pub struct AgentStatus {
 
 /// A record as the cockpit sees it: everything except the secret bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshPendingView {
+    pub fingerprint: String,
+    pub comment: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SshIdentityView {
+    /// The SSH public-key blob, hex — an `authorized_keys` line, essentially.
+    pub key_blob: String,
+    pub comment: String,
+    /// The standard `SHA256:...` fingerprint, which is how a human recognises
+    /// a key and how an approval names it.
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RecordView {
     pub id: String,
     pub kind: String,
@@ -857,6 +921,10 @@ pub struct Agent {
     /// up, and a passkey test would then pass or fail depending on the
     /// operator's disk rather than on the code.
     backup_log_path: Option<PathBuf>,
+    /// SSH signatures waiting for a first-use approval, so the deck can show
+    /// them. Cleared on grant, and emptied whenever the vault locks — a locked
+    /// vault holds no pending anything.
+    ssh_pending: Vec<SshPendingView>,
 }
 
 struct OpenVault {
@@ -895,6 +963,7 @@ impl Agent {
             approvals: crate::policy::Approvals::new(),
             audit_path: None,
             backup_log_path: crate::backup::Log::default_path().ok(),
+            ssh_pending: Vec::new(),
         }
     }
 
@@ -1064,9 +1133,32 @@ impl Agent {
         // granted before a suspend be collected after it, which is exactly the
         // gap locking on suspend exists to close.
         self.consent.clear();
+        // A pending SSH approval is a question about the session that is
+        // ending; it must not survive to be answered after a lock.
+        self.ssh_pending.clear();
         if self.open.take().is_some() {
             self.last_lock_reason = Some(reason);
         }
+    }
+
+    /// Remember that an SSH key is waiting for its first approval, so the deck
+    /// shows it. Returns whether this ADDED a new one: the daemon polls the
+    /// sign verb several times a second, and republishing status on every poll
+    /// would churn the file the deck watches — and, worse, keep re-running the
+    /// deck's status handler while a person is trying to type into the prompt.
+    fn note_ssh_pending(&mut self, fingerprint: &str, comment: &str) -> bool {
+        if self.ssh_pending.iter().any(|p| p.fingerprint == fingerprint) {
+            return false;
+        }
+        self.ssh_pending.push(SshPendingView {
+            fingerprint: fingerprint.to_string(),
+            comment: comment.to_string(),
+        });
+        true
+    }
+
+    fn clear_ssh_pending(&mut self, fingerprint: &str) {
+        self.ssh_pending.retain(|p| p.fingerprint != fingerprint);
     }
 
     /// Apply any host event the watcher delivered since the last pass.
@@ -1742,6 +1834,221 @@ impl Agent {
                 Ok(Response::Ok)
             }
 
+            Request::SshGenerate { comment } => {
+                use crate::ssh::key::SshKey;
+
+                let (key, seed) = SshKey::generate()?;
+                let blob = key.public_blob();
+                let fingerprint = crate::ssh::fingerprint(&blob);
+
+                let comment = comment.trim().to_string();
+                let title = if comment.is_empty() {
+                    format!("ssh {}", &fingerprint[..fingerprint.len().min(23)])
+                } else {
+                    comment.clone()
+                };
+                let mut record = crate::record::Record::new(crate::record::Kind::Ssh, Some(title));
+                if !comment.is_empty() {
+                    record.attributes.push(("comment".into(), comment.clone()));
+                }
+                // The raw 32-byte seed, exactly as the passkey private key is
+                // stored — bytes, not a string. The public half is derived on
+                // demand and never written.
+                record.set_field(
+                    crate::ssh::SSH_SEED_FIELD,
+                    crate::record::Secret::new(seed.as_slice()),
+                );
+
+                let _guard = crate::vault::open_lock(&self.vault_path)?;
+                let open = self.opened()?;
+                open.vault.add_record(record)?;
+                open.vault.save()?;
+                self.publish()?;
+
+                Ok(Response::SshIdentities {
+                    keys: vec![SshIdentityView {
+                        fingerprint,
+                        key_blob: hex(&blob),
+                        comment,
+                    }],
+                })
+            }
+
+            Request::SshIdentities => {
+                use crate::ssh::key::SshKey;
+                let open = self.opened()?;
+                let mut keys = Vec::new();
+                for record in open.vault.records() {
+                    if record.kind != crate::record::Kind::Ssh {
+                        continue;
+                    }
+                    let Some(seed) = record.field(crate::ssh::SSH_SEED_FIELD) else {
+                        continue;
+                    };
+                    let seed = seed.open();
+                    let Ok(key) = SshKey::from_seed(seed.as_slice()) else {
+                        continue;
+                    };
+                    let blob = key.public_blob();
+                    keys.push(SshIdentityView {
+                        fingerprint: crate::ssh::fingerprint(&blob),
+                        key_blob: hex(&blob),
+                        comment: record
+                            .attribute("comment")
+                            .or(record.title.as_deref())
+                            .unwrap_or("")
+                            .to_string(),
+                    });
+                }
+                Ok(Response::SshIdentities { keys })
+            }
+
+            Request::SshSign { key_blob, data } => {
+                use crate::policy::{Capability, ClientKey, Verdict};
+                use crate::ssh::key::SshKey;
+
+                let want = unhex(&key_blob)?;
+                let data = unhex(&data)?;
+
+                // Find the key whose public blob matches. A blob names exactly
+                // one key; there is nothing to choose.
+                let open = self.opened()?;
+                let mut found: Option<(String, SshKey, String)> = None;
+                for record in open.vault.records() {
+                    if record.kind != crate::record::Kind::Ssh {
+                        continue;
+                    }
+                    let Some(seed) = record.field(crate::ssh::SSH_SEED_FIELD) else {
+                        continue;
+                    };
+                    let seed = seed.open();
+                    let Ok(key) = SshKey::from_seed(seed.as_slice()) else {
+                        continue;
+                    };
+                    if key.public_blob() == want {
+                        let comment = record
+                            .attribute("comment")
+                            .or(record.title.as_deref())
+                            .unwrap_or("")
+                            .to_string();
+                        found = Some((crate::ssh::fingerprint(&want), key, comment));
+                        break;
+                    }
+                }
+                let Some((fingerprint, key, comment)) = found else {
+                    // No such key is the same answer a real agent gives: it
+                    // simply does not offer to sign with a key it does not
+                    // hold. Not an approval question.
+                    bail!("no SSH key in this vault matches that request");
+                };
+
+                // ONE client identity for all SSH signing, not the calling
+                // peer. The deck approves on the user's behalf and the
+                // ssh-agent daemon does the signing — two different processes —
+                // and the user approved the KEY, not a particular program. A
+                // fixed identity means the deck's grant and the daemon's check
+                // are the same grant, and it reads as "ssh-agent" in the ACCESS
+                // panel, which is the truth.
+                let client = ClientKey::of(Some(crate::ssh::SSH_CLIENT));
+                let program = self.peer.and_then(|p| PeerId::program(p.pid));
+
+                match self.approvals.consider(&client, &fingerprint, Capability::SshSign) {
+                    Verdict::Remembered => {
+                        let blob = key.sign_blob(&data);
+                        self.record_audit(
+                            crate::audit::Surface::SshAgent,
+                            crate::audit::Decision::Remembered,
+                            &fingerprint,
+                            Some(&comment),
+                        );
+                        Ok(Response::SshSignature { blob: hex(&blob) })
+                    }
+                    Verdict::Blocked(why) => {
+                        self.record_audit(
+                            crate::audit::Surface::SshAgent,
+                            crate::audit::Decision::Blocked,
+                            &fingerprint,
+                            Some(&comment),
+                        );
+                        bail!("{why}");
+                    }
+                    Verdict::MustAsk => {
+                        // Remember it as pending so the deck shows it and takes
+                        // the passphrase. The signing daemon polls this verb
+                        // until the approval lands, so publish ONLY when this is
+                        // newly pending — otherwise the deck's status handler
+                        // re-runs several times a second under the prompt.
+                        if self.note_ssh_pending(&fingerprint, &comment) {
+                            self.publish()?;
+                        }
+                        Ok(Response::ApprovalRequired {
+                            item: fingerprint,
+                            title: Some(comment),
+                            field: "an SSH signature".into(),
+                            client: program,
+                        })
+                    }
+                }
+            }
+
+            Request::SshApprove {
+                fingerprint,
+                passphrase,
+            } => {
+                use crate::policy::{Capability, ClientKey};
+                use crate::ssh::key::SshKey;
+
+                // The key must exist under this fingerprint, and the passphrase
+                // must open THIS vault.
+                let open = self.opened()?;
+                let exists = open.vault.records().iter().any(|r| {
+                    r.kind == crate::record::Kind::Ssh
+                        && r.field(crate::ssh::SSH_SEED_FIELD)
+                            .and_then(|s| SshKey::from_seed(s.open().as_slice()).ok())
+                            .is_some_and(|k| {
+                                crate::ssh::fingerprint(&k.public_blob()) == fingerprint
+                            })
+                });
+                if !exists {
+                    bail!("no SSH key in this vault matches that fingerprint");
+                }
+                if passphrase.is_empty()
+                    || !self.opened()?.vault.passphrase_matches(passphrase.as_bytes())
+                {
+                    self.record_audit(
+                        crate::audit::Surface::SshAgent,
+                        crate::audit::Decision::Refused,
+                        &fingerprint,
+                        Some("ssh"),
+                    );
+                    bail!("that is not the vault passphrase");
+                }
+
+                // The same fixed SSH identity the sign path checks against —
+                // see the note there. The user approved the key; the daemon
+                // that signs is a different process and must see the grant.
+                let client = ClientKey::of(Some(crate::ssh::SSH_CLIENT));
+                self.approvals.grant(&client, &fingerprint, Capability::SshSign);
+                self.clear_ssh_pending(&fingerprint);
+                self.record_audit(
+                    crate::audit::Surface::SshAgent,
+                    crate::audit::Decision::Approved,
+                    &fingerprint,
+                    Some("ssh"),
+                );
+                self.publish()?;
+                Ok(Response::Ok)
+            }
+
+            Request::SshDismiss { fingerprint } => {
+                // No proof, no audit-as-refusal: this is not a decision about
+                // the key, it is the daemon saying "nobody is waiting for this
+                // any more". Idempotent.
+                self.clear_ssh_pending(&fingerprint);
+                self.publish()?;
+                Ok(Response::Ok)
+            }
+
             Request::PasskeyCollect { nonce } => {
                 use crate::consent::{Operation, State};
 
@@ -2027,6 +2334,7 @@ impl Agent {
                     last_lock_reason: self.last_lock_reason,
                     sleep_watch,
                     pending_passkeys: self.consent.summaries(Utc::now()),
+                    pending_ssh: self.ssh_pending.clone(),
                     record_count: open.vault.records().len(),
                     counts_by_kind: open
                         .vault
@@ -2048,6 +2356,7 @@ impl Agent {
                 sleep_watch,
                 // A locked agent holds no ceremonies: lock() clears the desk.
                 pending_passkeys: Vec::new(),
+                pending_ssh: Vec::new(),
                 record_count: 0,
                 counts_by_kind: Vec::new(),
                 rollback_suspected: false,
@@ -2069,6 +2378,7 @@ impl Agent {
             last_lock_reason: snapshot.last_lock_reason.map(|r| r.as_str().to_string()),
             sleep_watch: snapshot.sleep_watch.clone(),
             pending_passkeys: snapshot.pending_passkeys.clone(),
+            pending_ssh: snapshot.pending_ssh.clone(),
         };
         let status = Status::probe(
             &self.vault_path,
@@ -2528,6 +2838,7 @@ mod tests {
             last_lock_reason: Some(LockReason::Idle),
             sleep_watch: None,
             pending_passkeys: Vec::new(),
+            pending_ssh: Vec::new(),
             record_count: 1,
             counts_by_kind: vec![("login".into(), 1)],
             rollback_suspected: false,
@@ -4125,9 +4436,171 @@ mod reveal_policy_tests {
         }
     }
 
+    /// Mint an SSH key through the agent and return its public blob.
+    fn add_ssh(sock: &Path, comment: &str) -> Vec<u8> {
+        match ask_at(sock, &Request::SshGenerate { comment: comment.into() }).unwrap() {
+            Response::SshIdentities { keys } => unhex(&keys[0].key_blob).unwrap(),
+            other => panic!("{other:?}"),
+        }
+    }
+
     fn reveal(sock: &Path, id: &str, pass: Option<&str>) -> Response {
         reveal_as(sock, id, crate::policy::Capability::Reveal, pass)
     }
+
+    /// The SSH agent, end to end through the socket.
+    ///
+    /// List the keys (no approval — public), then sign: the first sign is
+    /// refused with ApprovalRequired and a pending item appears; the deck
+    /// approves with the passphrase; the sign then succeeds and the signature
+    /// verifies under the advertised public key.
+    #[test]
+    fn ssh_signing_needs_a_first_use_approval_then_is_remembered() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let blob = add_ssh(&sock, "work@laptop");
+
+        // Listing is public: no approval, and the key is there with its comment.
+        let (fingerprint, listed_comment) =
+            match ask_at(&sock, &Request::SshIdentities).unwrap() {
+                Response::SshIdentities { keys } => {
+                    assert_eq!(keys.len(), 1);
+                    assert_eq!(unhex(&keys[0].key_blob).unwrap(), blob);
+                    (keys[0].fingerprint.clone(), keys[0].comment.clone())
+                }
+                other => panic!("{other:?}"),
+            };
+        assert_eq!(listed_comment, "work@laptop");
+
+        let sign = |data: &[u8]| {
+            ask_at(
+                &sock,
+                &Request::SshSign {
+                    key_blob: hex(&blob),
+                    data: hex(data),
+                },
+            )
+            .unwrap()
+        };
+
+        // First use: not signed, and now pending so the deck can show it.
+        match sign(b"first challenge") {
+            Response::ApprovalRequired { item, .. } => assert_eq!(item, fingerprint),
+            other => panic!("a key must not sign before it is approved: {other:?}"),
+        }
+        match ask_at(&sock, &Request::Status).unwrap() {
+            Response::Status(s) => {
+                assert_eq!(s.pending_ssh.len(), 1);
+                assert_eq!(s.pending_ssh[0].fingerprint, fingerprint);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A wrong passphrase approves nothing.
+        match ask_at(
+            &sock,
+            &Request::SshApprove {
+                fingerprint: fingerprint.clone(),
+                passphrase: Zeroizing::new("not it".into()),
+            },
+        )
+        .unwrap()
+        {
+            Response::Error { message } => assert!(message.contains("not the vault passphrase")),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(sign(b"still blocked"), Response::ApprovalRequired { .. }));
+
+        // The deck approves with the real passphrase.
+        assert!(matches!(
+            ask_at(
+                &sock,
+                &Request::SshApprove {
+                    fingerprint: fingerprint.clone(),
+                    passphrase: Zeroizing::new(PASS.into()),
+                },
+            )
+            .unwrap(),
+            Response::Ok
+        ));
+        // The pending item is gone.
+        match ask_at(&sock, &Request::Status).unwrap() {
+            Response::Status(s) => assert!(s.pending_ssh.is_empty()),
+            other => panic!("{other:?}"),
+        }
+
+        // Now it signs, and keeps signing without asking again.
+        let data = b"the real challenge";
+        let sig_blob = match sign(data) {
+            Response::SshSignature { blob } => unhex(&blob).unwrap(),
+            other => panic!("approved, but did not sign: {other:?}"),
+        };
+        assert!(matches!(sign(b"and again"), Response::SshSignature { .. }));
+
+        // The signature verifies under the advertised public key.
+        let mut r = crate::ssh::wire::Reader::new(&sig_blob);
+        assert_eq!(r.utf8().unwrap(), "ssh-ed25519");
+        let raw = r.string().unwrap();
+        let mut rb = crate::ssh::wire::Reader::new(&blob);
+        assert_eq!(rb.utf8().unwrap(), "ssh-ed25519");
+        let pk: [u8; 32] = rb.string().unwrap().try_into().unwrap();
+        let vk = VerifyingKey::from_bytes(&pk).unwrap();
+        vk.verify(data, &Signature::from_slice(&raw).unwrap())
+            .expect("the SSH signature must verify under the listed key");
+    }
+
+    /// Locking forgets an SSH approval, exactly as it forgets a Reveal.
+    #[test]
+    fn locking_forgets_an_ssh_approval() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let blob = add_ssh(&sock, "k");
+        let fp = crate::ssh::fingerprint(&blob);
+        ask_at(
+            &sock,
+            &Request::SshApprove {
+                fingerprint: fp,
+                passphrase: Zeroizing::new(PASS.into()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            ask_at(&sock, &Request::SshSign { key_blob: hex(&blob), data: hex(b"x") }).unwrap(),
+            Response::SshSignature { .. }
+        ));
+
+        ask_at(&sock, &Request::Lock).unwrap();
+        unlock(&sock);
+        assert!(
+            matches!(
+                ask_at(&sock, &Request::SshSign { key_blob: hex(&blob), data: hex(b"x") }).unwrap(),
+                Response::ApprovalRequired { .. }
+            ),
+            "an SSH approval must not survive the lock it was granted under"
+        );
+    }
+
+    /// Signing with a key the vault does not hold is refused — it is not an
+    /// approval question, it is simply not ours to sign with.
+    #[test]
+    fn signing_with_an_unknown_key_is_refused() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        add_ssh(&sock, "the only key");
+        let stranger = crate::ssh::wire::ed25519_public_blob(&[0x99; 32]);
+        match ask_at(
+            &sock,
+            &Request::SshSign { key_blob: hex(&stranger), data: hex(b"x") },
+        )
+        .unwrap()
+        {
+            Response::Error { message } => assert!(message.contains("no SSH key")),
+            other => panic!("{other:?}"),
+        }
+    }
+
 
     fn reveal_as(
         sock: &Path,

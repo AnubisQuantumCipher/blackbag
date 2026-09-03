@@ -234,6 +234,10 @@ black-bag audit --verify             # who asked for what, and whether the chain
 black-bag key doctor                 # can this machine present a virtual security key?
 black-bag key serve                  # present the vault as a FIDO2 key — no extension needed
 
+black-bag ssh generate --comment me@host   # mint an Ed25519 SSH key in the vault
+black-bag ssh list                   # the public keys, as authorized_keys lines
+black-bag ssh serve                  # run the SSH agent; export the SSH_AUTH_SOCK it prints
+
 black-bag agent breach --online      # k-anonymity check against Pwned Passwords
 black-bag import --from bitwarden.json --format bitwarden --dry-run
 black-bag export --to out.csv --format keepassxc --plaintext-ok

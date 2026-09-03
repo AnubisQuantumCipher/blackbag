@@ -21,6 +21,7 @@ pub mod record;
 pub mod secmem;
 pub mod session;
 pub mod sleepwatch;
+pub mod ssh;
 pub mod status;
 pub mod totp;
 pub mod vault;

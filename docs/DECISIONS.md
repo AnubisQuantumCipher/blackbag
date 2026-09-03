@@ -188,7 +188,14 @@ CXF, then packaging.
 
 - Socket stays `0600`; `SO_PEERCRED` supplies client identity.
 - **Per-item first-use approval** for `Reveal`, the Secret Service and the SSH
-  agent, remembered until lock or revoke.
+  agent, remembered until lock or revoke. **SSH agent: done** — `black-bag ssh
+  serve` is the daemon, keyed under a fixed `ssh-agent` client identity so the
+  deck's approval (a different process) and the daemon's signing meet at one
+  grant; the first use of a key raises the deck's approval sheet and costs the
+  passphrase, remembered after. Signing is the same `Capability::SshSign` the
+  policy already had. Because CTAP-style origin binding does not apply to SSH,
+  the prompt is careful to say only what it can: it names the key's fingerprint,
+  not a host — `ssh` chooses the host, Black-Bag only proves the key is yours.
 - **An approval requires the passphrase or a PIN, never a click.** A same-uid
   process can synthesise a click with `wtype` or `hyprctl`, so a click proves
   nothing about who is at the keyboard.

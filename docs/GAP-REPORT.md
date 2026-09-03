@@ -136,7 +136,7 @@ Ordered by how much of §3 it leaves unbuilt.
 | 3.4 | `black-bag backup` | **done** — copies the sealed file (works while locked out), reads it back, records epoch + digest; `--list`/`--verify`; BACKUP section in the deck |
 | 3.5 | Per-client approval policy, "deny all agents" switch | **done** — per (client, item, capability), passphrase-proved, lockdown switch; ACCESS section in the deck shows and revokes it |
 | 3.5 | Append-only hash-chained audit log | **done** — every decision recorded, read from the file rather than from the agent, `audit --verify` and the deck both check the chain |
-| 3.6 | SSH agent | missing |
+| 3.6 | SSH agent | **done** — `black-bag ssh serve` binds `$SSH_AUTH_SOCK`, serves Ed25519 keys, signs through the same per-item approval as `Reveal`. Verified with real OpenSSH: `ssh-add -l` lists, `ssh-add -T` signs and OpenSSH verifies (exit 0); fingerprint matches `ssh-keygen -lf` |
 | 3.6 | `org.freedesktop.secrets` | missing |
 | 3.6 | Autotype via `wtype` | missing (clipboard fill works) |
 | 4 | `webauthn-rs` relying-party integration test | **done** — 7 tests in `tests/webauthn_rs_relying_party.rs` drive whole ceremonies against a real relying party; three are negative controls, so the positives mean something |

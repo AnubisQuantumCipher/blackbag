@@ -343,6 +343,40 @@ Item {
     onboardSheet.begin()
   }
 
+  /// Put an SSH first-use approval on screen when one is waiting.
+  ///
+  /// The ssh-agent daemon cannot prompt — it has no window and `ssh` is
+  /// blocking on it — so the vault publishes the pending key here, exactly as
+  /// it publishes a waiting passkey ceremony, and the deck raises the same
+  /// approval sheet it uses for a reveal. The daemon polls until this grants
+  /// it, so `ssh` simply waits a moment.
+  function syncSshApproval(parsed) {
+    // Never over another sheet: a passkey ceremony or a record approval that is
+    // already up owns the screen. This one waits its turn; the daemon keeps
+    // the request alive.
+    if (root.pendingApproval !== null || consentSheet.open_) return
+    var pending = parsed && parsed.session && parsed.session.pending_ssh
+      ? parsed.session.pending_ssh : []
+    // Forget dismissals for keys that are no longer pending: the daemon cleared
+    // them, so a future request should prompt afresh.
+    if (root.sshDismissed.length > 0) {
+      var live = pending.map(function (p) { return String(p.fingerprint) })
+      root.sshDismissed = root.sshDismissed.filter(function (fp) {
+        return live.indexOf(fp) >= 0
+      })
+    }
+    if (pending.length === 0) return
+    if (!(parsed.session && parsed.session.unlocked)) return
+    // Raise the first pending key the user has not already waved away.
+    for (var i = 0; i < pending.length; i++) {
+      var fp = String(pending[i].fingerprint)
+      if (root.sshDismissed.indexOf(fp) < 0) {
+        root.askSshApproval(fp, String(pending[i].comment || ""))
+        return
+      }
+    }
+  }
+
   function applyStatus(raw) {
     try {
       var parsed = JSON.parse(String(raw || ""))
@@ -357,6 +391,7 @@ Item {
       var nowUnlocked = !!(parsed.session && parsed.session.unlocked)
       root.lastSessionUnlocked = nowUnlocked
       root.syncConsent(parsed)
+      root.syncSshApproval(parsed)
       if (nowUnlocked && !wasUnlocked) {
         // Only when the deck is actually on screen. An unlock from the CLI
         // used to fill this overlay's record list while it was hidden, and
@@ -365,7 +400,13 @@ Item {
         // Unlocked from outside — the CLI, or a stale status catching up. The
         // keyboard may still be sitting on the sealed screen's (now hidden)
         // passphrase field; hand it to the deck or every footer key is dead.
-        Qt.callLater(function () { if (root.opened) keyCatcher.forceActiveFocus() })
+        // BUT never over a prompt: this same status update can raise the SSH
+        // approval sheet, whose passphrase field must keep focus. Stealing it
+        // here left the field unable to receive a single keystroke.
+        Qt.callLater(function () {
+          if (root.opened && root.pendingApproval === null && !consentSheet.open_)
+            keyCatcher.forceActiveFocus()
+        })
       }
       if (!nowUnlocked && wasUnlocked) {
         // clearSecrets() also dismisses the editor: left open it sits
@@ -471,6 +512,10 @@ Item {
   /// same command with --approve, writing the passphrase on stdin.
   property string copyPendingField: ""
   property var pendingApproval: null
+  /// SSH fingerprints the user dismissed without approving. Kept only until the
+  /// key leaves the pending list — the daemon clears it on timeout — so a fresh
+  /// request later raises the prompt again rather than being suppressed for good.
+  property var sshDismissed: []
   property string approvalPassphrase: ""
   property string approvalError: ""
 
@@ -488,12 +533,39 @@ Item {
     Qt.callLater(function () { approvalField.forceActiveFocus() })
   }
 
-  function cancelApproval() {
+  /// The SSH variant of askApproval: the item is a key fingerprint, not a
+  /// record id, and the field is fixed. Kept a separate entry so the sheet can
+  /// word itself for a key rather than a vault record.
+  function askSshApproval(fingerprint, comment) {
+    root.pendingApproval = {
+      kind: "ssh", id: fingerprint, field: "ssh",
+      title: comment.length > 0 ? comment : fingerprint,
+      fingerprint: fingerprint
+    }
+    root.approvalPassphrase = ""
+    root.approvalError = ""
+    Qt.callLater(function () { approvalField.forceActiveFocus() })
+  }
+
+  /// Take the sheet down. Used on SUCCESS, so it must not mark anything
+  /// dismissed — the approval went through.
+  function clearApproval() {
     root.pendingApproval = null
     root.approvalPassphrase = ""
     root.approvalError = ""
     approvalField.text = ""
     Qt.callLater(function () { if (root.unlocked) keyCatcher.forceActiveFocus() })
+  }
+
+  /// Take the sheet down because the user backed out. For an SSH prompt this
+  /// also remembers the dismissal so it does not spring straight back.
+  function cancelApproval() {
+    if (root.pendingApproval && root.pendingApproval.kind === "ssh") {
+      var fp = String(root.pendingApproval.fingerprint)
+      if (root.sshDismissed.indexOf(fp) < 0)
+        root.sshDismissed = root.sshDismissed.concat([fp])
+    }
+    root.clearApproval()
   }
 
   function submitApproval() {
@@ -516,6 +588,9 @@ Item {
            "--to", "clipboard", "--clear-after", String(root.clipboardClearSec)]
         : ["black-bag", "agent", "reveal", p.id, p.field, "--approve",
            "--to", "clipboard", "--clear-after", String(root.clipboardClearSec)]
+    } else if (p.kind === "ssh") {
+      // The item IS the fingerprint; the CLI reads the passphrase on stdin.
+      approveProcess.command = ["black-bag", "ssh", "approve", p.fingerprint]
     } else {
       approveProcess.command = ["black-bag", "agent", "show", p.id, p.field, "--approve"]
     }
@@ -986,7 +1061,7 @@ Item {
         var rec = root.selectedRecord
         Qt.callLater(function () { if (rec) root.fetchTotp(rec) })
       }
-      root.cancelApproval()
+      root.clearApproval()
     }
   }
 
@@ -1096,7 +1171,12 @@ Item {
     Item {
       id: keyCatcher
       anchors.fill: parent
-      focus: true
+      // Yield focus while a modal prompt owns the screen. The approval sheet
+      // and the passkey consent sheet each have their own passphrase field, and
+      // a main key handler that kept claiming focus would compete with them —
+      // which is exactly what left an auto-raised SSH prompt unable to receive
+      // a single keystroke. When the prompt clears, this takes focus back.
+      focus: root.pendingApproval === null && !consentSheet.open_
       Keys.priority: Keys.BeforeItem
 
       // ── focus-independent shortcuts ──────────────────────────────────────────
@@ -3126,9 +3206,23 @@ Item {
       // Asserted on the transition rather than only from askApproval: the
       // sheet becomes visible a frame later, and focus given to an invisible
       // item does not stick.
-      onVisibleChanged: if (visible) Qt.callLater(function () {
-        approvalField.forceActiveFocus()
-      })
+      onVisibleChanged: if (visible) {
+        Qt.callLater(function () { approvalField.forceActiveFocus() })
+        refocus.restart()
+      }
+
+      // Re-assert focus once more after everything else has settled. When this
+      // sheet is raised by a STATUS update rather than a keypress — which is how
+      // an SSH signing prompt appears — the same update's unlock-transition
+      // handler can queue its own focus grab, and whichever callLater runs last
+      // wins. This fires after both, so the passphrase field reliably ends up
+      // with the keyboard. Without it the field silently swallowed every key.
+      Timer {
+        id: refocus
+        interval: 120
+        repeat: false
+        onTriggered: if (root.pendingApproval !== null) approvalField.forceActiveFocus()
+      }
 
       MouseArea { anchors.fill: parent; hoverEnabled: true; onClicked: {} }
 
@@ -3138,7 +3232,8 @@ Item {
         spacing: metric.space(14)
 
         Text {
-          text: "APPROVE THIS READ"
+          text: root.pendingApproval && root.pendingApproval.kind === "ssh"
+            ? "APPROVE AN SSH SIGNATURE" : "APPROVE THIS READ"
           color: Util.alpha(Color.foreground, 0.5)
           font.family: metric.font.family
           font.pixelSize: metric.font.caption
@@ -3162,12 +3257,15 @@ Item {
             spacing: metric.space(2)
             Text {
               Layout.fillWidth: true
-              text: root.pendingApproval
-                ? (String(root.pendingApproval.field) === "totp"
-                     ? "the current code for " + String(root.pendingApproval.title)
-                     : String(root.pendingApproval.field) + " of "
-                       + String(root.pendingApproval.title))
-                : ""
+              text: {
+                if (!root.pendingApproval) return ""
+                if (root.pendingApproval.kind === "ssh")
+                  return "sign with " + String(root.pendingApproval.title)
+                if (String(root.pendingApproval.field) === "totp")
+                  return "the current code for " + String(root.pendingApproval.title)
+                return String(root.pendingApproval.field) + " of "
+                     + String(root.pendingApproval.title)
+              }
               color: Color.accent
               font.family: metric.font.family
               font.pixelSize: metric.font.body
@@ -3186,6 +3284,9 @@ Item {
                 // held on screen for a countdown the way a password is.
                 if (root.pendingApproval.kind === "totp")
                   return "in the card above, refreshed each step until the vault locks"
+                if (root.pendingApproval.kind === "ssh")
+                  return root.pendingApproval.fingerprint
+                     + " · a program asked ssh to authenticate somewhere"
                 return "on screen, for " + root.revealSeconds + "s"
               }
               color: Util.alpha(Color.foreground, 0.55)
@@ -3199,11 +3300,16 @@ Item {
 
         Text {
           Layout.fillWidth: true
-          text: "The vault is already open. This is asked once per program, "
-              + "field and use — reading it and putting it on the clipboard are "
-              + "different questions — and remembered until the vault locks, "
-              + "because the socket cannot tell this deck from anything else "
-              + "running as you."
+          text: root.pendingApproval && root.pendingApproval.kind === "ssh"
+            ? "Approving lets this key sign SSH challenges until the vault locks. "
+            + "Check the fingerprint above against the key you meant to use — it "
+            + "is what a server records. SSH itself decides which host you reach; "
+            + "Black-Bag only proves the key is yours."
+            : "The vault is already open. This is asked once per program, "
+            + "field and use — reading it and putting it on the clipboard are "
+            + "different questions — and remembered until the vault locks, "
+            + "because the socket cannot tell this deck from anything else "
+            + "running as you."
           color: Util.alpha(Color.foreground, 0.5)
           font.family: metric.font.family
           font.pixelSize: metric.font.caption

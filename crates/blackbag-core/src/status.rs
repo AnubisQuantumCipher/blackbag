@@ -246,6 +246,11 @@ pub struct SessionView {
     /// no client data goes here.
     #[serde(default)]
     pub pending_passkeys: Vec<crate::consent::Summary>,
+    /// SSH keys waiting for a first-use approval, published for the same reason
+    /// and with the same care as the passkey queue: a fingerprint and a
+    /// comment, no key material.
+    #[serde(default)]
+    pub pending_ssh: Vec<crate::session::SshPendingView>,
 }
 
 

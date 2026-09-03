@@ -2,6 +2,7 @@
 
 mod passkey_host;
 mod uhid;
+mod ssh_agent;
 mod clipboard;
 mod import;
 mod tty;
@@ -63,6 +64,9 @@ enum Command {
     Agent(AgentCommand),
     /// Show who asked for what, and whether the record still holds.
     Audit(AuditArgs),
+    /// The SSH keys in this vault, and the agent that serves them.
+    #[command(subcommand)]
+    Ssh(SshCommand),
     /// Present this vault as a virtual FIDO2 security key.
     ///
     /// Every browser and every application already knows how to talk to a
@@ -443,6 +447,32 @@ struct AuditArgs {
 }
 
 #[derive(Subcommand)]
+enum SshCommand {
+    /// Mint a new Ed25519 SSH key in the vault and print its public line.
+    Generate {
+        /// A label for the key, shown in the approval prompt and the .pub line.
+        #[arg(long, default_value = "")]
+        comment: String,
+    },
+    /// List the public keys the vault holds.
+    List,
+    /// Approve a key for signing (passphrase on stdin). What the deck runs when
+    /// a person answers the prompt.
+    Approve {
+        /// The SHA256:... fingerprint, as shown in the prompt.
+        fingerprint: String,
+    },
+    /// Run the SSH agent: bind a socket, serve the vault's keys, sign through
+    /// Black-Bag's own approval.
+    Serve {
+        /// Where to bind. Defaults to a private path under the runtime dir,
+        /// which is printed as an `SSH_AUTH_SOCK` line to export.
+        #[arg(long)]
+        bind: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum KeyCommand {
     /// Present the key and answer it until stopped.
     Serve {
@@ -593,6 +623,10 @@ fn run(hardening: harden::HardenReport) -> Result<()> {
         Command::Backup(args) => cmd_backup(&path, args),
         Command::Key(KeyCommand::Serve { name }) => uhid::serve(&name),
         Command::Key(KeyCommand::Doctor) => uhid::doctor(),
+        Command::Ssh(SshCommand::Generate { comment }) => ssh_agent::generate(&comment),
+        Command::Ssh(SshCommand::List) => ssh_agent::list(),
+        Command::Ssh(SshCommand::Serve { bind }) => ssh_agent::serve(bind),
+        Command::Ssh(SshCommand::Approve { fingerprint }) => ssh_agent::approve(&fingerprint),
         Command::Doctor(args) => cmd_doctor(&path, args, hardening),
         Command::Status(args) => cmd_status(&path, args, hardening),
         Command::Gen(cmd) => cmd_gen(cmd),
@@ -1953,6 +1987,7 @@ fn agent_session_view() -> SessionView {
             last_lock_reason: status.last_lock_reason.map(|r| r.as_str().to_string()),
             sleep_watch: status.sleep_watch,
             pending_passkeys: status.pending_passkeys,
+            pending_ssh: status.pending_ssh,
         },
         _ => SessionView::default(),
     }
