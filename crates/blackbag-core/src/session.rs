@@ -137,6 +137,53 @@ pub enum Request {
     BreachMatch { ranges: Vec<crate::breach::Range> },
     /// Push the deadline out; called when the user interacts.
     Touch,
+    /// Register a passkey ceremony and put it in front of a human.
+    ///
+    /// Returns a nonce. Nothing is signed here: this only freezes what *may*
+    /// be signed. See `consent.rs` for why the socket does not authorize a
+    /// signature by itself.
+    PasskeyBegin {
+        operation: crate::consent::Operation,
+        /// The caller origin as the browser reported it, not as any client
+        /// chose to describe itself.
+        origin: String,
+        rp_id: String,
+        #[serde(default)]
+        rp_name: Option<String>,
+        /// `allowCredentials` from the relying party. Empty means "any
+        /// discoverable credential for this relying party".
+        #[serde(default)]
+        allow_credentials: Vec<String>,
+        /// The exact bytes that will be hashed into the signature, hex-encoded.
+        client_data_json: String,
+        // Create-only.
+        #[serde(default)]
+        user_handle: Option<String>,
+        #[serde(default)]
+        user_name: Option<String>,
+        #[serde(default)]
+        user_display_name: Option<String>,
+        #[serde(default)]
+        want_prf: bool,
+        /// PRF salts as the relying party supplied them, hex-encoded. The
+        /// WebAuthn derivation is applied here, not by the caller.
+        #[serde(default)]
+        prf_first_salt: Option<String>,
+        #[serde(default)]
+        prf_second_salt: Option<String>,
+    },
+    /// A human approved a ceremony, naming which credential to use.
+    PasskeyApprove {
+        nonce: String,
+        #[serde(default)]
+        credential_id: Option<String>,
+    },
+    /// A human refused a ceremony.
+    PasskeyRefuse { nonce: String },
+    /// Collect the answer. Signs on the way out, exactly once.
+    PasskeyCollect { nonce: String },
+    /// What is waiting for a human right now, so the deck can show it.
+    PasskeyQueue,
     /// Stop the agent.
     Shutdown,
 }
@@ -159,6 +206,34 @@ pub enum Response {
     Hygiene(crate::hygiene::VaultReport),
     BreachPrefixes { candidates: Vec<crate::breach::Candidate> },
     Breach(crate::breach::Report),
+    /// A ceremony was registered and is on screen.
+    PasskeyRegistered {
+        nonce: String,
+        choices: Vec<crate::consent::Choice>,
+    },
+    /// Still waiting for a human.
+    PasskeyWaiting,
+    /// The ceremony completed. Everything here is public by construction: it
+    /// is what goes to the relying party.
+    PasskeyResult {
+        credential_id: String,
+        authenticator_data: String,
+        signature: String,
+        user_handle: String,
+        /// Registration only.
+        #[serde(default)]
+        attestation_object: Option<String>,
+        #[serde(default)]
+        public_key_der: Option<String>,
+        /// PRF outputs, when the relying party asked and the credential has a seed.
+        #[serde(default)]
+        prf_first: Option<String>,
+        #[serde(default)]
+        prf_second: Option<String>,
+    },
+    PasskeyQueue {
+        pending: Vec<crate::consent::Summary>,
+    },
     Ok,
     Error { message: String },
 }
@@ -559,6 +634,29 @@ impl RecordView {
 }
 
 /// The agent process.
+/// Byte strings cross this socket as hex.
+///
+/// Not base64: there are several base64 alphabets in WebAuthn's own ecosystem
+/// (standard, URL-safe, padded, unpadded) and a provider that picks the wrong
+/// one produces a credential id the relying party does not recognise. Hex has
+/// exactly one spelling.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Result<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        bail!("expected hex, got an odd number of characters");
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&text[i..i + 2], 16)
+                .map_err(|_| anyhow!("expected hex, got {:?}", &text[i..i + 2]))
+        })
+        .collect()
+}
+
 pub struct Agent {
     vault_path: PathBuf,
     idle: Duration,
@@ -579,6 +677,8 @@ pub struct Agent {
     /// Where `status.json` goes. `None` means the runtime directory; tests
     /// point it elsewhere so a test agent never overwrites the live document.
     status_dir: Option<PathBuf>,
+    /// Passkey ceremonies waiting for a human.
+    consent: crate::consent::Desk,
 }
 
 struct OpenVault {
@@ -612,6 +712,7 @@ impl Agent {
             lock_signals: None,
             sleep_watch: None,
             status_dir: None,
+            consent: crate::consent::Desk::new(),
         }
     }
 
@@ -712,6 +813,11 @@ impl Agent {
     /// Lock the vault, remembering why. Dropping `OpenVault` drops the `Vault`,
     /// whose data key and every record are wiped and unlocked on the way out.
     fn lock(&mut self, reason: LockReason) {
+        // Anything waiting for a human was authorized against the session that
+        // is ending. A ceremony that outlived its lock would let an approval
+        // granted before a suspend be collected after it, which is exactly the
+        // gap locking on suspend exists to close.
+        self.consent.clear();
         if self.open.take().is_some() {
             self.last_lock_reason = Some(reason);
         }
@@ -975,6 +1081,262 @@ impl Agent {
                     crate::breach::match_ranges(open.vault.records(), &ranges, &open.exposure);
                 open.exposure = map;
                 Ok(Response::Breach(report))
+            }
+
+            // ── passkeys ──────────────────────────────────────────────────
+            //
+            // Split in two because the agent is single-threaded: `Begin` only
+            // records what may happen, and `Collect` performs it once a human
+            // has answered. See `consent.rs`.
+            Request::PasskeyBegin {
+                operation,
+                origin,
+                rp_id,
+                rp_name,
+                allow_credentials,
+                client_data_json,
+                user_handle,
+                user_name,
+                user_display_name,
+                want_prf,
+                prf_first_salt,
+                prf_second_salt,
+            } => {
+                use crate::consent::{Ceremony, Choice, Operation, State};
+
+                // The origin is the browser's, and the relying party must be a
+                // registrable-domain suffix of it. Checked HERE and not only in
+                // the signing code, so a ceremony that could never be signed is
+                // never put in front of a human in the first place.
+                if !crate::passkey::rp_id_is_valid_for_origin(&rp_id, &origin) {
+                    bail!(
+                        "relying party {rp_id} is not valid for origin {origin}"
+                    );
+                }
+                let client_data = unhex(&client_data_json)?;
+                if client_data.is_empty() {
+                    bail!("a passkey ceremony must carry the client data it will sign");
+                }
+                let rp_id = rp_id.trim_end_matches('.').to_ascii_lowercase();
+
+                let allow: Vec<Vec<u8>> = allow_credentials
+                    .iter()
+                    .map(|h| unhex(h))
+                    .collect::<Result<_>>()?;
+
+                let choices: Vec<Choice> = {
+                    let open = self.opened()?;
+                    match operation {
+                        // Nothing exists yet; the credential is minted on
+                        // approval, so there is exactly one implicit choice.
+                        Operation::Create => Vec::new(),
+                        Operation::Assert => {
+                            let records = if allow.is_empty() {
+                                open.vault.passkeys_for_rp(&rp_id)
+                            } else {
+                                allow
+                                    .iter()
+                                    .filter_map(|id| open.vault.passkey_by_credential_id(id))
+                                    // A named credential still has to belong to
+                                    // the relying party that asked for it.
+                                    // Without this, a caller could name a
+                                    // credential id belonging to another site
+                                    // and have it signed for this origin.
+                                    .filter(|r| {
+                                        r.passkey.as_ref().is_some_and(|p| p.rp_id == rp_id)
+                                    })
+                                    .collect()
+                            };
+                            records
+                                .iter()
+                                .filter_map(|r| {
+                                    let p = r.passkey.as_ref()?;
+                                    Some(Choice {
+                                        record_id: r.id.to_string(),
+                                        credential_id: p.credential_id.clone(),
+                                        label: p.describe(),
+                                    })
+                                })
+                                .collect()
+                        }
+                    }
+                };
+
+                let mut raw = [0u8; 16];
+                getrandom::getrandom(&mut raw)
+                    .map_err(|e| anyhow!("the system CSPRNG refused: {e}"))?;
+                let nonce = hex(&raw);
+
+                let ceremony = Ceremony {
+                    nonce: nonce.clone(),
+                    operation,
+                    origin,
+                    rp_id,
+                    rp_name,
+                    choices: choices.clone(),
+                    client_data_json: client_data,
+                    user_handle: user_handle.as_deref().map(unhex).transpose()?,
+                    user_name,
+                    user_display_name,
+                    want_prf,
+                    prf_first_salt: prf_first_salt.as_deref().map(unhex).transpose()?,
+                    prf_second_salt: prf_second_salt.as_deref().map(unhex).transpose()?,
+                    registered_at: Utc::now(),
+                    state: State::AwaitingHuman,
+                };
+                self.consent.register(ceremony, Utc::now())?;
+                // Publish so the deck, which watches status.json, puts it on
+                // screen without being asked.
+                self.publish()?;
+                Ok(Response::PasskeyRegistered { nonce, choices })
+            }
+
+            Request::PasskeyApprove {
+                nonce,
+                credential_id,
+            } => {
+                let chosen = credential_id.as_deref().map(unhex).transpose()?;
+                self.consent
+                    .approve(&nonce, chosen.as_deref(), Utc::now())?;
+                self.publish()?;
+                Ok(Response::Ok)
+            }
+
+            Request::PasskeyRefuse { nonce } => {
+                self.consent
+                    .refuse(&nonce, "you refused this request", Utc::now())?;
+                self.publish()?;
+                Ok(Response::Ok)
+            }
+
+            Request::PasskeyQueue => Ok(Response::PasskeyQueue {
+                pending: self.consent.summaries(Utc::now()),
+            }),
+
+            Request::PasskeyCollect { nonce } => {
+                use crate::consent::{Operation, State};
+
+                let Some(ceremony) = self.consent.take_answered(&nonce, Utc::now()) else {
+                    if self.consent.is_waiting(&nonce) {
+                        return Ok(Response::PasskeyWaiting);
+                    }
+                    bail!("no passkey request is waiting with that id");
+                };
+                self.publish()?;
+
+                let credential_id = match ceremony.state {
+                    State::Approved { credential_id } => credential_id,
+                    State::Refused { reason } => bail!("{reason}"),
+                    State::AwaitingHuman => bail!("that request has not been answered"),
+                };
+
+                // A human said yes, in a surface this process controls, to this
+                // exact frozen request. That — and only that — is what sets UV.
+                let user_verified = true;
+
+                match ceremony.operation {
+                    Operation::Create => {
+                        let handle = ceremony
+                            .user_handle
+                            .clone()
+                            .ok_or_else(|| anyhow!("a new passkey needs a user handle"))?;
+                        let (created, seed) = crate::passkey::Credential::create(
+                            &ceremony.rp_id,
+                            ceremony.rp_name.clone(),
+                            handle,
+                            ceremony.user_name.clone(),
+                            ceremony.user_display_name.clone(),
+                            user_verified,
+                            ceremony.want_prf,
+                        )?;
+
+                        let mut record = crate::record::Record::new(
+                            crate::record::Kind::Passkey,
+                            Some(created.credential.config.describe()),
+                        );
+                        record.attributes.push((
+                            "relying_party".into(),
+                            created.credential.config.rp_id.clone(),
+                        ));
+                        if let Some(name) = &created.credential.config.user_name {
+                            record.attributes.push(("username".into(), name.clone()));
+                        }
+                        record.set_field(
+                            crate::passkey::PRIVATE_KEY_FIELD,
+                            crate::record::Secret::new(created.credential.private_key()),
+                        );
+                        if let Some(seed) = &seed {
+                            record.set_field(
+                                crate::passkey::PRF_SEED_FIELD,
+                                crate::record::Secret::new(seed.as_ref()),
+                            );
+                        }
+                        record.passkey = Some(created.credential.config.clone());
+
+                        let open = self.opened()?;
+                        open.vault.add_record(record)?;
+                        open.vault.save()?;
+                        self.publish()?;
+
+                        Ok(Response::PasskeyResult {
+                            credential_id: hex(&created.credential.config.credential_id),
+                            authenticator_data: hex(&created.authenticator_data),
+                            // A registration has no assertion signature.
+                            signature: String::new(),
+                            user_handle: hex(&created.credential.config.user_handle),
+                            attestation_object: Some(hex(&created.attestation_object)),
+                            public_key_der: Some(hex(&created.public_key_der)),
+                            prf_first: None,
+                            prf_second: None,
+                        })
+                    }
+                    Operation::Assert => {
+                        let open = self.opened()?;
+                        let record = open
+                            .vault
+                            .passkey_by_credential_id(&credential_id)
+                            .ok_or_else(|| anyhow!("that passkey is no longer in the vault"))?;
+                        let prf_seed = record
+                            .field(crate::passkey::PRF_SEED_FIELD)
+                            .map(|s| s.open());
+                        let credential = crate::passkey::credential_from_record(record)?;
+
+                        // Re-checked at the moment of signing, not merely when
+                        // the ceremony was registered: the vault can be
+                        // refreshed from disk in between.
+                        let asserted = credential.assert(
+                            &ceremony.origin,
+                            &ceremony.client_data_json,
+                            user_verified,
+                        )?;
+
+                        // The PRF is evaluated only when the credential
+                        // actually carries a seed AND the relying party asked.
+                        // A credential minted without one has no answer to give,
+                        // and inventing one would hand the relying party a key
+                        // that changes the next time they ask.
+                        let evaluate = |salt: &Option<Vec<u8>>| {
+                            let seed = prf_seed.as_ref()?;
+                            let salt = salt.as_ref()?;
+                            Some(hex(
+                                crate::passkey::prf_evaluate(seed.as_slice(), salt).as_ref(),
+                            ))
+                        };
+                        let prf_first = evaluate(&ceremony.prf_first_salt);
+                        let prf_second = evaluate(&ceremony.prf_second_salt);
+
+                        Ok(Response::PasskeyResult {
+                            credential_id: hex(&credential_id),
+                            authenticator_data: hex(&asserted.authenticator_data),
+                            signature: hex(&asserted.signature),
+                            user_handle: hex(&asserted.user_handle),
+                            attestation_object: None,
+                            public_key_der: None,
+                            prf_first,
+                            prf_second,
+                        })
+                    }
+                }
             }
 
             Request::Shutdown => {
@@ -1551,7 +1913,7 @@ mod tests {
 
     // ── the agent itself ────────────────────────────────────────────────────
 
-    fn spawn_test_agent(idle_secs: u64, max_secs: u64) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    pub(super) fn spawn_test_agent(idle_secs: u64, max_secs: u64) -> (tempfile::TempDir, PathBuf, PathBuf) {
         use crate::vault::Vault;
         crate::vault::Witness::isolate_for_tests();
         let dir = tempfile::TempDir::new().unwrap();
@@ -1744,5 +2106,230 @@ mod tests {
         assert!(line.contains("\"op\":\"reveal\""));
         let back: Request = serde_json::from_str(&line).unwrap();
         matches!(back, Request::Reveal { .. });
+    }
+}
+
+/// The passkey ceremony, end to end, against a live agent over a real socket.
+#[cfg(test)]
+mod passkey_agent_tests {
+    use super::tests::spawn_test_agent;
+    use super::*;
+    use crate::consent::Operation;
+
+    const PASS: &str = "agent test passphrase";
+
+    fn unlock(sock: &Path) {
+        let r = ask_at(
+            sock,
+            &Request::Unlock {
+                passphrase: Zeroizing::new(PASS.into()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(r, Response::Status(_) | Response::Ok), "{r:?}");
+    }
+
+    fn begin(sock: &Path, op: Operation, origin: &str, rp: &str, allow: Vec<String>) -> Response {
+        ask_at(
+            sock,
+            &Request::PasskeyBegin {
+                operation: op,
+                origin: origin.into(),
+                rp_id: rp.into(),
+                rp_name: Some("Test RP".into()),
+                allow_credentials: allow,
+                client_data_json: hex(br#"{"type":"webauthn.get","challenge":"abc"}"#),
+                user_handle: Some(hex(b"user-handle")),
+                user_name: Some("ada".into()),
+                user_display_name: Some("Ada".into()),
+                want_prf: true,
+                prf_first_salt: Some(hex(&[0x11; 32])),
+                prf_second_salt: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Register a passkey and return its credential id.
+    fn make_one(sock: &Path, rp: &str) -> String {
+        let Response::PasskeyRegistered { nonce, .. } =
+            begin(sock, Operation::Create, &format!("https://{rp}"), rp, vec![])
+        else {
+            panic!("create was not registered")
+        };
+        ask_at(
+            sock,
+            &Request::PasskeyApprove {
+                nonce: nonce.clone(),
+                credential_id: None,
+            },
+        )
+        .unwrap();
+        let Response::PasskeyResult { credential_id, .. } =
+            ask_at(sock, &Request::PasskeyCollect { nonce }).unwrap()
+        else {
+            panic!("create did not complete")
+        };
+        credential_id
+    }
+
+    #[test]
+    fn nothing_is_signed_until_a_human_has_answered() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = make_one(&sock, "example.com");
+
+        let Response::PasskeyRegistered { nonce, choices } = begin(
+            &sock,
+            Operation::Assert,
+            "https://example.com",
+            "example.com",
+            vec![],
+        ) else {
+            panic!("assert was not registered")
+        };
+        assert_eq!(choices.len(), 1, "the credential just minted is discoverable");
+
+        // Collecting before an answer must not produce a signature.
+        assert!(matches!(
+            ask_at(&sock, &Request::PasskeyCollect { nonce: nonce.clone() }).unwrap(),
+            Response::PasskeyWaiting
+        ));
+
+        ask_at(
+            &sock,
+            &Request::PasskeyApprove {
+                nonce: nonce.clone(),
+                credential_id: Some(id),
+            },
+        )
+        .unwrap();
+
+        let Response::PasskeyResult {
+            signature,
+            prf_first,
+            ..
+        } = ask_at(&sock, &Request::PasskeyCollect { nonce: nonce.clone() }).unwrap()
+        else {
+            panic!("an approved ceremony must produce a signature")
+        };
+        assert!(!signature.is_empty());
+        assert!(prf_first.is_some(), "the relying party asked for a PRF value");
+
+        // And exactly once.
+        assert!(matches!(
+            ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap(),
+            Response::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn a_refused_ceremony_signs_nothing() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        make_one(&sock, "example.com");
+
+        let Response::PasskeyRegistered { nonce, .. } = begin(
+            &sock,
+            Operation::Assert,
+            "https://example.com",
+            "example.com",
+            vec![],
+        ) else {
+            panic!()
+        };
+        ask_at(&sock, &Request::PasskeyRefuse { nonce: nonce.clone() }).unwrap();
+        assert!(matches!(
+            ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap(),
+            Response::Error { .. }
+        ));
+    }
+
+    /// The attack the origin check exists for: a page that is not the relying
+    /// party asking for the relying party's credential.
+    #[test]
+    fn a_ceremony_for_the_wrong_origin_never_reaches_a_human() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        make_one(&sock, "example.com");
+
+        for origin in [
+            "https://evil.example",
+            "https://example.com.evil.test",
+            "http://example.com",
+        ] {
+            let r = begin(&sock, Operation::Assert, origin, "example.com", vec![]);
+            assert!(
+                matches!(r, Response::Error { .. }),
+                "{origin} must be refused, got {r:?}"
+            );
+        }
+        assert!(matches!(
+            ask_at(&sock, &Request::PasskeyQueue).unwrap(),
+            Response::PasskeyQueue { pending } if pending.is_empty()
+        ));
+    }
+
+    /// Naming a credential that belongs to a different relying party must not
+    /// smuggle it into this origin's ceremony.
+    #[test]
+    fn a_credential_from_another_relying_party_cannot_be_named() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let bank = make_one(&sock, "bank.example");
+        make_one(&sock, "shop.example");
+
+        // shop.example asks, but names the bank's credential.
+        let r = begin(
+            &sock,
+            Operation::Assert,
+            "https://shop.example",
+            "shop.example",
+            vec![bank],
+        );
+        assert!(
+            matches!(r, Response::Error { .. }),
+            "the bank's credential must not be usable at the shop, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn locking_the_vault_abandons_everything_waiting() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        make_one(&sock, "example.com");
+        let Response::PasskeyRegistered { nonce, .. } = begin(
+            &sock,
+            Operation::Assert,
+            "https://example.com",
+            "example.com",
+            vec![],
+        ) else {
+            panic!()
+        };
+
+        ask_at(&sock, &Request::Lock).unwrap();
+        unlock(&sock);
+
+        assert!(
+            matches!(
+                ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap(),
+                Response::Error { .. }
+            ),
+            "an approval must not survive the lock it was granted under"
+        );
+    }
+
+    #[test]
+    fn a_locked_vault_registers_no_ceremonies() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        let r = begin(
+            &sock,
+            Operation::Assert,
+            "https://example.com",
+            "example.com",
+            vec![],
+        );
+        assert!(matches!(r, Response::Error { .. }), "{r:?}");
     }
 }

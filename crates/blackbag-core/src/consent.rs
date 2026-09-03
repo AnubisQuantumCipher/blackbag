@@ -116,6 +116,12 @@ pub struct Ceremony {
     pub user_display_name: Option<String>,
     /// Whether the relying party asked for the PRF extension.
     pub want_prf: bool,
+    /// PRF salts, exactly as the relying party supplied them. Frozen with the
+    /// rest of the ceremony: a PRF output is key material for the relying
+    /// party's own encryption, so which salt gets evaluated must not be
+    /// changeable after the human has approved.
+    pub prf_first_salt: Option<Vec<u8>>,
+    pub prf_second_salt: Option<Vec<u8>>,
     pub registered_at: DateTime<Utc>,
     pub state: State,
 }
@@ -339,9 +345,9 @@ impl Desk {
     }
 }
 
-/// Hex for the credential ids that cross into JSON, so the deck never has to
-/// deal with base64 variants.
-mod hex_bytes {
+/// Hex for the byte strings that cross into JSON, so the deck and the
+/// native-messaging host never have to agree on a base64 variant.
+pub mod hex_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
@@ -391,6 +397,8 @@ mod tests {
             user_name: Some("ada".into()),
             user_display_name: None,
             want_prf: false,
+            prf_first_salt: None,
+            prf_second_salt: None,
             registered_at: at(0),
             state: State::AwaitingHuman,
         }
