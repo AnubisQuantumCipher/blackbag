@@ -102,6 +102,7 @@ impl Operation {
 /// For an assert this is what the user picks between. For a create there is
 /// exactly one, minted after approval.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Choice {
     /// The vault record's id, as a string, so the deck can name it.
     pub record_id: String,
@@ -253,6 +254,7 @@ impl Ceremony {
 /// worse than the record list the same socket already serves. It carries no key
 /// material and no client data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Summary {
     pub nonce: String,
     pub operation: Operation,

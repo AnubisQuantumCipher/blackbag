@@ -105,6 +105,7 @@ impl ClientKey {
 
 /// One remembered "yes".
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Grant {
     pub client: ClientKey,
     pub item: String,

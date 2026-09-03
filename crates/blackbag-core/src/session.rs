@@ -361,7 +361,12 @@ pub enum Request {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "snake_case")]
+/// Replies are held to the same rule as requests, for the same reason: the two
+/// ends are meant to be the same binary. Note what this does and does not
+/// reach — on an internally tagged enum the attribute is enforced for struct
+/// variants and ignored for newtype variants, which defer to the type inside
+/// them, so those inner types carry it themselves.
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
     Status(AgentStatus),
     // A struct variant, not a newtype around the Vec: serde's internally
@@ -448,7 +453,17 @@ pub enum Response {
 /// request. It is deliberately NOT reachable from the command line: there is no
 /// `--password` flag anywhere in this project, because `/proc/<pid>/cmdline` is
 /// world-readable and an argv secret is a published secret.
+/// **Unknown fields are refused here too, and this is the type where it
+/// matters most.** `Request` denies them, but that guard stops at the variant:
+/// serde checks a nested struct against the struct's own attribute, so `draft`
+/// went on ignoring fields it had never heard of after the enclosing enum
+/// stopped. This is also the only wire type in the tree with a hand-written
+/// producer in another language — the deck builds this object in JavaScript
+/// (`Model.js: buildDraft`) and pipes it to `black-bag agent add` — so a key
+/// renamed on one side and not the other is exactly the change that would
+/// otherwise go unreported.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordDraft {
     pub kind: String,
     #[serde(default)]
@@ -516,7 +531,13 @@ impl RecordDraft {
     }
 }
 
+/// Every field here is optional, which is what makes a dropped one dangerous:
+/// a missing parameter is not a missing value, it is a *different* credential.
+/// Measured — `algorithm`/`digits`/`step` misspelled was accepted and stored
+/// SHA-1 / 6 digits / 30 s, so the record produced codes the relying party
+/// rejects and nothing said why. Refuse the key instead of defaulting it.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TotpDraft {
     /// A bare base32 shared secret. Wiped with the draft.
     #[serde(default)]
@@ -769,7 +790,24 @@ impl RecordDraft {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentStatus {
+    /// Which build is serving this socket.
+    ///
+    /// Not a protocol version to bump — nobody would have bumped one for
+    /// `client_data_hash`, which is how that field came to be dropped in the
+    /// first place. This is stated, not negotiated: it makes "the running
+    /// agent predates the client" answerable instead of something inferred
+    /// from a parse failure. `#[serde(default)]` so an agent that predates the
+    /// field reports an empty string rather than failing to be read at all —
+    /// which is itself the signal.
+    ///
+    /// Its limit, because it would otherwise be overclaimed: this is the
+    /// package version, so it does NOT distinguish a freshly built agent from
+    /// the installed binary at the same version — the case actually measured.
+    /// Catching that needs something build-specific here.
+    #[serde(default)]
+    pub build: String,
     pub unlocked: bool,
     pub method: Option<String>,
     /// The nearer of the idle deadline and the session ceiling.
@@ -803,6 +841,7 @@ pub struct AgentStatus {
 
 /// A record as the cockpit sees it: everything except the secret bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretItemView {
     /// The vault record id backing this item.
     pub id: String,
@@ -814,12 +853,14 @@ pub struct SecretItemView {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SshPendingView {
     pub fingerprint: String,
     pub comment: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SecretPendingView {
     /// The item id (vault record id).
     pub id: String,
@@ -827,6 +868,7 @@ pub struct SecretPendingView {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SshIdentityView {
     /// The SSH public-key blob, hex — an `authorized_keys` line, essentially.
     pub key_blob: String,
@@ -837,6 +879,7 @@ pub struct SshIdentityView {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RecordView {
     pub id: String,
     pub kind: String,
@@ -856,6 +899,7 @@ pub struct RecordView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretFieldView {
     pub name: String,
     pub handle: String,
@@ -1286,6 +1330,17 @@ impl Agent {
 
         let mut response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => self.dispatch(request),
+            // The request direction deserves the same sentence the reply
+            // direction already gets. Before this it answered with serde's
+            // "unknown field `client_data_hash`, expected one of …", which
+            // reads like a corrupt message and is not one.
+            Err(e) if is_version_skew(&e) => Response::Error {
+                message: format!(
+                    "this agent ({}) does not understand what you asked — the \
+                     client is a different build of black-bag ({e})",
+                    env!("CARGO_PKG_VERSION"),
+                ),
+            },
             Err(e) => Response::Error {
                 message: format!("malformed request: {e}"),
             },
@@ -2602,6 +2657,7 @@ impl Agent {
                     .effective_deadline()
                     .saturating_duration_since(Instant::now());
                 AgentStatus {
+                    build: env!("CARGO_PKG_VERSION").to_string(),
                     unlocked: true,
                     method: Some(method_str(open.method).into()),
                     expires_at: Some(
@@ -2627,6 +2683,7 @@ impl Agent {
                 }
             }
             None => AgentStatus {
+                build: env!("CARGO_PKG_VERSION").to_string(),
                 unlocked: false,
                 method: None,
                 expires_at: None,
@@ -2893,6 +2950,20 @@ pub fn ask(request: &Request) -> Result<Response> {
     ask_at(&path, request)
 }
 
+/// Is this serde error version skew rather than a corrupt message?
+///
+/// Two spellings mean the same thing. `unknown variant` is a verb or a reply
+/// this build has never heard of; `unknown field` is a field added after this
+/// build was made. Both mean two copies of this program, built at different
+/// times, are talking to each other — easy to arrange by accident, because a
+/// browser spawns the *installed* binary as its native host while a developer
+/// runs a freshly built agent. Neither is a protocol bug, and repeating
+/// serde's words for it sends a reader looking in the wrong place.
+fn is_version_skew(e: &serde_json::Error) -> bool {
+    let text = e.to_string();
+    text.contains("unknown variant") || text.contains("unknown field")
+}
+
 /// Client side against an explicit socket path.
 pub fn ask_at(path: &Path, request: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(path)
@@ -2916,7 +2987,7 @@ pub fn ask_at(path: &Path, request: &Request) -> Result<Response> {
         // wrong place. Measured: a browser spawned the installed binary as its
         // native host while a freshly built agent was serving, and the whole
         // afternoon went on the wrong hypothesis.
-        if e.to_string().contains("unknown variant") {
+        if is_version_skew(&e) {
             anyhow!(
                 "this build of black-bag ({}) does not understand what the agent \
                  replied — they are different versions. Restart the agent from \
@@ -3112,6 +3183,7 @@ mod tests {
         let record = Record::new(Kind::Login, Some("GitHub".into()));
         let view = RecordView::of(&record);
         let status = AgentStatus {
+            build: env!("CARGO_PKG_VERSION").to_string(),
             unlocked: true,
             method: Some("passphrase".into()),
             expires_at: None,
@@ -5225,5 +5297,87 @@ mod reveal_policy_tests {
         let raw = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
         assert!(raw.contains("password"), "the field name is metadata");
         assert!(!raw.contains("hunter2"), "the value never is");
+    }
+}
+
+/// The guard on `Request` stopped at the variant; these cover below it, and the
+/// reply direction, which had only half a guard.
+#[cfg(test)]
+mod nested_unknown_field_tests {
+    use super::*;
+
+    /// Reproduced before the fix: this parsed, and the field vanished.
+    #[test]
+    fn a_nested_draft_refuses_an_unknown_field_too() {
+        let err = serde_json::from_str::<Request>(
+            r#"{"op":"add","draft":{"kind":"login","from_a_newer_build":"x"}}"#,
+        )
+        .map(|r| format!("{r:?}"))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field"), "the draft must refuse it: {err}");
+    }
+
+    /// The one with a consequence. A dropped TOTP parameter is not a missing
+    /// value, it is a different credential: before the fix this parsed and
+    /// stored SHA-1 / 6 digits / 30 s, so every code it produced was rejected
+    /// by the relying party and nothing said why.
+    #[test]
+    fn a_renamed_totp_parameter_is_refused_not_defaulted() {
+        let err = serde_json::from_str::<TotpDraft>(
+            r#"{"secret_base32":"JBSWY3DPEHPK3PXP","hash_algorithm":"sha512"}"#,
+        )
+        .map(|d| format!("{d:?}"))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown field"),
+            "a renamed parameter must be refused: {err}"
+        );
+    }
+
+    /// The reply direction. `client` is what the consent prompt shows as the
+    /// program asking, so a rename dropped here would name the wrong thing on
+    /// a screen whose entire job is to say who is asking.
+    #[test]
+    fn a_reply_with_an_unknown_field_is_refused() {
+        let err = serde_json::from_str::<Response>(
+            r#"{"result":"approval_required","item":"i","field":"password","requester":"/usr/bin/curl"}"#,
+        )
+        .map(|r| format!("{r:?}"))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field"), "a reply field must be refused: {err}");
+    }
+
+    /// Request-direction skew is named, not spelled out in serde's words —
+    /// the sentence the reply direction has had since lane B landed.
+    #[test]
+    fn a_request_from_another_build_is_recognised_as_skew() {
+        let e = serde_json::from_str::<Request>(
+            r#"{"op":"reveal","id":"x","field":"password","from_a_newer_build":1}"#,
+        )
+        .unwrap_err();
+        assert!(
+            is_version_skew(&e),
+            "an unknown field is skew, not corruption: {e}"
+        );
+    }
+
+    /// A stale agent is answerable rather than inferred from a parse failure.
+    #[test]
+    fn a_status_reply_names_the_build_serving_it() {
+        let older = serde_json::from_str::<AgentStatus>(
+            r#"{"unlocked":false,"method":null,"expires_at":null,
+                "idle_timeout_secs":900,"record_count":0,"counts_by_kind":[],
+                "rollback_suspected":false}"#,
+        );
+        match older {
+            Ok(status) => assert!(
+                status.build.is_empty(),
+                "an agent predating the field reports no build, which is the signal"
+            ),
+            Err(e) => panic!("a status without the field must still parse: {e}"),
+        }
     }
 }

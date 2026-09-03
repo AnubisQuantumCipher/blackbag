@@ -62,6 +62,7 @@ pub const PAD_TO: usize = 8;
 
 /// A field the agent is willing to check, identified without its value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Candidate {
     pub id: Uuid,
     pub title: Option<String>,
@@ -74,6 +75,7 @@ pub struct Candidate {
 /// with its breach count. Padding entries carry a count of zero and are
 /// dropped by the caller before they get here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Range {
     pub prefix: String,
     pub suffixes: Vec<(String, u64)>,
@@ -81,6 +83,7 @@ pub struct Range {
 
 /// A field that appears in the corpus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Exposure {
     pub id: Uuid,
     pub title: Option<String>,
@@ -91,6 +94,7 @@ pub struct Exposure {
 
 /// The outcome of a matching pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Report {
     /// Fields whose prefix had a bucket to compare against.
     pub checked: usize,

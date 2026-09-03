@@ -42,8 +42,11 @@ use std::time::{Duration, Instant};
 const MAX_MESSAGE: u32 = 1024 * 1024;
 
 /// What the extension sends us.
+/// Unknown fields are refused, as on the agent socket and for a sharper
+/// reason: the extension lives in the browser profile and updates on its own
+/// schedule, so extension-versus-binary skew is the likeliest kind here.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Incoming {
     /// Liveness, and whether the vault is open — so the extension can tell the
     /// user to unlock rather than failing a ceremony for no visible reason.
@@ -65,6 +68,7 @@ enum Incoming {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BeginArgs {
     operation: String,
     origin: String,

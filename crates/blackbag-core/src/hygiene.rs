@@ -161,7 +161,7 @@ impl std::fmt::Display for Severity {
 /// stays readable after the policy changes and no reader has to guess which
 /// floor applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Issue {
     /// This field's secret produces the same handle as the same-named field on
     /// the listed records. A shared handle, not a proven shared secret.
@@ -269,6 +269,7 @@ impl Issue {
 
 /// A record that has at least one issue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordReport {
     pub id: Uuid,
     pub title: Option<String>,
@@ -294,6 +295,7 @@ impl RecordReport {
 /// `members.len()` is always at least two. Membership means "shares a handle";
 /// see the module docs on the 32-bit collision space.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReuseCluster {
     pub field: String,
     pub handle: String,
@@ -302,6 +304,7 @@ pub struct ReuseCluster {
 
 /// What one record cost, so the total can be shown rather than asserted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScoreContribution {
     pub id: Uuid,
     pub demerits: u64,
@@ -310,6 +313,7 @@ pub struct ScoreContribution {
 /// Counts by severity plus a decomposable total. See the module docs for the
 /// formula; nothing here is normalised, scaled, or capped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HygieneScore {
     pub high: usize,
     pub medium: usize,
@@ -334,6 +338,7 @@ impl HygieneScore {
 /// `scanned - records.len() == score.clean_records` and a tidy vault yields an
 /// empty vector rather than a wall of clean rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VaultReport {
     pub scanned: usize,
     pub records: Vec<RecordReport>,

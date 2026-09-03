@@ -46,9 +46,10 @@ jobs:
           echo "warnings: $count"
           test "$count" -eq 0
 
+      # Was continue-on-error, which made the line above a suggestion. It
+      # passes clean today, so the gate is real from here.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-        continue-on-error: true
 
   surfaces:
     name: plugin logic
