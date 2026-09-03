@@ -129,6 +129,37 @@ eq(lockReasonLabel(""), "", "no reason")
      ["usb"], "array-like recipients from QML")
 }
 
+// ── vault management ─────────────────────────────────────────────────────────
+{
+  const two = status({ recipients: [
+    { label: "passphrase", kind: "passphrase", key_held_externally: false },
+    { label: "offsite", kind: "hybrid-x25519-mlkem1024", key_held_externally: true },
+    { label: "usb", kind: "hybrid-x25519-mlkem1024", key_held_externally: true }
+  ] })
+  eq(revocableRecipients(two).map(r => r.label), ["offsite", "usb"], "only offline keys are revocable")
+  eq(revocableRecipients(status()).length, 0, "nothing to revoke without recipients")
+
+  eq(kdfMeetsDefault(status({ kdf: { meets_current_defaults: true } })), true, "kdf at default")
+  eq(kdfMeetsDefault(status({ kdf: { meets_current_defaults: false } })), false, "kdf below default")
+  eq(kdfMeetsDefault(status()), true, "no kdf reported is not a complaint")
+  eq(kdfMeetsDefault(null), true, "no status is not a complaint")
+
+  eq(shortStamp().length, 8, "stamp is YYYYMMDD")
+  eq(/^\d{8}$/.test(shortStamp()), true, "stamp is all digits")
+
+  eq(IMPORT_FORMATS.length, 6, "every import format the engine has is offered")
+  eq(EXPORT_FORMATS.length, 2, "and every export format")
+  eq(GEN_KINDS.length, 3, "and every generator kind")
+
+  // The steppers must not be able to offer a value the clamp would reject.
+  for (const row of SETTING_ROWS) {
+    const lo = clampSettings({ [row.key]: row.from })[row.key]
+    const hi = clampSettings({ [row.key]: row.to })[row.key]
+    eq(lo, row.from, `${row.key} lower bound survives the clamp`)
+    eq(hi, row.to, `${row.key} upper bound survives the clamp`)
+  }
+}
+
 // ── posture: session key ─────────────────────────────────────────────────────
 {
   const rows = postureRows(status({ host: { mlock_working: true, core_dumps_disabled: true, swap_devices: [],

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Idempotent installer for the BLACK-BAG Omarchy plugin.
 #   * checks that the `black-bag` engine is on PATH
+#   * copies the plugin's own files into ~/.config/omarchy/plugins
 #   * adds the bar widget to ~/.config/omarchy/shell.json (right section)
 #   * binds SUPER+SHIFT+K in ~/.config/hypr/bindings.lua (managed block)
 #   * installs a user unit for the unlock agent
@@ -24,6 +25,30 @@ if ! command -v black-bag >/dev/null 2>&1; then
   exit 1
 fi
 echo "  engine: $(command -v black-bag) ($(black-bag --version 2>/dev/null | head -1))"
+
+# 1b. Put the surfaces where the shell actually loads them from.
+#
+# Omarchy's PluginRegistry scans ~/.config/omarchy/plugins and nowhere else, so
+# a plugin edited in a checkout is not the plugin the shell is running. This
+# step used to be done by hand, which meant a new file — a whole new sheet, in
+# one case — could be written, built, tested and "installed" while the live
+# shell went on loading the previous version. Copying every tracked surface,
+# rather than a hand-kept list, is what keeps that from happening again.
+DEST="$HOME/.config/omarchy/plugins/$ID"
+if [[ "$PLUGIN_DIR" != "$DEST" ]]; then
+  mkdir -p "$DEST"
+  copied=0
+  shopt -s nullglob
+  for f in "$PLUGIN_DIR"/*.qml "$PLUGIN_DIR"/*.js "$PLUGIN_DIR"/manifest.json \
+           "$PLUGIN_DIR"/*.desktop "$PLUGIN_DIR"/install.sh; do
+    install -m644 "$f" "$DEST/$(basename "$f")" && copied=$((copied + 1))
+  done
+  shopt -u nullglob
+  chmod 755 "$DEST/install.sh" 2>/dev/null
+  echo "  surfaces: $copied file(s) → $DEST"
+else
+  echo "  surfaces: already running from $DEST"
+fi
 
 # 2. Enable the bar widget (insert after the last khephri.* widget).
 if [[ -f "$SHELL_JSON" ]]; then
@@ -78,7 +103,12 @@ mkdir -p "$UNIT_DIR"
 mkdir -p "$HOME/.local/share/black-bag" "$HOME/.local/state/black-bag"
 chmod 700 "$HOME/.local/share/black-bag" "$HOME/.local/state/black-bag"
 
-cat > "$UNIT_DIR/black-bag-agent.service" <<UNIT
+# Quoted delimiter: the body is systemd specifiers (%h, %t) and prose, with
+# no shell expansion wanted. Unquoted, the backticks in the ReadWritePaths
+# comment ran as command substitution — printing "-: command not found" and
+# writing the comment into the unit with the character it was explaining
+# silently removed.
+cat > "$UNIT_DIR/black-bag-agent.service" <<'UNIT'
 [Unit]
 Description=Black-Bag unlock agent
 Documentation=man:black-bag(1)

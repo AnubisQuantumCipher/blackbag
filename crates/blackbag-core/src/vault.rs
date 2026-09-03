@@ -1089,7 +1089,7 @@ mod tests {
         Vault::init(&path, PASS, MEM).unwrap();
 
         let mut file = read_vault_file(&path).unwrap();
-        file.header.updated_at = file.header.updated_at + chrono::Duration::days(365);
+        file.header.updated_at += chrono::Duration::days(365);
         write_vault_file(&path, &file).unwrap();
 
         assert!(Vault::unlock(&path, PASS).is_err());

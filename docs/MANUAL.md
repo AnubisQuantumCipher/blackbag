@@ -498,11 +498,12 @@ Deck, with the record list focused:
 | `u` | focus the passphrase field (only while locked) |
 | `Ctrl+B` | check breaches — press twice; the first press arms and explains |
 | `Ctrl+K` | unlock with a recovery key (sealed screen; only when the vault has one) |
+| `Ctrl+M` | open the management sheet (passphrase, recovery keys, import, export, generator, settings) |
 | `Ctrl+L` | lock the agent now |
 | `Ctrl+R` | re-publish status and re-read the record list |
 | `Esc` | step back (see below) |
 
-`Ctrl+B`, `Ctrl+L`, `Ctrl+R` and `Esc` are window-scoped and work wherever
+`Ctrl+B`, `Ctrl+L`, `Ctrl+M`, `Ctrl+R` and `Esc` are window-scoped and work wherever
 the caret is. The plain letter keys are deliberately dead while a text field
 has focus. The footer shows the map: `n new · e edit · del remove · / search
 · ↑↓ move · ⏎ copy · ⇧⏎ show · ^B breaches · ^L lock · esc close`.
@@ -535,6 +536,34 @@ REFRESH in the SESSION card; CHECK BREACHES in the HYGIENE card; clicking a
 hygiene finding jumps to its record, clearing the kind filter if the record is
 hidden behind one. Every button is also reachable with `Tab` and pressed with
 `Space` or `Enter`.
+
+### The management sheet
+
+`Ctrl+M` opens everything that changes the vault itself rather than a record
+in it. Six sections down the left rail; `Ctrl+1` to `Ctrl+6` jump straight to
+one and `Ctrl+↑` / `Ctrl+↓` walk them in a ring. The accelerator is printed on
+each rail row, so the chord never has to be remembered. `Ctrl+Enter` runs the
+section's primary verb, and the footer names what that verb is right now.
+`Esc` closes the sheet — or, if something is armed, disarms it first.
+
+| Section | What it does |
+|---|---|
+| **PASSPHRASE** (`Ctrl+1`) | Change the master passphrase, or raise the Argon2 work factor without changing it. Both mint a fresh data key, re-encrypt every record and re-wrap every recipient, so **recovery keys keep working** and the old passphrase stops. The card at the top states the vault's current `argon2id` figures and says plainly when they are below what this build would choose today — the finding the hygiene card used to report with no way to act on it |
+| **RECOVERY KEYS** (`Ctrl+2`) | Lists every recipient and what kind it is. Mint a new offline key, or revoke one — revoke arms first and takes a second press. The passphrase recipient is never offered a REVOKE button, because removing it is not recovery, it is destruction. Minting asks for the passphrase, since it changes who can open the vault |
+| **IMPORT** (`Ctrl+3`) | Read an export from Bitwarden, KeePassXC, Firefox, Chrome, any CSV with a usable header, or Black-Bag's own JSON. **PREVIEW parses the file and reports what it found and what it skipped without opening the vault at all**; IMPORT stays disabled until you have previewed. `Ctrl+Enter` follows the two steps in order — preview first, write second |
+| **EXPORT** (`Ctrl+4`) | Every record and every secret, in the clear, as Black-Bag JSON or KeePassXC CSV. The JSON form imports back whole, so it is also a restorable backup. It asks for the passphrase even while the deck is unlocked, because there is deliberately no way to read the whole vault over the agent socket |
+| **GENERATE** (`Ctrl+5`) | Passwords, passphrases and PINs, with the length, symbols and look-alike-avoidance controls. COPY draws a **new** value straight to the clipboard rather than copying the one on screen, so a value you only glanced at is never the one you paste. The entropy figure describes the generator, never a value you typed |
+| **SETTINGS** (`Ctrl+6`) | Reveal timeout, clipboard clear delay, staleness threshold, poll interval and cockpit motion. Every value is a stepper rather than free text, and the deck clamps the range, so no setting here can leave a secret on screen forever or set a clipboard that never clears |
+
+Everything in the sheet is reachable from the keyboard: `Tab` moves between
+controls, the format and kind choosers are single tab stops that arrow-key
+within themselves like the radio groups they are, and `Space` or `Enter`
+presses whatever is focused. The focused control draws a ring so it is never
+a guess.
+
+An import or a re-key changes the vault under the deck, so the sheet tells
+the cockpit to re-read both the file's posture and the record list when it
+finishes.
 
 ---
 
@@ -811,7 +840,7 @@ taken from `--help`.
 | `black-bag init` | `--mem-kib <KIB>` (default 262144) | Prompts for the new passphrase twice. Refuses if the file exists |
 | `black-bag rekey` | `--change-passphrase`, `--mem-kib <KIB>` | New data key, payload re-encrypted, every recipient re-wrapped, Argon2 salt re-drawn |
 | `black-bag migrate` | `--from <PATH>`, `--to <PATH>` | Reads a `black-bagg` 0.4.x v1 vault. See §9 |
-| `black-bag import` | `--from <FILE>` (required), `--format bitwarden\|keepassxc\|firefox\|chrome\|csv\|black-bag` (required), `--dry-run` | Opens the vault itself (passphrase prompt), parses the export by hand, adds every record it could map. `black-bag` reads this program's own JSON export back whole — kinds, tags, attributes, every field byte for byte, notes and TOTP — so an export is a restorable backup. A file whose header names none of the format's columns is refused by name rather than guessed at, and blank lines are dropped. Skipped rows are reported on stderr by reason, never by value. `--dry-run` parses, prints the counts by kind, writes nothing. Afterwards it tells you to `shred -u` the export |
+| `black-bag import` | `--from <FILE>` (required), `--format bitwarden\|keepassxc\|firefox\|chrome\|csv\|black-bag` (required), `--dry-run` | Parses the export by hand and adds every record it could map. **If the agent already holds this vault open it does the writing** — one request, one save — so an import from the deck needs no passphrase the agent is already holding the key for; otherwise the vault is opened here and the passphrase is prompted for. `black-bag` reads this program's own JSON export back whole — kinds, tags, attributes, every field byte for byte, notes and TOTP — so an export is a restorable backup. A file whose header names none of the format's columns is refused by name rather than guessed at, and blank lines are dropped. Skipped rows are reported on stderr by reason, never by value. `--dry-run` parses, prints the counts by kind, writes nothing. Afterwards it tells you to `shred -u` the export |
 | `black-bag export` | `--to <FILE>` (required), `--format json\|keepassxc` (json), `--plaintext-ok` (required) | Every record and every secret in plaintext. Refuses without `--plaintext-ok`, refuses to overwrite, creates the file `0600` with `O_EXCL`, and tells you to shred it once the other tool has read it |
 
 Import formats: `bitwarden` is the unencrypted JSON export (an encrypted one

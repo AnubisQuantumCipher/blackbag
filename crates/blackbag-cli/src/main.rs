@@ -86,10 +86,23 @@ enum Command {
 /// Generated values go to STDOUT and the strength line to STDERR, so a pipe
 /// captures the secret alone. That also means a shell redirect writes a
 /// password to a file — which is the point of a generator, but worth knowing.
+#[derive(Args)]
+struct GenSink {
+    /// Where the generated value goes. The default writes it to stdout so a
+    /// pipe captures the secret and nothing else; the clipboard sink offers
+    /// it with the sensitive hint and clears it on a timer.
+    #[arg(long = "to", value_enum, default_value_t = Sink::Stdout)]
+    sink: Sink,
+    #[arg(long, default_value_t = 30)]
+    clear_after: u64,
+}
+
 #[derive(Subcommand)]
 enum GenCommand {
     /// A random password.
     Password {
+        #[command(flatten)]
+        out: GenSink,
         #[arg(long, default_value_t = 20)]
         length: usize,
         #[arg(long)]
@@ -106,6 +119,8 @@ enum GenCommand {
     },
     /// A random passphrase from the built-in 512-word list (9 bits per word).
     Passphrase {
+        #[command(flatten)]
+        out: GenSink,
         #[arg(long, default_value_t = 8)]
         words: usize,
         #[arg(long, default_value_t = '-')]
@@ -115,6 +130,8 @@ enum GenCommand {
     },
     /// A random numeric PIN.
     Pin {
+        #[command(flatten)]
+        out: GenSink,
         #[arg(long, default_value_t = 6)]
         digits: usize,
     },
@@ -1232,8 +1249,9 @@ fn cmd_gen(cmd: GenCommand) -> Result<()> {
     use blackbag_core::generate;
     use std::io::Write;
 
-    let (secret, strength) = match cmd {
+    let (secret, strength, out) = match cmd {
         GenCommand::Password {
+            out,
             length,
             no_lowercase,
             no_uppercase,
@@ -1249,9 +1267,10 @@ fn cmd_gen(cmd: GenCommand) -> Result<()> {
                 symbols: !no_symbols,
                 exclude_ambiguous,
             };
-            (generate::password(&spec)?, generate::strength_of_spec(&spec))
+            (generate::password(&spec)?, generate::strength_of_spec(&spec), out)
         }
         GenCommand::Passphrase {
+            out,
             words,
             separator,
             capitalise,
@@ -1264,16 +1283,28 @@ fn cmd_gen(cmd: GenCommand) -> Result<()> {
             (
                 generate::passphrase(&spec)?,
                 generate::strength_of_passphrase(&spec),
+                out,
             )
         }
-        GenCommand::Pin { digits } => (generate::pin(digits)?, generate::strength_of_pin(digits)),
+        GenCommand::Pin { out, digits } => (
+            generate::pin(digits)?,
+            generate::strength_of_pin(digits),
+            out,
+        ),
     };
 
     let value = secret.expose_str()?;
-    let mut out = std::io::stdout();
-    out.write_all(value.as_bytes())?;
-    out.write_all(b"\n")?;
-    out.flush()?;
+    match out.sink {
+        // The historical behaviour, and still the default: the value alone on
+        // stdout so a pipe or a redirect captures it and nothing else.
+        Sink::Stdout => {
+            let mut stdout = std::io::stdout();
+            stdout.write_all(value.as_bytes())?;
+            stdout.write_all(b"\n")?;
+            stdout.flush()?;
+        }
+        sink => tty::emit_secret(&value, "generated", sink, out.clear_after)?,
+    }
 
     // stderr, so a pipe gets the secret and nothing else.
     eprintln!(

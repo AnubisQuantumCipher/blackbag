@@ -268,6 +268,7 @@ Item {
     // back its own unlock screen, which is the only honest outcome.
     if (onboardSheet.open_) onboardSheet.abandon()
     if (recoverSheet.open_) recoverSheet.clear()
+    if (manageSheet.open_) manageSheet.clear()
   }
 
   // Focus the passphrase box only when it is actually on screen and usable.
@@ -618,11 +619,13 @@ Item {
   // hosts: the plugin's settings live in the shell's config and are written
   // through the shell, the application owns a settings file of its own.
   // A value of 0 clears the override and returns the deck to the viewport.
-  function persistScale(value) {
+  function persistSetting(key, value) {
     // The application owns its settings file, so this is a direct write; the
     // watcher on that file feeds the new value straight back to Style.
-    App.setSetting("uiScale", value)
+    App.setSetting(String(key), value)
   }
+
+  function persistScale(value) { root.persistSetting("uiScale", value) }
 
   // ── processes ──────────────────────────────────────────────────────────────
 
@@ -915,13 +918,13 @@ Item {
       // while you are typing into a field.
       Shortcut {
         sequences: ["Esc"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_
         context: Qt.WindowShortcut
         onActivated: root.backOut()
       }
       Shortcut {
         sequences: ["Ctrl+L"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && root.unlocked
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && root.unlocked
         context: Qt.WindowShortcut
         onActivated: root.doLock()
       }
@@ -955,13 +958,25 @@ Item {
 
       Shortcut {
         sequences: ["Ctrl+R"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_
         context: Qt.WindowShortcut
         onActivated: {
           refreshProcess.running = true
           if (root.unlocked) root.refreshRecords()
         }
       }
+      // Vault management: re-key, recovery keys, import, export, generate,
+      // settings. Reachable unlocked or sealed, because raising the work
+      // factor and minting a recovery key are things you may want to do
+      // before you have opened anything.
+      Shortcut {
+        sequences: ["Ctrl+M"]
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_
+                 && !recoverSheet.open_ && !manageSheet.open_
+        context: Qt.WindowShortcut
+        onActivated: manageSheet.begin("passphrase")
+      }
+
       // The way back in, from the sealed screen. Only when there is one.
       Shortcut {
         sequences: ["Ctrl+K"]
@@ -973,7 +988,7 @@ Item {
       }
       Shortcut {
         sequences: ["Ctrl+B"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && root.unlocked
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && root.unlocked
         context: Qt.WindowShortcut
         onActivated: root.requestBreachCheck()
       }
@@ -2851,6 +2866,28 @@ Item {
           renderType: Text.NativeRendering
         }
       }
+
+    // ── everything else the engine can do ─────────────────────────────────
+    Manage {
+      id: manageSheet
+      motionMs: root.motionMs
+      uiScale: root.uiScale
+      homeDir: root.homeDir
+      status: root.status
+      settings: root.settings
+
+      onChanged: {
+        // The vault moved under us: re-read both the file's posture and the
+        // record list, since an import or a re-key changes each.
+        refreshProcess.running = true
+        if (root.unlocked) root.refreshRecords()
+      }
+      onSettingChanged: function (key, value) { root.persistSetting(key, value) }
+      onDismissed: Qt.callLater(function () {
+        if (root.unlocked) keyCatcher.forceActiveFocus()
+        else root.focusPass()
+      })
+    }
 
     // ── the way back in ───────────────────────────────────────────────────
     // Offered only when status.json actually lists a recipient whose private

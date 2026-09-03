@@ -1037,12 +1037,32 @@ mod tests {
 
     #[test]
     fn many_small_secrets_pack_into_one_slab() {
-        let before = locked_bytes() + unlocked_bytes();
         let held: Vec<SecretBuf> = (0..1000).map(|i| SecretBuf::new(&[i as u8; 24])).collect();
         assert_eq!(held.len(), 1000);
-        // 1000 × 32 bytes = 32 KiB, well within one slab; at most one new slab
-        // was mapped for them.
-        assert!(locked_bytes() + unlocked_bytes() <= before + SLAB_BYTES + page_size());
+
+        // Packing is asserted on the addresses themselves, not on
+        // locked_bytes()/unlocked_bytes(). Those are process-global and every
+        // other test in this binary moves them, so a delta across this body
+        // measured the whole suite's concurrent allocation and failed once the
+        // harness was given enough threads — the same defect that was already
+        // fixed once in the oversize-slab test.
+        //
+        // 1000 × 32 bytes is 32 KiB, comfortably inside one slab. Sort the
+        // addresses and count the runs: buffers carved from a shared slab sit
+        // within SLAB_BYTES of their neighbour, so a handful of runs means they
+        // packed, while a per-allocation mapping would show hundreds.
+        let mut addrs: Vec<usize> = held.iter().map(|s| s.as_slice().as_ptr() as usize).collect();
+        addrs.sort_unstable();
+        let runs = 1 + addrs
+            .windows(2)
+            .filter(|w| w[1] - w[0] > SLAB_BYTES)
+            .count();
+        assert!(
+            runs <= 4,
+            "1000 small secrets landed in {runs} separate regions; they are no \
+             longer being packed into shared slabs"
+        );
+
         for (i, s) in held.iter().enumerate() {
             assert!(s.iter().all(|&b| b == i as u8));
         }
@@ -1209,16 +1229,25 @@ mod tests {
         );
 
         assert!(secret.scanned > 0, "nothing was scanned");
-        // Every live thread stack has a band of never-faulted pages the
-        // kernel refuses with EIO — measured here as 32 of 2272, all of them
-        // in the two worker stacks. What must not happen is coverage quietly
+        // Every live thread stack has a band of never-faulted pages the kernel
+        // refuses with EIO — measured here as 32 of 2272, all of them in the
+        // two worker stacks. What must not happen is coverage quietly
         // collapsing: before this was measured, one bad page discarded its
         // whole mapping, and a 528-page stack was dropped for the sake of 16.
+        //
+        // The floor is absolute rather than a fraction of what is mapped,
+        // because the denominator belongs to the harness and not to the code
+        // under test: every additional `--test-threads` adds a stack whose
+        // never-faulted pages are unreadable, so an "unreadable < 5%" bound
+        // held at 8 threads and failed at 64 while the scan was working
+        // perfectly. The real guarantee that coverage did not collapse is the
+        // positive control below — if a refused page had discarded the mapping
+        // holding the planted needle, it would not be found.
+        let readable = secret.pages - secret.unreadable_pages;
         assert!(
-            secret.unreadable_pages * 20 < secret.pages,
-            "{} of {} pages were unreadable; the scan no longer covers enough \
-             memory for its silence to mean anything",
-            secret.unreadable_pages,
+            readable >= 512,
+            "only {readable} of {} pages could be read; the scan no longer \
+             covers enough memory for its silence to mean anything",
             secret.pages
         );
         assert!(

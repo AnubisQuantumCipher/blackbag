@@ -3,6 +3,63 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — the deck can now manage the vault, not just its records
+
+- **A management sheet on `Ctrl+M`** with six sections: passphrase, recovery
+  keys, import, export, generator and settings. Everything the engine could
+  already do to a vault had, until now, no surface in the deck at all — a
+  GUI-only owner could not change a passphrase, raise a work factor, mint or
+  revoke a recovery key, import from another manager, or take a backup.
+- **Raise the work factor without changing the passphrase.** The hygiene card
+  has always been able to say "Argon2 cost is below the current default"; it
+  now has a button that acts on it. Both this and a passphrase change re-wrap
+  every recipient, so existing recovery keys keep working.
+- **Import previews before it writes.** PREVIEW parses the file and reports
+  what it found and what it skipped *without opening the vault*, and IMPORT
+  stays disabled until it has. `Ctrl+Enter` walks the two steps in order.
+- **The sheet is fully keyboard-driven**, like the rest of the deck:
+  `Ctrl+1`–`Ctrl+6` jump to a section, `Ctrl+↑`/`Ctrl+↓` walk them, and
+  `Ctrl+Enter` runs the section's primary verb. The accelerators are drawn on
+  the rail and the footer names the verb, so neither is a chord to remember.
+  Buttons take `Tab` focus and draw a focus ring; a chooser is one tab stop
+  that arrows within itself, the way a radio group should.
+
+### Fixed
+
+- **A chooser never showed which option was selected, and its chips did
+  nothing when clicked.** The chip delegate reached for `parent.parent`, but a
+  `Repeater` parents its delegates to the `Flow` itself, so the binding read
+  one level too high: `active` was never true and the tap handler's target
+  came back `undefined`. Bound to the flow directly.
+- **The management sheet's rail ate the whole window.** A nested layout
+  defaults to `Layout.fillWidth: true` in Qt, so a bare `preferredWidth` was
+  only a hint and the content panel was squeezed to a few pixels at the right
+  edge. The rail is pinned at all three widths.
+- **A successful import reported what it had parsed, not what it had
+  written.** The engine prints the parse summary first and the write
+  confirmation second; the deck took line one, so the one moment the user
+  needed to be told "3 records went in" said "3 records were read".
+- **The installer never actually deployed the plugin.** Omarchy's registry
+  scans `~/.config/omarchy/plugins` and nowhere else, but `install.sh` only
+  wired up `shell.json`, the keybinding and the unit — the surfaces themselves
+  had been copied by hand. A whole new sheet could be written, built, tested
+  and "installed" while the live shell went on loading the previous version.
+  It now copies every surface it finds, rather than a hand-kept list.
+- **The generated systemd unit had the character it was explaining removed
+  from it.** The heredoc was unquoted, so the backticks in the
+  `ReadWritePaths` comment ran as command substitution: the install printed
+  `-: command not found` and wrote `# Leading  so a directory…` into the unit.
+- **Two memory tests asserted on process-global counters** that every other
+  test in the binary moves, so they failed under load and at high
+  `--test-threads` while the code was working. `many_small_secrets_pack_into_
+  one_slab` now asserts packing on the addresses themselves, and the
+  `/proc/self/mem` scan's coverage floor is absolute instead of a fraction of
+  a mapped total that grows with the harness's thread count. Ten consecutive
+  runs at `--test-threads=64` are clean.
+- `clippy`: an `assign_op_pattern` in `vault.rs`.
+
 ## [2.5.0] — 2026-09-02
 
 The release that came out of treating the product as a target. Every item

@@ -113,7 +113,17 @@ report until lock.
 
 **Import and export.** Bitwarden, KeePassXC, Firefox, Chrome and any CSV in;
 JSON or KeePassXC CSV out, plaintext by declaration and 0600 by construction.
-The JSON export imports back whole, so a backup is restorable.
+The JSON export imports back whole, so a backup is restorable. An import
+previews first — it reports what parsed and what it skipped without opening
+the vault at all — and only writes on a second, deliberate press.
+
+**Everything the engine can do to a vault, the deck can do too.** `Ctrl+M`
+opens a management sheet: change the passphrase, raise the Argon2 work factor
+without changing it, mint or revoke a recovery key, import, export, generate,
+and tune the deck's own timeouts. A re-key re-wraps every recipient, so
+recovery keys keep working. It is driven from the keyboard like the rest of
+the deck — `Ctrl+1`–`Ctrl+6` for the sections, `Ctrl+Enter` for the section's
+verb, with both drawn on screen rather than left to memory.
 
 **A way back in that does not need a terminal.** The deck could mint a
 recovery key in first run and had no way to use one — so an owner who only

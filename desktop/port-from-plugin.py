@@ -98,11 +98,13 @@ import qs.Ui""",
   }"""
 ),
 (
-"""  function persistScale(value) {
+"""  function persistSetting(key, value) {
     scaleWriter.command = ["omarchy-shell", "shell", "setBarWidget",
-                           "khephri.blackbag", "uiScale", String(value), "{}"]
+                           "khephri.blackbag", String(key), String(value), "{}"]
     scaleWriter.running = true
   }
+
+  function persistScale(value) { root.persistSetting("uiScale", value) }
 
   Process {
     id: scaleWriter
@@ -112,11 +114,13 @@ import qs.Ui""",
       if (code !== 0) root.actionError = "could not save the scale"
     }
   }""",
-"""  function persistScale(value) {
+"""  function persistSetting(key, value) {
     // The application owns its settings file, so this is a direct write; the
     // watcher on that file feeds the new value straight back to Style.
-    App.setSetting("uiScale", value)
-  }"""
+    App.setSetting(String(key), value)
+  }
+
+  function persistScale(value) { root.persistSetting("uiScale", value) }"""
 ),
 (
 """  PanelWindow {
@@ -154,6 +158,7 @@ import qs.Ui""",
 # itself, so this is the whole of its port.
 ONBOARD_EDITS = list(EDITOR_EDITS)
 RECOVER_EDITS = list(EDITOR_EDITS)
+MANAGE_EDITS = list(EDITOR_EDITS)
 
 # DeckMetrics wraps the host's Style singleton, so only the import differs.
 METRICS_EDITS = [
@@ -203,6 +208,11 @@ def main():
         # sheet is: it is handed $HOME rather than asking for it.
         "Recover.qml": port((PLUGIN / "Recover.qml").read_text(),
                             RECOVER_EDITS, "Recover.qml"),
+        # The management sheet is host-neutral too: it is handed $HOME, the
+        # status document and the resolved settings, and raises a signal
+        # rather than knowing where settings live.
+        "Manage.qml": port((PLUGIN / "Manage.qml").read_text(),
+                           MANAGE_EDITS, "Manage.qml"),
         "DeckMetrics.qml": port((PLUGIN / "DeckMetrics.qml").read_text(),
                                 METRICS_EDITS, "DeckMetrics.qml",
                                 rename_textfield=False),

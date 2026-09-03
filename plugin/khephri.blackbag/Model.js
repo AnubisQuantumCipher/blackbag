@@ -721,6 +721,70 @@ function canRecover(status) {
   return recoverableLabels(status).length > 0
 }
 
+// Recipients that may be revoked. The passphrase recipient may not: a vault
+// only a key file can open is a lockout waiting to happen, and the engine
+// refuses it anyway.
+function revocableRecipients(status) {
+  return recipientRows(status).filter(function (r) { return r.external })
+}
+
+// A short, sortable stamp for a default recovery-key label, so two keys minted
+// on the same machine do not collide by name.
+function shortStamp() {
+  var d = new Date()
+  function two(n) { return (n < 10 ? "0" : "") + n }
+  return String(d.getFullYear()) + two(d.getMonth() + 1) + two(d.getDate())
+}
+
+// What `crypto::DEFAULT_MEM_KIB` is in the engine. Restated rather than read
+// because status.json reports what the VAULT uses, not what a fresh one would
+// choose; if the engine's default changes this must change with it.
+var DEFAULT_MEM_KIB = 262144
+
+function kdfMeetsDefault(status) {
+  var kdf = status ? status.kdf : null
+  if (!kdf) return true          // nothing to complain about yet
+  return kdf.meets_current_defaults === true
+}
+
+var IMPORT_FORMATS = [
+  { key: "bitwarden", label: "Bitwarden" },
+  { key: "keepassxc", label: "KeePassXC" },
+  { key: "firefox",   label: "Firefox" },
+  { key: "chrome",    label: "Chrome" },
+  { key: "csv",       label: "Any CSV" },
+  { key: "black-bag", label: "Black-Bag" }
+]
+
+var EXPORT_FORMATS = [
+  { key: "json",      label: "Black-Bag JSON" },
+  { key: "keepassxc", label: "KeePassXC CSV" }
+]
+
+var GEN_KINDS = [
+  { key: "password",   label: "Password" },
+  { key: "passphrase", label: "Passphrase" },
+  { key: "pin",        label: "PIN" }
+]
+
+// The settings a person may change from the deck, with the same bounds
+// clampSettings enforces — so the stepper cannot even offer an out-of-range
+// value, rather than offering it and having it silently corrected.
+var SETTING_ROWS = [
+  { key: "revealSeconds", label: "reveal timeout",
+    hint: "how long SHOW, the editor's eye and a generated value stay readable",
+    fallback: 10, from: 3, to: 120, step: 1 },
+  { key: "clipboardClearSec", label: "clipboard clears after",
+    hint: "seconds before a copied secret is taken back off the clipboard",
+    fallback: 30, from: 5, to: 600, step: 5 },
+  { key: "staleAfterSec", label: "treat status as stale after",
+    hint: "older than this and the deck desaturates rather than asserting a state",
+    fallback: 120, from: 10, to: 3600, step: 10 },
+  { key: "pollIntervalSec", label: "status poll interval",
+    hint: "the file is watched anyway; this is the safety net",
+    fallback: 15, from: 2, to: 120, step: 1 }
+]
+
 // ── hygiene ──────────────────────────────────────────────────────────────────
 //
 // The engine serialises `Issue` externally tagged, which is two shapes:
