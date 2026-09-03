@@ -6,6 +6,7 @@
 //! had shipped. `docs/AUDIT.md` records what was lost and what was restored.
 
 pub mod breach;
+pub mod consent;
 pub mod crypto;
 pub mod generate;
 pub mod harden;
