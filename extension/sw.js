@@ -341,20 +341,34 @@ async function onGet(info) {
  * a site that could distinguish them could enumerate it.
  */
 async function answer(info, work, complete) {
+  let outcome;
   try {
     const responseJson = JSON.stringify(await work(info));
-    console.warn('Black-Bag: completing', info.requestId, responseJson.length, 'bytes');
     await complete({ requestId: info.requestId, responseJson });
-    console.warn('Black-Bag: completed', info.requestId);
+    outcome = { ok: true };
   } catch (e) {
     console.warn('Black-Bag:', e);
-    await complete({
-      requestId: info.requestId,
-      error: { name: 'NotAllowedError', message: 'Black-Bag did not complete this request.' },
-    });
+    // The page may say more than the site may. A site learns only
+    // NotAllowedError, because "you refused", "no such credential" and "the
+    // vault is locked" are each a fact about the contents of a vault.
+    outcome = { ok: false, message: String(e.message ?? e) };
+    try {
+      await complete({
+        requestId: info.requestId,
+        error: { name: 'NotAllowedError', message: 'Black-Bag did not complete this request.' },
+      });
+    } catch (also) {
+      // Completing can itself fail — Chromium refuses a response for a request
+      // it has already abandoned. Nested, because an exception thrown from the
+      // handler for an exception escapes this function entirely, and then the
+      // outcome is never recorded and the page that is waiting for it waits
+      // forever. That is not hypothetical: it is what this code did.
+      console.warn('Black-Bag: could not report the failure either:', also);
+    }
   } finally {
     live.delete(info.requestId);
   }
+  return outcome;
 }
 
 // ── events ──────────────────────────────────────────────────────────────────
@@ -363,13 +377,204 @@ async function answer(info, work, complete) {
 // is not registered when the service worker is revived to deliver an event,
 // and the event is lost.
 
-chrome.webAuthenticationProxy.onCreateRequest.addListener(info =>
-  answer(info, onCreate, d => chrome.webAuthenticationProxy.completeCreateRequest(d)),
-);
+chrome.webAuthenticationProxy.onCreateRequest.addListener(info => park(info, 'create'));
+chrome.webAuthenticationProxy.onGetRequest.addListener(info => park(info, 'assert'));
 
-chrome.webAuthenticationProxy.onGetRequest.addListener(info =>
-  answer(info, onGet, d => chrome.webAuthenticationProxy.completeGetRequest(d)),
-);
+/**
+ * Park a request and put a full-screen page in front of the person.
+ *
+ * The ceremony is NOT run here. A Manifest V3 service worker is torn down when
+ * it looks idle, and waiting for a human to decide looks idle — measured, the
+ * worker went silent mid-ceremony and the page that asked waited forever for an
+ * answer nobody could deliver. So the worker only records the job and opens
+ * `ceremony.html`; that page is a live extension context, and it asks the
+ * worker to do the work while it is on screen to keep it alive.
+ */
+async function park(info, operation) {
+  try {
+    const details = JSON.parse(info.requestDetailsJson);
+    const caller = callerOrigin(details);
+    if (!caller) throw new Error('Chromium did not report a caller origin');
+
+    await chrome.storage.session.set({
+      [String(info.requestId)]: {
+        operation,
+        origin: caller.origin,
+        rpName: (operation === 'create' ? details.rp?.name : null) ?? null,
+        requestDetailsJson: info.requestDetailsJson,
+      },
+    });
+    jobs.set(info.requestId, { info, operation });
+
+    await chrome.windows.create({
+      url: chrome.runtime.getURL(`ceremony.html?requestId=${info.requestId}`),
+      type: 'popup',
+      state: 'fullscreen',
+    });
+  } catch (e) {
+    console.warn('Black-Bag:', e);
+    await chrome.webAuthenticationProxy[
+      operation === 'create' ? 'completeCreateRequest' : 'completeGetRequest'
+    ]({
+      requestId: info.requestId,
+      error: { name: 'NotAllowedError', message: 'Black-Bag did not complete this request.' },
+    });
+  }
+}
+
+/** Requests parked and not yet run. */
+const jobs = new Map();
+
+// The ceremony page asks for the work to happen, over a PORT.
+//
+// A port, specifically, and not `sendMessage`. An open extension page does not
+// keep a Manifest V3 service worker alive — an open port does, which is the
+// documented keepalive and the only reason this worker survives the seconds or
+// minutes a person spends deciding. Measured the other way first: with
+// `sendMessage`, the vault minted the credential and the worker was gone before
+// it could hand the result back, so the site waited forever.
+chrome.runtime.onConnect.addListener(port => {
+  if (!port.name.startsWith('ceremony:')) return;
+  const requestId = Number(port.name.slice('ceremony:'.length));
+  const job = jobs.get(requestId);
+  if (!job) {
+    port.postMessage({ ok: false, message: 'This request is no longer waiting.' });
+    return;
+  }
+  jobs.delete(requestId);
+
+  const complete =
+    job.operation === 'create'
+      ? d => chrome.webAuthenticationProxy.completeCreateRequest(d)
+      : d => chrome.webAuthenticationProxy.completeGetRequest(d);
+
+  answer(job.info, job.operation === 'create' ? onCreate : onGet, complete)
+    .then(async outcome => {
+      // Written to storage as well as posted: the port dies with the page, and
+      // the page closes itself the moment it has an answer.
+      await chrome.storage.session.set({ [`outcome:${requestId}`]: outcome });
+      try { port.postMessage(outcome); } catch { /* page already gone */ }
+    })
+    .finally(() => chrome.storage.session.remove(String(requestId)));
+});
+
+/**
+ * Answer a request, turning any failure into a DOMException.
+ *
+ * NotAllowedError for everything, deliberately. A page must not be able to
+ * tell "you refused" from "there is no such credential" from "the vault is
+ * locked" — each of those is a fact about the contents of someone's vault, and
+ * a site that could distinguish them could enumerate it.
+ */
+async function answer(info, work, complete) {
+  let outcome;
+  try {
+    const responseJson = JSON.stringify(await work(info));
+    await complete({ requestId: info.requestId, responseJson });
+    outcome = { ok: true };
+  } catch (e) {
+    console.warn('Black-Bag:', e);
+    // The page may say more than the site may. A site learns only
+    // NotAllowedError, because "you refused", "no such credential" and "the
+    // vault is locked" are each a fact about the contents of a vault.
+    outcome = { ok: false, message: String(e.message ?? e) };
+    try {
+      await complete({
+        requestId: info.requestId,
+        error: { name: 'NotAllowedError', message: 'Black-Bag did not complete this request.' },
+      });
+    } catch (also) {
+      // Completing can itself fail — Chromium refuses a response for a request
+      // it has already abandoned. Nested, because an exception thrown from the
+      // handler for an exception escapes this function entirely, and then the
+      // outcome is never recorded and the page that is waiting for it waits
+      // forever. That is not hypothetical: it is what this code did.
+      console.warn('Black-Bag: could not report the failure either:', also);
+    }
+  } finally {
+    live.delete(info.requestId);
+  }
+  return outcome;
+}
+
+// ── events ──────────────────────────────────────────────────────────────────
+//
+// Registered synchronously at load. A listener added inside an async callback
+// is not registered when the service worker is revived to deliver an event,
+// and the event is lost.
+
+chrome.webAuthenticationProxy.onCreateRequest.addListener(info => park(info, 'create'));
+chrome.webAuthenticationProxy.onGetRequest.addListener(info => park(info, 'assert'));
+
+/**
+ * Park a request and put a full-screen page in front of the person.
+ *
+ * The ceremony is NOT run here. A Manifest V3 service worker is torn down when
+ * it looks idle, and waiting for a human to decide looks idle — measured, the
+ * worker went silent mid-ceremony and the page that asked waited forever for an
+ * answer nobody could deliver. So the worker only records the job and opens
+ * `ceremony.html`; that page is a live extension context, and it asks the
+ * worker to do the work while it is on screen to keep it alive.
+ */
+async function park(info, operation) {
+  try {
+    const details = JSON.parse(info.requestDetailsJson);
+    const caller = callerOrigin(details);
+    if (!caller) throw new Error('Chromium did not report a caller origin');
+
+    await chrome.storage.session.set({
+      [String(info.requestId)]: {
+        operation,
+        origin: caller.origin,
+        rpName: (operation === 'create' ? details.rp?.name : null) ?? null,
+        requestDetailsJson: info.requestDetailsJson,
+      },
+    });
+    jobs.set(info.requestId, { info, operation });
+
+    await chrome.windows.create({
+      url: chrome.runtime.getURL(`ceremony.html?requestId=${info.requestId}`),
+      type: 'popup',
+      state: 'fullscreen',
+    });
+  } catch (e) {
+    console.warn('Black-Bag:', e);
+    await chrome.webAuthenticationProxy[
+      operation === 'create' ? 'completeCreateRequest' : 'completeGetRequest'
+    ]({
+      requestId: info.requestId,
+      error: { name: 'NotAllowedError', message: 'Black-Bag did not complete this request.' },
+    });
+  }
+}
+
+
+// The ceremony page asks for the work to happen while it is open.
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== 'run') return false;
+  const job = jobs.get(message.requestId);
+  if (!job) {
+    sendResponse({ ok: false, message: 'This request is no longer waiting.' });
+    return false;
+  }
+  jobs.delete(message.requestId);
+  const complete =
+    job.operation === 'create'
+      ? d => chrome.webAuthenticationProxy.completeCreateRequest(d)
+      : d => chrome.webAuthenticationProxy.completeGetRequest(d);
+  // The outcome is written to session storage as well as returned. A reply
+  // travels down a channel that dies with this worker, and this worker is
+  // waiting on a human — so the answer has to survive it being torn down. The
+  // page reads storage; the direct reply is just the fast path.
+  answer(job.info, job.operation === 'create' ? onCreate : onGet, complete)
+    .then(async outcome => {
+      await chrome.storage.session.set({ [`outcome:${message.requestId}`]: outcome });
+      try { sendResponse(outcome); } catch { /* the page may already be gone */ }
+    })
+    .finally(() => chrome.storage.session.remove(String(message.requestId)));
+  // Keep the message channel open for the asynchronous reply.
+  return true;
+});
 
 chrome.webAuthenticationProxy.onIsUvpaaRequest.addListener(async info => {
   // Truthfully: a platform authenticator is available exactly when Black-Bag
@@ -388,6 +593,8 @@ chrome.webAuthenticationProxy.onIsUvpaaRequest.addListener(async info => {
 });
 
 chrome.webAuthenticationProxy.onRequestCanceled.addListener(requestId => {
+  jobs.delete(requestId);
+  chrome.storage.session.remove(String(requestId));
   const entry = live.get(requestId);
   if (!entry) return;
   entry.cancelled = true;

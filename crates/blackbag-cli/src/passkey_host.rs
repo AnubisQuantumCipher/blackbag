@@ -128,6 +128,15 @@ enum Outgoing {
     },
 }
 
+/// Did this fail only because the other end went away?
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
 /// Read one framed message. `Ok(None)` at end of input.
 fn read_message(input: &mut impl Read) -> Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
@@ -312,7 +321,16 @@ pub fn serve() -> Result<()> {
                 message: format!("unintelligible message: {e}"),
             },
         };
-        write_message(&mut output, &reply)?;
+        // The browser closing the port mid-write is how a native messaging host
+        // ends: the page navigated away, the ceremony window closed, the
+        // browser quit. It is not a failure, and reporting it as one puts
+        // "black-bag: Broken pipe" in the browser's log every time somebody
+        // closes a tab.
+        match write_message(&mut output, &reply) {
+            Ok(()) => {}
+            Err(e) if is_broken_pipe(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }

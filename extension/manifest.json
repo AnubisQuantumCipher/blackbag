@@ -2,18 +2,29 @@
   "manifest_version": 3,
   "name": "Black-Bag",
   "version": "1.0.0",
-  "description": "Passkeys from your Black-Bag vault. Every signature is approved by you, in Black-Bag, not here.",
+  "description": "Passkeys from your Black-Bag vault. Every signature is approved by you, in Black-Bag, with your master passphrase \u2014 never here.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoCvjgW3w+uZetdE5xsvMKhQpFatPR2OjbEUyNNrvm8JI5lx2HLbdWJW2iozai0NPAIXSXk/LFAUY8tg2L0Ix+WYi6gcKuzNEHK4qMukA5iPqHDMSLc+2FshKRcIWMx1mMoqTRpVhbyHEs4555HX+3YK+4JVKDlAAb6UfTMen/20S7lBTEHzFEf+TYGDxe1GFqCzCK9aKMVvzayaf5rME6Tf0rrva1SWszqu+jT+GfZL07x87DRFr1+xBKvsxkqHvRYMTNTGMDOGb53RDI6BcVjGw4CpPLMdovt5A+4LC8j8kUi5A3qusP+WrIEfmLUu/KdFvQZFY19LF6jtEnnLFGQIDAQAB",
   "permissions": [
     "webAuthenticationProxy",
-    "nativeMessaging"
+    "nativeMessaging",
+    "storage"
   ],
   "background": {
     "service_worker": "sw.js"
   },
   "action": {
     "default_title": "Black-Bag passkeys",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
   },
-  "icons": {}
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": []
 }

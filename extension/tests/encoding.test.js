@@ -24,8 +24,17 @@ globalThis.chrome = {
   runtime: {
     onStartup: { addListener() {} },
     onInstalled: { addListener() {} },
+    onMessage: { addListener() {} },
+    onConnect: { addListener() {} },
     sendNativeMessage() {},
+    connectNative() {
+      return { onMessage: { addListener() {} }, onDisconnect: { addListener() {} },
+               postMessage() {}, disconnect() {} };
+    },
+    getURL: p => 'chrome-extension://test/' + p,
   },
+  storage: { session: { set: async () => {}, get: async () => ({}), remove: async () => {} } },
+  windows: { create: async () => {} },
 };
 
 const {
