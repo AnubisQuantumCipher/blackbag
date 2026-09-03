@@ -139,7 +139,7 @@ Ordered by how much of §3 it leaves unbuilt.
 | 3.6 | SSH agent | missing |
 | 3.6 | `org.freedesktop.secrets` | missing |
 | 3.6 | Autotype via `wtype` | missing (clipboard fill works) |
-| 4 | `webauthn-rs` relying-party integration test | missing — verification is done by an independent Python implementation instead, which is equivalent evidence but not the specified tool |
+| 4 | `webauthn-rs` relying-party integration test | **done** — 7 tests in `tests/webauthn_rs_relying_party.rs` drive whole ceremonies against a real relying party; three are negative controls, so the positives mean something |
 | 4 | `docs/COMPAT.md` site matrix | missing |
 | 4 | Fresh-box CI, PKGBUILD | missing |
 | 4 | `cargo audit`, `cargo deny`, `cargo-fuzz` | missing (clippy is clean and enforced) |

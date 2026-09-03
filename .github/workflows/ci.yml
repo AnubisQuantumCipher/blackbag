@@ -29,6 +29,14 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Called out separately so a failure here is legible in the log: this is
+      # a real relying party from another project accepting — or refusing —
+      # what our authenticator produces, and it is the check most likely to
+      # notice a WebAuthn regression we would otherwise not see until a site
+      # rejected a login.
+      - name: A real relying party accepts our passkeys
+        run: cargo test -p blackbag-core --test webauthn_rs_relying_party -- --nocapture
+
       # The project's standard is zero warnings, so a warning fails the build
       # rather than scrolling past in a log nobody reads.
       - name: No warnings

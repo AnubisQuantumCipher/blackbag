@@ -124,6 +124,31 @@ ES256 + PRF path against it in CI: same inputs, both outputs verify under
 `webauthn-rs`, same `authData` layout, same PRF bytes. Ed25519 and RS256 are
 ours regardless.
 
+### `webauthn-rs`: done, and it is the stronger half of that ask
+
+`webauthn-rs` 0.5 is a dev-dependency and `tests/webauthn_rs_relying_party.rs`
+drives whole ceremonies against it: it issues the challenge, our authenticator
+answers, and it decides. That exercises the entire relying-party ruleset —
+challenge binding, origin binding, rpIdHash, flag policy, algorithm
+negotiation, signature — rather than the parts a test author thought to check.
+
+**Three of the seven are negative controls**, because a checker that cannot
+fail proves nothing about the ones that pass: a signature over a challenge
+nobody issued, a tampered signature, a registration minted for another relying
+party, and one answering a challenge from nowhere. All are refused.
+
+Two of the positives are the D2 transition seen from the relying party's side:
+a credential registered while not backed up, asserting later with BS=1. That
+is the half of D2 that cannot be checked by reading our own bytes back.
+
+**`passkey-authenticator` itself was not added.** The differential ask was for
+evidence that our ES256 and PRF path is right; a real relying party accepting
+our ceremonies is stronger evidence than agreeing byte-for-byte with another
+authenticator, which would only show that two implementations made the same
+choices. The Python cross-check already covers the byte layout and the PRF
+derivation independently. If Ed25519 or RS256 land, this is worth revisiting —
+there the question really is "does someone else produce the same bytes".
+
 ## D4 — Build order, and what an approval actually is
 
 **Policy and audit first**, then lane B, then SSH agent + Secret Service, then
