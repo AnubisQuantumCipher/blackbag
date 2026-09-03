@@ -1,5 +1,6 @@
 //! `black-bag` — hardened credential storage for Omarchy.
 
+mod passkey_host;
 mod clipboard;
 mod import;
 mod tty;
@@ -76,6 +77,10 @@ enum Command {
     ///
     /// Spawned by `--to clipboard`; not meant to be run by hand. Hidden from
     /// help so nobody reaches for it with a secret on argv.
+    /// Native-messaging host for the browser extension. Launched by the
+    /// browser, never by a person, so it is hidden from help like clip-serve.
+    #[command(hide = true, name = "passkey-host")]
+    PasskeyHost,
     #[command(hide = true, name = "clip-serve")]
     ClipServe {
         #[arg(long, default_value_t = 30)]
@@ -423,6 +428,7 @@ fn run(hardening: harden::HardenReport) -> Result<()> {
         Command::Migrate(args) => cmd_migrate(args),
         Command::Import(args) => cmd_import(&path, args),
         Command::Export(args) => cmd_export(&path, args),
+        Command::PasskeyHost => passkey_host::serve(),
         Command::ClipServe { clear_after } => clipboard::serve(clear_after),
     }
 }
