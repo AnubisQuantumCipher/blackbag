@@ -437,5 +437,36 @@ eq(draftProblems("totp", "x", {}, { uri: "https://nope" }, false)
      .indexOf("a URI starting with otpauth://") >= 0, true,
    "a non-otpauth URI is rejected before it reaches the engine")
 
+
+// ── the origin, rendered so a lookalike is visible ─────────────────────────
+//
+// This is the only defence a human has on the consent screen, so its edges are
+// tested rather than eyeballed.
+
+const DIM = "#555", BRIGHT = "#0f0";
+const core = (s) => {
+  // The text inside the BRIGHT span: what the eye is being told to trust.
+  const m = originMarkup(s, DIM, BRIGHT).match(
+    new RegExp('<font color="' + BRIGHT + '">([^<]*)</font>'));
+  return m ? m[1] : "";
+};
+
+eq(core("https://bank.example"), "bank.example", "a bare origin highlights itself");
+eq(core("https://login.bank.example"), "bank.example", "a subdomain highlights the domain");
+eq(core("https://a.b.c.bank.example"), "bank.example", "deep subdomains still highlight it");
+eq(core("https://bank.example.evil.test"), "evil.test",
+   "a lookalike highlights the attacker's domain, not the bait");
+eq(core("https://bank.example:8443"), "bank.example", "a port is not part of the domain");
+eq(core("https://bank.example/login?next=/x"), "bank.example", "nor is a path");
+eq(core("http://localhost:3000"), "localhost", "localhost has no second label");
+eq(originMarkup("", DIM, BRIGHT), "", "nothing in, nothing out");
+
+// StyledText renders markup, so anything that arrives from a browser must be
+// escaped or an origin could inject styling into this screen.
+eq(originMarkup("https://<b>evil</b>.test", DIM, BRIGHT).indexOf("&lt;b&gt;") > 0, true,
+   "markup in an origin is escaped, not rendered");
+eq(core("https://x&y.test"), "x&amp;y.test", "an ampersand is escaped");
+
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURES`)
 process.exit(fails === 0 ? 0 : 1)

@@ -213,6 +213,11 @@ def main():
         # rather than knowing where settings live.
         "Manage.qml": port((PLUGIN / "Manage.qml").read_text(),
                            MANAGE_EDITS, "Manage.qml"),
+        # The consent sheet has no text input at all -- there is nothing to
+        # type on a screen whose only two answers are yes and no -- so it has
+        # no TextField to rename.
+        "Consent.qml": port((PLUGIN / "Consent.qml").read_text(),
+                            MANAGE_EDITS, "Consent.qml", rename_textfield=False),
         "DeckMetrics.qml": port((PLUGIN / "DeckMetrics.qml").read_text(),
                                 METRICS_EDITS, "DeckMetrics.qml",
                                 rename_textfield=False),

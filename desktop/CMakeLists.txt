@@ -39,7 +39,7 @@ target_include_directories(blackbag-desktop PRIVATE src)
 # `import "Model.js"` and the singleton lookups resolve the same way they do in
 # the plugin's flat directory. That is what lets Cockpit.qml, Editor.qml and
 # Model.js be the same files in both surfaces.
-foreach(qml_file Main.qml Cockpit.qml Editor.qml Onboard.qml Recover.qml Manage.qml DeckMetrics.qml
+foreach(qml_file Main.qml Cockpit.qml Editor.qml Onboard.qml Recover.qml Manage.qml Consent.qml DeckMetrics.qml
                  Color.qml Style.qml Util.qml InputField.qml Model.js)
   set_source_files_properties(qml/${qml_file}
     PROPERTIES QT_RESOURCE_ALIAS ${qml_file})
@@ -66,6 +66,7 @@ qt_add_qml_module(blackbag-desktop
     qml/Onboard.qml
     qml/Recover.qml
     qml/Manage.qml
+    qml/Consent.qml
     qml/DeckMetrics.qml
     qml/Color.qml
     qml/Style.qml

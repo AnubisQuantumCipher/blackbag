@@ -266,6 +266,7 @@ Item {
     // back its own unlock screen, which is the only honest outcome.
     if (onboardSheet.open_) onboardSheet.abandon()
     if (recoverSheet.open_) recoverSheet.clear()
+    if (consentSheet.open_) consentSheet.standDown()
     if (manageSheet.open_) manageSheet.clear()
   }
 
@@ -276,6 +277,29 @@ Item {
   function focusPass() {
     if (passField.visible && passField.enabled) passField.forceActiveFocus()
     else keyCatcher.forceActiveFocus()
+  }
+
+  /// Put a passkey prompt on screen, or take a stale one off.
+  ///
+  /// The agent publishes waiting ceremonies into status.json, which this deck
+  /// already watches, so a browser asking for a signature reaches the screen
+  /// without a polling timer. The first waiting ceremony wins; the rest queue
+  /// behind it, because asking someone to approve two logins at once is asking
+  /// them to approve neither carefully.
+  function syncConsent(parsed) {
+    var pending = parsed && parsed.session && parsed.session.pending_passkeys
+      ? parsed.session.pending_passkeys : []
+
+    if (pending.length === 0) {
+      // The ceremony was answered, expired, or the vault locked underneath it.
+      if (consentSheet.open_) consentSheet.standDown()
+      return
+    }
+    var next = pending[0]
+    if (consentSheet.open_ && consentSheet.ceremony
+        && String(consentSheet.ceremony.nonce) === String(next.nonce)) return
+    if (consentSheet.open_) return
+    consentSheet.begin(next)
   }
 
   // There being no vault is a first run, not an error. The deck creates one
@@ -307,6 +331,7 @@ Item {
       Qt.callLater(root.maybeOnboard)
       var nowUnlocked = !!(parsed.session && parsed.session.unlocked)
       root.lastSessionUnlocked = nowUnlocked
+      root.syncConsent(parsed)
       if (nowUnlocked && !wasUnlocked) {
         // Only when the deck is actually on screen. An unlock from the CLI
         // used to fill this overlay's record list while it was hidden, and
@@ -925,13 +950,13 @@ Item {
       // while you are typing into a field.
       Shortcut {
         sequences: ["Esc"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_
         context: Qt.WindowShortcut
         onActivated: root.backOut()
       }
       Shortcut {
         sequences: ["Ctrl+L"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && root.unlocked
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_ && root.unlocked
         context: Qt.WindowShortcut
         onActivated: root.doLock()
       }
@@ -965,7 +990,7 @@ Item {
 
       Shortcut {
         sequences: ["Ctrl+R"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_
         context: Qt.WindowShortcut
         onActivated: {
           refreshProcess.running = true
@@ -979,7 +1004,7 @@ Item {
       Shortcut {
         sequences: ["Ctrl+M"]
         enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_
-                 && !recoverSheet.open_ && !manageSheet.open_
+                 && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_
         context: Qt.WindowShortcut
         onActivated: manageSheet.begin("passphrase")
       }
@@ -989,13 +1014,14 @@ Item {
         sequences: ["Ctrl+K"]
         enabled: root.opened && !root.unlocked && !recordEditor.open_
                  && !onboardSheet.open_ && !recoverSheet.open_
+                 && !consentSheet.open_
                  && Model.canRecover(root.status)
         context: Qt.WindowShortcut
         onActivated: recoverSheet.begin()
       }
       Shortcut {
         sequences: ["Ctrl+B"]
-        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && root.unlocked
+        enabled: root.opened && !recordEditor.open_ && !onboardSheet.open_ && !recoverSheet.open_ && !manageSheet.open_ && !consentSheet.open_ && root.unlocked
         context: Qt.WindowShortcut
         onActivated: root.requestBreachCheck()
       }
@@ -2875,6 +2901,22 @@ Item {
       }
 
     // ── everything else the engine can do ─────────────────────────────────
+    // The passkey prompt sits above every other sheet, because it is the only
+    // one that performs an act on someone else's behalf.
+    Consent {
+      id: consentSheet
+      motionMs: root.motionMs
+      uiScale: root.uiScale
+
+      onChanged: {
+        refreshProcess.running = true
+        if (root.unlocked) root.refreshRecords()
+      }
+      onDismissed: Qt.callLater(function () {
+        if (root.opened && root.unlocked) keyCatcher.forceActiveFocus()
+      })
+    }
+
     Manage {
       id: manageSheet
       motionMs: root.motionMs

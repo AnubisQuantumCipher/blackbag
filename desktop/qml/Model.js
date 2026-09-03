@@ -1107,3 +1107,62 @@ function settingOf(settings, name, fallback) {
   return v === undefined || v === null ? fallback : v
 }
 
+
+/// Render an origin so a lookalike is visible at a glance.
+///
+/// The registrable domain — approximated as the last two labels — is drawn in
+/// `bright`; the scheme, any leading subdomains, the port and the path are
+/// drawn in `dim`. `https://bank.example.evil.test` therefore reads as
+/// **evil.test**, which is what it actually is, rather than as "bank.example"
+/// with noise around it.
+///
+/// The approximation is deliberate and its limit is worth stating: without a
+/// Public Suffix List, `shop.co.uk` highlights `co.uk`. That under-emphasises a
+/// legitimate site; it never over-emphasises a hostile one, because the last
+/// two labels of an attacker's origin always belong to the attacker.
+function originMarkup(origin, dim, bright) {
+  var text = String(origin || "")
+  if (text.length === 0) return ""
+
+  var esc = function (s) {
+    return String(s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+  }
+  // `<font color=...>`, not a CSS style attribute: Qt's StyledText supports a
+  // small fixed tag set and silently ignores `style=`, which renders the whole
+  // origin in one undifferentiated colour — exactly the failure this function
+  // exists to prevent.
+  var span = function (s, colour) {
+    return s.length === 0 ? "" : '<font color="' + colour + '">' + esc(s) + "</font>"
+  }
+
+  var schemeEnd = text.indexOf("://")
+  if (schemeEnd < 0) return span(text, bright)
+  var scheme = text.slice(0, schemeEnd + 3)
+  var rest = text.slice(schemeEnd + 3)
+
+  var cut = rest.length
+  var slash = rest.indexOf("/")
+  if (slash >= 0) cut = Math.min(cut, slash)
+  var hostAndPort = rest.slice(0, cut)
+  var tail = rest.slice(cut)
+
+  var host = hostAndPort
+  var port = ""
+  var colon = hostAndPort.lastIndexOf(":")
+  // Only a trailing :port, never part of an IPv6 literal.
+  if (colon > 0 && hostAndPort.indexOf("]") < colon) {
+    port = hostAndPort.slice(colon)
+    host = hostAndPort.slice(0, colon)
+  }
+
+  var labels = host.split(".")
+  var lead = "", core = host
+  if (labels.length > 2) {
+    core = labels.slice(labels.length - 2).join(".")
+    lead = labels.slice(0, labels.length - 2).join(".") + "."
+  }
+  return span(scheme, dim) + span(lead, dim) + span(core, bright)
+       + span(port, dim) + span(tail, dim)
+}
