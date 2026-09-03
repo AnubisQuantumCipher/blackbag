@@ -294,15 +294,17 @@ impl Verdict {
     }
 }
 
-/// Read the caller's identity for the log.
-pub fn who(uid: u32, pid: i32) -> Who {
-    Who {
-        uid,
-        pid,
-        program: std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
-    }
+/// The caller's identity for the log.
+///
+/// `program` is passed in rather than read here, so that the name in the log
+/// and the name the approval was keyed on are the same string from the same
+/// source. Reading it twice, in two places, with two different fallbacks is how
+/// a log ends up disagreeing with the policy it is supposed to be a record of —
+/// which is exactly what happened: this read `/proc/<pid>/exe`, which
+/// `ptrace_scope=1` makes unreadable for a non-descendant, and logged `None`
+/// for callers the policy had named perfectly well.
+pub fn who(uid: u32, pid: i32, program: Option<String>) -> Who {
+    Who { uid, pid, program }
 }
 
 /// A sanity check that no secret value ever reaches this module.
@@ -496,6 +498,15 @@ mod tests {
     }
 
     /// A field name is metadata; a field value is the thing being protected.
+    #[test]
+    fn who_records_exactly_the_identity_it_is_handed() {
+        // Passed in rather than read here, so the log and the policy always
+        // agree about what something was called.
+        let w = who(1000, 42, Some("brave".into()));
+        assert_eq!(w.program.as_deref(), Some("brave"));
+        assert_eq!(who(1000, 42, None).program, None);
+    }
+
     #[test]
     fn an_overlong_detail_is_refused_before_it_is_written() {
         assert!(reject_secret_looking("password").is_ok());

@@ -116,7 +116,22 @@ pub enum Request {
     /// One record's non-secret metadata.
     Detail { id: String },
     /// One secret field, by name. The only path that returns secret bytes.
-    Reveal { id: String, field: String },
+    ///
+    /// Carries an optional proof. The first time a given program asks for a
+    /// given field, the agent answers `ApprovalRequired` instead of the secret;
+    /// the caller re-asks with the master passphrase, which grants the approval
+    /// and returns the value. After that the same program reading the same
+    /// field is served without asking, until the vault locks.
+    ///
+    /// One round trip rather than the passkeys' two-phase ceremony, because a
+    /// caller here can simply ask again — a browser waiting on a WebAuthn
+    /// promise cannot.
+    Reveal {
+        id: String,
+        field: String,
+        #[serde(default)]
+        passphrase: Option<Zeroizing<String>>,
+    },
     /// Create a record. Secrets travel inside this request, over the socket —
     /// which is exactly why authoring lives here and not behind CLI flags.
     Add { draft: RecordDraft },
@@ -260,6 +275,22 @@ pub enum Response {
     },
     PasskeyQueue {
         pending: Vec<crate::consent::Summary>,
+    },
+    /// Nobody has approved this program reading this field. Ask again with the
+    /// master passphrase.
+    ApprovalRequired {
+        item: String,
+        #[serde(default)]
+        title: Option<String>,
+        field: String,
+        /// What is asking, for the prompt to show. Context, not control.
+        #[serde(default)]
+        client: Option<String>,
+    },
+    /// Everything currently approved, for the deck to show and revoke.
+    Approvals {
+        granted: Vec<crate::policy::Grant>,
+        lockdown: bool,
     },
     Ok,
     Error { message: String },
@@ -755,6 +786,10 @@ pub struct Agent {
     consent: crate::consent::Desk,
     /// Who is on the other end of the connection being served right now.
     peer: Option<PeerId>,
+    /// Approvals in force for this unlocked session.
+    approvals: crate::policy::Approvals,
+    /// Where the history goes. `None` in tests that do not want a file.
+    audit_path: Option<PathBuf>,
 }
 
 struct OpenVault {
@@ -790,6 +825,8 @@ impl Agent {
             status_dir: None,
             consent: crate::consent::Desk::new(),
             peer: None,
+            approvals: crate::policy::Approvals::new(),
+            audit_path: None,
         }
     }
 
@@ -826,6 +863,22 @@ impl Agent {
     /// Publish `status.json` into `dir` instead of the runtime directory.
     pub fn with_status_dir(mut self, dir: PathBuf) -> Self {
         self.status_dir = Some(dir);
+        self
+    }
+
+    /// Where the audit log goes.
+    ///
+    /// A test agent points this at its own directory so a test run never
+    /// appends to the operator's real history — which would make the one file
+    /// whose value is that it is trustworthy the one file full of noise.
+    pub fn with_audit_path(mut self, path: PathBuf) -> Self {
+        self.audit_path = Some(path);
+        self
+    }
+
+    /// Write history to the default location under the state directory.
+    pub fn with_default_audit(mut self) -> Self {
+        self.audit_path = crate::audit::Log::default_path().ok();
         self
     }
 
@@ -887,9 +940,51 @@ impl Agent {
         Ok(())
     }
 
+    /// Write one line of history, and never let that failure hide the event.
+    ///
+    /// A log that cannot be written is worth reporting, but refusing the
+    /// request because of it would turn a full disk into a denial of service
+    /// against the owner's own vault. The failure goes to stderr, where the
+    /// unit journal keeps it.
+    fn record_audit(
+        &self,
+        surface: crate::audit::Surface,
+        decision: crate::audit::Decision,
+        subject: &str,
+        detail: Option<&str>,
+    ) {
+        let Some(path) = self.audit_path.as_ref() else {
+            return;
+        };
+        if let Some(d) = detail {
+            if crate::audit::reject_secret_looking(d).is_err() {
+                eprintln!("black-bag agent: refusing to audit an overlong detail");
+                return;
+            }
+        }
+        let uid = unsafe { libc::getuid() };
+        let who = match self.peer {
+            Some(p) => crate::audit::who(uid, p.pid, PeerId::program(p.pid)),
+            None => crate::audit::who(uid, 0, None),
+        };
+        if let Err(e) = crate::audit::Log::at(path).append(
+            who,
+            surface,
+            decision,
+            subject,
+            detail,
+            Utc::now(),
+        ) {
+            eprintln!("black-bag agent: could not write the audit log: {e}");
+        }
+    }
+
     /// Lock the vault, remembering why. Dropping `OpenVault` drops the `Vault`,
     /// whose data key and every record are wiped and unlocked on the way out.
     fn lock(&mut self, reason: LockReason) {
+        // Every approval was given for the session that is ending. One that
+        // outlived it would turn a lock into a pause.
+        self.approvals.clear();
         // Anything waiting for a human was authorized against the session that
         // is ending. A ceremony that outlived its lock would let an approval
         // granted before a suspend be collected after it, which is exactly the
@@ -1036,25 +1131,112 @@ impl Agent {
                 Ok(Response::Detail(RecordView::of(record)))
             }
 
-            Request::Reveal { id, field } => {
+            Request::Reveal {
+                id,
+                field,
+                passphrase,
+            } => {
+                use crate::policy::{Capability, ClientKey, Verdict};
+
                 let id: Uuid = id.parse().context("invalid record id")?;
-                let open = self.opened()?;
-                let record = open
+
+                // Refused before anything else, and before a human is asked.
+                // A passkey's key material is never handed back on any terms,
+                // so prompting for approval first would be asking somebody to
+                // authorise a thing that cannot happen — the same reason a
+                // passkey ceremony with no usable credential never reaches the
+                // screen.
+                if self
+                    .opened()?
                     .vault
                     .get(id)
-                    .ok_or_else(|| anyhow!("record not found"))?;
-                // A passkey's private key has exactly one legitimate use, and it
-                // happens inside this process. There is no version of "show me
-                // the key" or "copy the key to the clipboard" that helps its
-                // owner, and both put an unexportable credential somewhere it
-                // can be exported. Refused at the engine rather than merely
-                // hidden in the deck, because hiding a button is not a control.
-                if record.kind == crate::record::Kind::Passkey {
+                    .is_some_and(|r| r.kind == crate::record::Kind::Passkey)
+                {
                     bail!(
                         "a passkey's key material is never revealed; it is used \
                          to sign, in the agent, and nowhere else"
                     );
                 }
+
+                let program = self.peer.and_then(|p| PeerId::program(p.pid));
+                let client = ClientKey::for_peer(
+                    program.as_deref(),
+                    self.peer.map(|p| p.pid).unwrap_or(0),
+                );
+
+                // Decided BEFORE the vault is touched, so a refusal cannot be
+                // distinguished from a miss by how long it took.
+                let verdict = self.approvals.consider(&client, &id.to_string(), Capability::Reveal);
+
+                let allowed = match verdict {
+                    Verdict::Remembered => {
+                        self.record_audit(
+                            crate::audit::Surface::Socket,
+                            crate::audit::Decision::Remembered,
+                            &id.to_string(),
+                            Some(&field),
+                        );
+                        true
+                    }
+                    Verdict::Blocked(why) => {
+                        self.record_audit(
+                            crate::audit::Surface::Socket,
+                            crate::audit::Decision::Blocked,
+                            &id.to_string(),
+                            Some(&field),
+                        );
+                        bail!("{why}");
+                    }
+                    Verdict::MustAsk => match &passphrase {
+                        // The proof, checked against the OPEN vault — never by
+                        // re-reading the path, which any same-uid process can
+                        // replace between the check and the read.
+                        Some(pass)
+                            if !pass.is_empty()
+                                && self.opened()?.vault.passphrase_matches(pass.as_bytes()) =>
+                        {
+                            self.approvals
+                                .grant(&client, &id.to_string(), Capability::Reveal);
+                            self.record_audit(
+                                crate::audit::Surface::Socket,
+                                crate::audit::Decision::Approved,
+                                &id.to_string(),
+                                Some(&field),
+                            );
+                            true
+                        }
+                        Some(_) => {
+                            self.record_audit(
+                                crate::audit::Surface::Socket,
+                                crate::audit::Decision::Refused,
+                                &id.to_string(),
+                                Some(&field),
+                            );
+                            bail!("that is not the vault passphrase");
+                        }
+                        None => false,
+                    },
+                };
+
+                if !allowed {
+                    let title = self
+                        .opened()?
+                        .vault
+                        .get(id)
+                        .and_then(|r| r.title.clone());
+                    return Ok(Response::ApprovalRequired {
+                        item: id.to_string(),
+                        title,
+                        field,
+                        client: program,
+                    });
+                }
+
+                let open = self.opened()?;
+                let record = open
+                    .vault
+                    .get(id)
+                    .ok_or_else(|| anyhow!("record not found"))?;
                 let secret = record
                     .field(&field)
                     .ok_or_else(|| anyhow!("no field named {field}"))?;
@@ -1722,8 +1904,24 @@ impl PeerId {
     /// and not something else, which is the difference between a prompt that
     /// can be substituted for and one that cannot be substituted for silently.
     fn program(pid: i32) -> Option<String> {
-        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-        Some(exe.file_name()?.to_string_lossy().into_owned())
+        // `/proc/<pid>/exe` is the good answer, and it is not always available:
+        // reading that symlink needs PTRACE_MODE_READ, and with Yama's
+        // `ptrace_scope=1` — which this project recommends — a process can only
+        // read it for its own descendants. The agent is nobody's parent, so on
+        // a hardened box this fails for every caller.
+        //
+        // `/proc/<pid>/comm` is world-readable and always works. It is weaker:
+        // a process can set it with `prctl`. That changes nothing, because this
+        // is context and not control either way — see `policy.rs`.
+        if let Some(name) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
+        {
+            return Some(name);
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        let comm = comm.trim();
+        (!comm.is_empty()).then(|| comm.to_string())
     }
 
     fn of(pid: i32) -> Option<Self> {
@@ -2194,7 +2392,8 @@ mod tests {
         let status_dir = dir.path().join("status");
         let agent = Agent::new(vault.clone(), idle_secs)
             .with_max_session_secs(max_secs)
-            .with_status_dir(status_dir);
+            .with_status_dir(status_dir)
+            .with_audit_path(dir.path().join("audit.jsonl"));
         let sock_for_thread = sock.clone();
         std::thread::spawn(move || {
             if let Err(e) = agent.serve_at(&sock_for_thread) {
@@ -2372,6 +2571,7 @@ mod tests {
         let request = Request::Reveal {
             id: "1234".into(),
             field: "password".into(),
+            passphrase: None,
         };
         let line = serde_json::to_string(&request).unwrap();
         assert!(line.contains("\"op\":\"reveal\""));
@@ -2788,6 +2988,7 @@ mod passkey_reveal_tests {
                 &Request::Reveal {
                     id: id.clone(),
                     field: field.into(),
+                    passphrase: None,
                 },
             )
             .unwrap();
@@ -2965,5 +3166,164 @@ mod peer_pinning_tests {
         // The agent survived it and still answers.
         let reply = ask_at(&sock, &Request::Status).expect("the agent is still answering");
         assert!(matches!(reply, Response::Status(_)), "{reply:?}");
+    }
+}
+
+#[cfg(test)]
+mod reveal_policy_tests {
+    use super::tests::spawn_test_agent;
+    use super::*;
+    use crate::record::Kind;
+
+    const PASS: &str = "agent test passphrase";
+
+    fn unlock(sock: &Path) {
+        ask_at(
+            sock,
+            &Request::Unlock {
+                passphrase: Zeroizing::new(PASS.into()),
+            },
+        )
+        .unwrap();
+    }
+
+    fn add_login(sock: &Path) -> String {
+        let mut draft = RecordDraft {
+            kind: Kind::Login.as_str().into(),
+            title: Some("Bank".into()),
+            ..Default::default()
+        };
+        draft
+            .secrets
+            .push(("password".into(), Zeroizing::new("hunter2".into())));
+        match ask_at(sock, &Request::Add { draft }).unwrap() {
+            Response::Saved { id } => id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn reveal(sock: &Path, id: &str, pass: Option<&str>) -> Response {
+        ask_at(
+            sock,
+            &Request::Reveal {
+                id: id.into(),
+                field: "password".into(),
+                passphrase: pass.map(|p| Zeroizing::new(p.to_string())),
+            },
+        )
+        .unwrap()
+    }
+
+    /// An unlocked vault used to answer every read on the socket. On a machine
+    /// running coding agents, that is every agent reading every secret.
+    #[test]
+    fn the_first_read_is_not_served_and_the_second_is() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = add_login(&sock);
+
+        match reveal(&sock, &id, None) {
+            Response::ApprovalRequired { title, field, .. } => {
+                assert_eq!(title.as_deref(), Some("Bank"));
+                assert_eq!(field, "password");
+            }
+            other => panic!("a secret was served without approval: {other:?}"),
+        }
+
+        match reveal(&sock, &id, Some(PASS)) {
+            Response::Secret { value } => assert_eq!(&*value, "hunter2"),
+            other => panic!("the passphrase must approve it: {other:?}"),
+        }
+
+        // Remembered: no proof needed the second time.
+        match reveal(&sock, &id, None) {
+            Response::Secret { value } => assert_eq!(&*value, "hunter2"),
+            other => panic!("an approval must be remembered: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_wrong_passphrase_approves_nothing() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = add_login(&sock);
+
+        match reveal(&sock, &id, Some("not it")) {
+            Response::Error { message } => assert!(message.contains("not the vault passphrase")),
+            other => panic!("{other:?}"),
+        }
+        // And it is still unapproved afterwards.
+        assert!(matches!(
+            reveal(&sock, &id, None),
+            Response::ApprovalRequired { .. }
+        ));
+    }
+
+    /// An approval belongs to the session it was granted in.
+    #[test]
+    fn locking_forgets_the_approval() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = add_login(&sock);
+        reveal(&sock, &id, Some(PASS));
+        assert!(matches!(reveal(&sock, &id, None), Response::Secret { .. }));
+
+        ask_at(&sock, &Request::Lock).unwrap();
+        unlock(&sock);
+
+        assert!(
+            matches!(reveal(&sock, &id, None), Response::ApprovalRequired { .. }),
+            "an approval must not survive the lock it was granted under"
+        );
+    }
+
+    /// Approving one field must not approve the record's other secrets.
+    #[test]
+    fn an_approval_is_for_one_field_of_one_record() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let a = add_login(&sock);
+        let b = add_login(&sock);
+
+        reveal(&sock, &a, Some(PASS));
+        assert!(matches!(reveal(&sock, &a, None), Response::Secret { .. }));
+        assert!(
+            matches!(reveal(&sock, &b, None), Response::ApprovalRequired { .. }),
+            "another record is another question"
+        );
+    }
+
+    /// The history has to show what happened, and hold together.
+    #[test]
+    fn every_outcome_is_recorded_and_the_chain_holds() {
+        let (dir, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = add_login(&sock);
+
+        reveal(&sock, &id, None); // asked, not served
+        reveal(&sock, &id, Some("wrong")); // refused
+        reveal(&sock, &id, Some(PASS)); // approved
+        reveal(&sock, &id, None); // remembered
+
+        let log = crate::audit::Log::at(dir.path().join("audit.jsonl"));
+        let decisions: Vec<_> = log
+            .entries()
+            .unwrap()
+            .iter()
+            .map(|e| e.decision)
+            .collect();
+        use crate::audit::Decision::*;
+        assert_eq!(
+            decisions,
+            vec![Refused, Approved, Remembered],
+            "an unanswered ask writes nothing; a refusal, an approval and a \
+             remembered use each write one line"
+        );
+        assert!(log.verify(None).unwrap().is_intact());
+
+        // And the log records the field name, never the value.
+        let raw = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        assert!(raw.contains("password"), "the field name is metadata");
+        assert!(!raw.contains("hunter2"), "the value never is");
     }
 }

@@ -73,6 +73,15 @@ pub fn emit_secret(secret: &str, label: &str, sink: Sink, clip_seconds: u64) -> 
 /// from stdin when there is not — so scripts and the cockpit can pipe it in.
 ///
 /// There is deliberately no `--passphrase` flag anywhere in this CLI.
+/// Is there a person at the other end of stdin?
+///
+/// Used only to choose wording. A passphrase still crosses on stdin either way,
+/// so `printf '%s\n' "$PASS" | black-bag …` keeps working in a script.
+pub fn is_interactive() -> bool {
+    use is_terminal::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
 pub fn read_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
     use is_terminal::IsTerminal;
 

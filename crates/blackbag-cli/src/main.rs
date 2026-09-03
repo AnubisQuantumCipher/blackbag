@@ -304,13 +304,27 @@ enum AgentCommand {
         sink: Sink,
         #[arg(long, default_value_t = 30)]
         clear_after: u64,
+        /// Read the approval passphrase from stdin.
+        ///
+        /// For a caller with no terminal — the deck — that has already asked
+        /// the owner. Without it, an unapproved read exits
+        /// EXIT_APPROVAL_REQUIRED rather than blocking on a stdin that may
+        /// never produce anything.
+        #[arg(long)]
+        approve: bool,
     },
     /// Print one secret field to stdout.
     ///
     /// Deliberately separate from `reveal`: this is the one command that writes
     /// a secret to a redirectable stream, and the cockpit uses it only when the
     /// user explicitly chooses SHOW.
-    Show { id: Uuid, field: String },
+    Show {
+        id: Uuid,
+        field: String,
+        /// Read the approval passphrase from stdin. See `reveal --approve`.
+        #[arg(long)]
+        approve: bool,
+    },
     /// Current TOTP code for a record.
     ///
     /// Copying a 2FA record must go through here, not through `reveal totp`:
@@ -419,6 +433,11 @@ fn main() {
 
     if let Err(err) = run(hardening) {
         eprintln!("black-bag: {err:#}");
+        // A caller that spawned this needs to tell "approve it first" from
+        // "that failed", without matching on English.
+        if err.downcast_ref::<ApprovalRequired>().is_some() {
+            std::process::exit(EXIT_APPROVAL_REQUIRED);
+        }
         std::process::exit(1);
     }
 }
@@ -824,6 +843,7 @@ fn cmd_agent(
                 .with_max_session_secs(max_secs)
                 .with_hardening(hardening)
                 .with_lock_signals(rx, watch_state)
+                .with_default_audit()
                 .serve()
         }
         AgentCommand::Unlock => {
@@ -927,40 +947,23 @@ fn cmd_agent(
             field,
             sink,
             clear_after,
+            approve,
         } => {
-            let request = Request::Reveal {
-                id: id.to_string(),
-                field: field.clone(),
-            };
-            match session::ask(&request)? {
-                Response::Secret { value } => {
-                    // `value` arrives wrapped, so it is wiped when this scope
-                    // ends however the emit path returns.
-                    tty::emit_secret(&value, &field, sink, clear_after)?;
-                    Ok(())
-                }
-                Response::Error { message } => bail!("{message}"),
-                _ => bail!("unexpected reply"),
-            }
+            let value = reveal_with_approval(&id.to_string(), &field, approve)?;
+            // `value` arrives wrapped, so it is wiped when this scope ends
+            // however the emit path returns.
+            tty::emit_secret(&value, &field, sink, clear_after)?;
+            Ok(())
         }
 
-        AgentCommand::Show { id, field } => {
-            let request = Request::Reveal {
-                id: id.to_string(),
-                field,
-            };
-            match session::ask(&request)? {
-                Response::Secret { value } => {
-                    use std::io::Write;
-                    let mut out = std::io::stdout();
-                    out.write_all(value.as_bytes())?;
-                    out.write_all(b"\n")?;
-                    out.flush()?;
-                    Ok(())
-                }
-                Response::Error { message } => bail!("{message}"),
-                _ => bail!("unexpected reply"),
-            }
+        AgentCommand::Show { id, field, approve } => {
+            let value = reveal_with_approval(&id.to_string(), &field, approve)?;
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            out.write_all(value.as_bytes())?;
+            out.write_all(b"\n")?;
+            out.flush()?;
+            Ok(())
         }
 
         AgentCommand::Add => {
@@ -1426,6 +1429,99 @@ fn read_draft() -> Result<blackbag_core::session::RecordDraft> {
 }
 
 /// Ask the agent for lock state, tolerating its absence.
+/// Ask for a secret, handling a first-use approval.
+///
+/// The agent answers `ApprovalRequired` the first time a given program asks for
+/// a given field. The passphrase is read from the terminal — never an argument,
+/// never an environment variable — and the request is made again. On a
+/// non-interactive run there is nowhere to read it from, so this says what is
+/// needed and how, rather than failing with something inscrutable in a script.
+/// Exit code for "a human must approve this first".
+///
+/// A distinct code rather than a message to parse: the deck spawns this binary
+/// and has to tell "needs approval" from "that failed" without matching on
+/// English. Documented in `docs/MANUAL.md` alongside the other exit codes.
+pub const EXIT_APPROVAL_REQUIRED: i32 = 3;
+
+/// Marker error carrying that code up to `main`.
+#[derive(Debug)]
+pub struct ApprovalRequired {
+    pub item: String,
+    pub field: String,
+    pub client: Option<String>,
+}
+
+impl std::fmt::Display for ApprovalRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // One stable line, in a shape a script can split on, before the prose.
+        write!(
+            f,
+            "approval-required item={} field={} client={}",
+            self.item,
+            self.field,
+            self.client.as_deref().unwrap_or("unidentified")
+        )
+    }
+}
+
+impl std::error::Error for ApprovalRequired {}
+
+fn reveal_with_approval(id: &str, field: &str, approve: bool) -> Result<Zeroizing<String>> {
+    let ask = |passphrase: Option<Zeroizing<String>>| {
+        session::ask(&Request::Reveal {
+            id: id.to_string(),
+            field: field.to_string(),
+            passphrase,
+        })
+    };
+
+    match ask(None)? {
+        Response::Secret { value } => Ok(value),
+        Response::Error { message } => bail!("{message}"),
+        Response::ApprovalRequired {
+            title,
+            client,
+            field,
+            ..
+        } => {
+            let what = title.clone().unwrap_or_else(|| id.to_string());
+            let who = client.clone();
+
+            // Nowhere to read a passphrase from, and not asked to: say so in a
+            // shape the caller can act on rather than blocking on a stdin that
+            // may never produce anything.
+            if !tty::is_interactive() && !approve {
+                return Err(ApprovalRequired {
+                    item: id.to_string(),
+                    field: field.clone(),
+                    client: who,
+                }
+                .into());
+            }
+
+            let who = client.unwrap_or_else(|| "an unidentified program".into());
+            if tty::is_interactive() {
+                eprintln!("{who} wants to read {field} of {what}.");
+                eprintln!(
+                    "This is the first time. Approving is remembered until the vault locks."
+                );
+            }
+            // The passphrase crosses on stdin either way, so a script can pipe
+            // it; only the explaining changes.
+            let passphrase = tty::read_passphrase("Master passphrase, to approve: ")
+                .with_context(|| {
+                    format!("{who} is not approved to read {field} of {what}")
+                })?;
+            match ask(Some(passphrase))? {
+                Response::Secret { value } => Ok(value),
+                Response::Error { message } => bail!("{message}"),
+                _ => bail!("unexpected reply"),
+            }
+        }
+        _ => bail!("unexpected reply"),
+    }
+}
+
 fn agent_session_view() -> SessionView {
     match session::ask(&Request::Status) {
         Ok(Response::Status(status)) => SessionView {

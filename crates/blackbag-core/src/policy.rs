@@ -79,6 +79,22 @@ impl ClientKey {
         Self(program.unwrap_or("unidentified").to_string())
     }
 
+    /// The key for a caller, falling back to its pid when it cannot be named.
+    ///
+    /// This distinction matters more than it looks. If every unidentifiable
+    /// caller shared one key, approving *one* of them would approve *all* of
+    /// them — and on a box with `ptrace_scope=1`, "unidentifiable" can be the
+    /// common case rather than the exception. Keying on the pid instead means
+    /// an approval given to a program that could not be named never reaches a
+    /// different process, at the cost of not surviving that program restarting.
+    /// That is the right way round.
+    pub fn for_peer(program: Option<&str>, pid: i32) -> Self {
+        match program {
+            Some(name) if !name.is_empty() => Self(name.to_string()),
+            _ => Self(format!("pid:{pid}")),
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -267,20 +283,40 @@ mod tests {
         }
     }
 
+    /// The case that would otherwise be a hole: if every caller the agent
+    /// cannot name shared one key, approving one would approve all of them.
     #[test]
-    fn a_program_that_could_not_be_identified_is_its_own_client() {
+    fn callers_that_cannot_be_named_do_not_share_an_approval() {
         let mut a = Approvals::new();
-        let unknown = ClientKey::of(None);
-        a.grant(&unknown, "rec-1", Capability::Reveal);
+        let one = ClientKey::for_peer(None, 111);
+        let other = ClientKey::for_peer(None, 222);
+
+        a.grant(&one, "rec-1", Capability::Reveal);
         assert_eq!(
-            a.consider(&unknown, "rec-1", Capability::Reveal),
+            a.consider(&one, "rec-1", Capability::Reveal),
             Verdict::Remembered
         );
-        // And approving one unidentified caller does not approve a named one.
+        assert_eq!(
+            a.consider(&other, "rec-1", Capability::Reveal),
+            Verdict::MustAsk,
+            "a different unnamed process is a different client"
+        );
         assert_eq!(
             a.consider(&client("brave"), "rec-1", Capability::Reveal),
-            Verdict::MustAsk
+            Verdict::MustAsk,
+            "and so is a named one"
         );
+    }
+
+    #[test]
+    fn a_named_caller_is_keyed_by_name_not_by_pid() {
+        assert_eq!(
+            ClientKey::for_peer(Some("brave"), 111),
+            ClientKey::for_peer(Some("brave"), 222),
+            "a program that restarts keeps its approvals"
+        );
+        assert_ne!(ClientKey::for_peer(None, 111), ClientKey::for_peer(None, 222));
+        assert_eq!(ClientKey::for_peer(Some(""), 5), ClientKey::for_peer(None, 5));
     }
 
     #[test]
