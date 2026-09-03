@@ -40,6 +40,12 @@ uses `gitleaks` when it is installed and falls back to a smaller built-in scan
 when it is not, so a machine without `gitleaks` is not a machine without a
 check.
 
+Git will not enable a hook for you, by design — a repository that could run
+code on clone would be a rather larger problem than a leaked token. So the one
+line above is yours to run. `.githooks/selftest.sh` proves the hook still
+blocks (a private key, three kinds of token, a vault file) and CI runs it, so
+it cannot quietly rot into a file that passes everything.
+
 ## Building and testing
 
 ```sh
