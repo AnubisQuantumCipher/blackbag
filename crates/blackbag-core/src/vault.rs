@@ -317,6 +317,30 @@ impl Vault {
         bail!("unlock failed")
     }
 
+    /// Does this passphrase open this vault?
+    ///
+    /// The whole unlock, stopped one step short of building a `Vault`: the same
+    /// Argon2id derivation over the same parameters, and the same authenticated
+    /// unwrap of the sealed data key. It costs exactly what an unlock costs,
+    /// which is the point — a cheaper check would be a different check, and the
+    /// thing being proved here is that whoever is answering knows the
+    /// passphrase, not that they can produce something shaped like one.
+    ///
+    /// Used to prove a human is behind a passkey approval. See `consent.rs`.
+    pub fn passphrase_opens(path: &Path, passphrase: &[u8]) -> Result<bool> {
+        let file = read_vault_file(path)?;
+        for recipient in &file.header.recipients {
+            let Recipient::Passphrase { argon, sealed_dek } = recipient else {
+                continue;
+            };
+            let kek = crypto::derive_kek(passphrase, argon)?;
+            if crypto::open(kek.as_ref(), sealed_dek, AAD_RECIPIENT_PASSPHRASE).is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Unlock with a recovery key, without the passphrase.
     pub fn unlock_with_recovery(path: &Path, key: &RecoveryKey) -> Result<Self> {
         let file = read_vault_file(path)?;

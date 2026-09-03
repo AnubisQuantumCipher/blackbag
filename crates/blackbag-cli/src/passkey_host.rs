@@ -7,13 +7,20 @@
 //!
 //! # What this process is trusted with, and what it is not
 //!
-//! It is a **relay and nothing else**. It holds no key material, makes no
-//! security decision, and its opinion about an origin is worth nothing: the
-//! agent independently checks that the relying party is a registrable-domain
-//! suffix of the origin, and a human is shown that origin before anything is
-//! signed. If this process were replaced wholesale by a hostile one, the worst
-//! it could do is what any other process in the session can already do — ask
-//! the agent for a ceremony, and be refused by the human looking at the screen.
+//! It is a **relay and nothing else**. It holds no key material and makes no
+//! security decision.
+//!
+//! Be precise about what that buys, because the obvious sentence is wrong. The
+//! agent checks that the relying party is a registrable-domain suffix of the
+//! origin it was handed. It does **not**, and cannot, check that the origin is
+//! *real* — nothing downstream of the browser can. What stands behind the
+//! origin is two other things: Chromium authored it (`sw.js` takes it from
+//! `remoteDesktopClientOverride`, which a web page cannot forge), and a human
+//! is shown it and must type the vault passphrase before anything is signed.
+//!
+//! So a hostile replacement of this process cannot sign anything by itself. It
+//! can ask for a ceremony naming any origin it likes — and that is the string
+//! the person reads on Black-Bag's own screen before approving.
 //!
 //! That is the reason the consent prompt lives in the deck rather than here or
 //! in the extension. The two components nearest the browser are the two most
@@ -57,7 +64,9 @@ struct BeginArgs {
     rp_name: Option<String>,
     #[serde(default)]
     allow_credentials: Vec<String>,
-    client_data_json: String,
+    challenge: String,
+    #[serde(default)]
+    cross_origin: bool,
     #[serde(default)]
     user_handle: Option<String>,
     #[serde(default)]
@@ -86,6 +95,8 @@ enum Outgoing {
     /// Still waiting for the human.
     Waiting,
     Result {
+        /// The exact bytes the agent hashed; Chromium gets these verbatim.
+        client_data_json: String,
         credential_id: String,
         authenticator_data: String,
         signature: String,
@@ -172,7 +183,8 @@ fn handle_inner(incoming: Incoming) -> Result<Outgoing> {
                 rp_id: args.rp_id,
                 rp_name: args.rp_name,
                 allow_credentials: args.allow_credentials,
-                client_data_json: args.client_data_json,
+                challenge: args.challenge,
+                cross_origin: args.cross_origin,
                 user_handle: args.user_handle,
                 user_name: args.user_name,
                 user_display_name: args.user_display_name,
@@ -190,6 +202,7 @@ fn handle_inner(incoming: Incoming) -> Result<Outgoing> {
         Incoming::Collect { nonce } => match session::ask(&Request::PasskeyCollect { nonce })? {
             Response::PasskeyWaiting => Ok(Outgoing::Waiting),
             Response::PasskeyResult {
+                client_data_json,
                 credential_id,
                 authenticator_data,
                 signature,
@@ -199,6 +212,7 @@ fn handle_inner(incoming: Incoming) -> Result<Outgoing> {
                 prf_first,
                 prf_second,
             } => Ok(Outgoing::Result {
+                client_data_json,
                 credential_id,
                 authenticator_data,
                 signature,
@@ -216,7 +230,12 @@ fn handle_inner(incoming: Incoming) -> Result<Outgoing> {
             // The browser has stopped waiting, so take the prompt off the
             // user's screen rather than leaving them to answer something that
             // can no longer be delivered.
-            match session::ask(&Request::PasskeyRefuse { nonce })? {
+            match session::ask(&Request::PasskeyAnswer {
+                nonce,
+                approve: false,
+                credential_id: None,
+                passphrase: Default::default(),
+            })? {
                 Response::Ok | Response::Error { .. } => Ok(Outgoing::Waiting),
                 other => bail!("unexpected reply to cancel: {other:?}"),
             }
@@ -325,7 +344,8 @@ mod tests {
             rp_id: "evil.example".into(),
             rp_name: None,
             allow_credentials: vec![],
-            client_data_json: "00".into(),
+            challenge: "Y2hhbGxlbmdl".into(),
+            cross_origin: false,
             user_handle: None,
             user_name: None,
             user_display_name: None,

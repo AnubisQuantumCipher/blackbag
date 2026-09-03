@@ -154,8 +154,16 @@ pub enum Request {
         /// discoverable credential for this relying party".
         #[serde(default)]
         allow_credentials: Vec<String>,
-        /// The exact bytes that will be hashed into the signature, hex-encoded.
-        client_data_json: String,
+        /// The relying party's challenge, base64url, exactly as the browser
+        /// supplied it. The bytes that get signed are built HERE, from this and
+        /// the origin above — a caller that could hand in the signed bytes
+        /// would have a signing oracle with attacker-chosen content, and the
+        /// origin the human read would bear no mechanical relation to the one
+        /// the relying party verifies.
+        challenge: String,
+        /// Whether the caller was a cross-origin iframe.
+        #[serde(default)]
+        cross_origin: bool,
         // Create-only.
         #[serde(default)]
         user_handle: Option<String>,
@@ -172,14 +180,21 @@ pub enum Request {
         #[serde(default)]
         prf_second_salt: Option<String>,
     },
-    /// A human approved a ceremony, naming which credential to use.
-    PasskeyApprove {
+    /// Answer a waiting ceremony.
+    ///
+    /// An approval carries the vault passphrase, re-entered for this ceremony.
+    /// Nothing else can approve: the socket establishes only that the peer runs
+    /// as the same user, and everything in the session does. A refusal needs no
+    /// proof — anyone may say no on your behalf, and the failure mode of a
+    /// spurious refusal is a login that does not happen.
+    PasskeyAnswer {
         nonce: String,
+        approve: bool,
         #[serde(default)]
         credential_id: Option<String>,
+        #[serde(default)]
+        passphrase: Zeroizing<String>,
     },
-    /// A human refused a ceremony.
-    PasskeyRefuse { nonce: String },
     /// Collect the answer. Signs on the way out, exactly once.
     PasskeyCollect { nonce: String },
     /// What is waiting for a human right now, so the deck can show it.
@@ -216,6 +231,10 @@ pub enum Response {
     /// The ceremony completed. Everything here is public by construction: it
     /// is what goes to the relying party.
     PasskeyResult {
+        /// The exact bytes the agent hashed. The extension hands these to
+        /// Chromium verbatim; regenerating them anywhere else would produce a
+        /// signature that does not verify.
+        client_data_json: String,
         credential_id: String,
         authenticator_data: String,
         signature: String,
@@ -658,6 +677,37 @@ impl RecordView {
 /// exactly one spelling.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The client data a relying party will verify, built here rather than handed in.
+///
+/// WebAuthn hashes these bytes into the signature, and the relying party
+/// re-serialises its own copy to compare. Two properties matter and neither
+/// survives letting a caller supply them:
+///
+///   * the `origin` is the one the human was shown, by construction rather
+///     than by agreement between two components; and
+///   * nothing attacker-chosen sits in the signed message except the challenge
+///     the relying party itself issued.
+///
+/// The key order is fixed and matches what browsers emit, so the bytes returned
+/// to the extension are the bytes the relying party checks.
+fn client_data_json(kind: &str, challenge: &str, origin: &str, cross_origin: bool) -> Vec<u8> {
+    // Built field by field rather than with `json!`, because serde_json's map
+    // is a BTreeMap and would emit these in alphabetical order. Browsers emit
+    // type, challenge, origin, crossOrigin, and a relying party that compares
+    // the bytes it stored against the bytes a browser would produce should see
+    // the same shape from us. Each VALUE still goes through serde_json, so an
+    // origin carrying a quote cannot break out of the string it sits in.
+    let q = |v: &str| serde_json::Value::String(v.to_string()).to_string();
+    format!(
+        r#"{{"type":{},"challenge":{},"origin":{},"crossOrigin":{}}}"#,
+        q(kind),
+        q(challenge),
+        q(origin),
+        cross_origin
+    )
+    .into_bytes()
 }
 
 fn unhex(text: &str) -> Result<Vec<u8>> {
@@ -1122,7 +1172,8 @@ impl Agent {
                 rp_id,
                 rp_name,
                 allow_credentials,
-                client_data_json,
+                challenge,
+                cross_origin,
                 user_handle,
                 user_name,
                 user_display_name,
@@ -1141,9 +1192,8 @@ impl Agent {
                         "relying party {rp_id} is not valid for origin {origin}"
                     );
                 }
-                let client_data = unhex(&client_data_json)?;
-                if client_data.is_empty() {
-                    bail!("a passkey ceremony must carry the client data it will sign");
+                if challenge.trim().is_empty() {
+                    bail!("a passkey ceremony must carry the relying party's challenge");
                 }
                 let rp_id = rp_id.trim_end_matches('.').to_ascii_lowercase();
 
@@ -1202,7 +1252,8 @@ impl Agent {
                     rp_id,
                     rp_name,
                     choices: choices.clone(),
-                    client_data_json: client_data,
+                    challenge,
+                    cross_origin,
                     user_handle: user_handle.as_deref().map(unhex).transpose()?,
                     user_name,
                     user_display_name,
@@ -1210,6 +1261,7 @@ impl Agent {
                     prf_first_salt: prf_first_salt.as_deref().map(unhex).transpose()?,
                     prf_second_salt: prf_second_salt.as_deref().map(unhex).transpose()?,
                     registered_at: Utc::now(),
+                    attempts: 0,
                     state: State::AwaitingHuman,
                 };
                 self.consent.register(ceremony, Utc::now())?;
@@ -1219,20 +1271,29 @@ impl Agent {
                 Ok(Response::PasskeyRegistered { nonce, choices })
             }
 
-            Request::PasskeyApprove {
+            Request::PasskeyAnswer {
                 nonce,
+                approve,
                 credential_id,
+                passphrase,
             } => {
+                if !approve {
+                    self.consent
+                        .refuse(&nonce, "you refused this request", Utc::now())?;
+                    self.publish()?;
+                    return Ok(Response::Ok);
+                }
+                // The proof, and the whole reason this verb exists. Checked
+                // against the vault on disk rather than against anything this
+                // process is already holding, so an agent that has been
+                // unlocked for eleven hours is no help to a caller who does not
+                // know the passphrase.
+                let proof_ok = !passphrase.is_empty()
+                    && Vault::passphrase_opens(&self.vault_path, passphrase.as_bytes())
+                        .unwrap_or(false);
                 let chosen = credential_id.as_deref().map(unhex).transpose()?;
                 self.consent
-                    .approve(&nonce, chosen.as_deref(), Utc::now())?;
-                self.publish()?;
-                Ok(Response::Ok)
-            }
-
-            Request::PasskeyRefuse { nonce } => {
-                self.consent
-                    .refuse(&nonce, "you refused this request", Utc::now())?;
+                    .approve(&nonce, chosen.as_deref(), proof_ok, Utc::now())?;
                 self.publish()?;
                 Ok(Response::Ok)
             }
@@ -1307,6 +1368,12 @@ impl Agent {
                         self.publish()?;
 
                         Ok(Response::PasskeyResult {
+                            client_data_json: hex(&client_data_json(
+                                "webauthn.create",
+                                &ceremony.challenge,
+                                &ceremony.origin,
+                                ceremony.cross_origin,
+                            )),
                             credential_id: hex(&created.credential.config.credential_id),
                             authenticator_data: hex(&created.authenticator_data),
                             // A registration has no assertion signature.
@@ -1332,11 +1399,14 @@ impl Agent {
                         // Re-checked at the moment of signing, not merely when
                         // the ceremony was registered: the vault can be
                         // refreshed from disk in between.
-                        let asserted = credential.assert(
+                        let client_data = client_data_json(
+                            "webauthn.get",
+                            &ceremony.challenge,
                             &ceremony.origin,
-                            &ceremony.client_data_json,
-                            user_verified,
-                        )?;
+                            ceremony.cross_origin,
+                        );
+                        let asserted =
+                            credential.assert(&ceremony.origin, &client_data, user_verified)?;
 
                         // The PRF is evaluated only when the credential
                         // actually carries a seed AND the relying party asked.
@@ -1354,6 +1424,7 @@ impl Agent {
                         let prf_second = evaluate(&ceremony.prf_second_salt);
 
                         Ok(Response::PasskeyResult {
+                            client_data_json: hex(&client_data),
                             credential_id: hex(&credential_id),
                             authenticator_data: hex(&asserted.authenticator_data),
                             signature: hex(&asserted.signature),
@@ -1707,6 +1778,7 @@ mod tests {
             },
             Response::PasskeyWaiting,
             Response::PasskeyResult {
+                client_data_json: "7b7d".into(),
                 credential_id: "aabb".into(),
                 authenticator_data: "00".into(),
                 signature: "3045".into(),
@@ -2193,7 +2265,8 @@ mod passkey_agent_tests {
                 rp_id: rp.into(),
                 rp_name: Some("Test RP".into()),
                 allow_credentials: allow,
-                client_data_json: hex(br#"{"type":"webauthn.get","challenge":"abc"}"#),
+                challenge: "Y2hhbGxlbmdl".into(),
+                cross_origin: false,
                 user_handle: Some(hex(b"user-handle")),
                 user_name: Some("ada".into()),
                 user_display_name: Some("Ada".into()),
@@ -2214,9 +2287,11 @@ mod passkey_agent_tests {
         };
         ask_at(
             sock,
-            &Request::PasskeyApprove {
+            &Request::PasskeyAnswer {
                 nonce: nonce.clone(),
+                approve: true,
                 credential_id: None,
+                passphrase: Zeroizing::new(PASS.into()),
             },
         )
         .unwrap();
@@ -2253,9 +2328,11 @@ mod passkey_agent_tests {
 
         ask_at(
             &sock,
-            &Request::PasskeyApprove {
+            &Request::PasskeyAnswer {
                 nonce: nonce.clone(),
+                approve: true,
                 credential_id: Some(id),
+                passphrase: Zeroizing::new(PASS.into()),
             },
         )
         .unwrap();
@@ -2278,6 +2355,101 @@ mod passkey_agent_tests {
         ));
     }
 
+    /// The attack this whole two-phase design exists to stop.
+    ///
+    /// Before the proof requirement, `passkey_approve` was an ordinary socket
+    /// verb: any process running as the user could register a ceremony,
+    /// approve its own ceremony, collect the signature, and be logged in as the
+    /// owner at any relying party the vault holds a passkey for — silently,
+    /// with nothing on screen. This test performs exactly that sequence and
+    /// requires it to fail.
+    #[test]
+    fn a_caller_cannot_approve_its_own_ceremony_without_the_passphrase() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = make_one(&sock, "bank.example");
+
+        let Response::PasskeyRegistered { nonce, .. } = begin(
+            &sock,
+            Operation::Assert,
+            "https://bank.example",
+            "bank.example",
+            vec![],
+        ) else {
+            panic!("assert was not registered")
+        };
+
+        for guess in ["", "not the passphrase", "correct horse battery staple"] {
+            let reply = ask_at(
+                &sock,
+                &Request::PasskeyAnswer {
+                    nonce: nonce.clone(),
+                    approve: true,
+                    credential_id: Some(id.clone()),
+                    passphrase: Zeroizing::new(guess.into()),
+                },
+            )
+            .unwrap();
+            assert!(
+                matches!(reply, Response::Error { .. }),
+                "a wrong passphrase approved a login: {reply:?}"
+            );
+        }
+
+        // Three wrong guesses refuse the ceremony outright, so the prompt is
+        // not left standing as an oracle to keep guessing against.
+        let reply = ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap();
+        assert!(
+            matches!(reply, Response::Error { .. }),
+            "no signature may come out of this: {reply:?}"
+        );
+    }
+
+    /// And the honest half: the right passphrase does approve it.
+    #[test]
+    fn the_passphrase_approves_it() {
+        let (_d, _v, sock) = spawn_test_agent(60, 3600);
+        unlock(&sock);
+        let id = make_one(&sock, "bank.example");
+
+        let Response::PasskeyRegistered { nonce, .. } = begin(
+            &sock,
+            Operation::Assert,
+            "https://bank.example",
+            "bank.example",
+            vec![],
+        ) else {
+            panic!()
+        };
+        ask_at(
+            &sock,
+            &Request::PasskeyAnswer {
+                nonce: nonce.clone(),
+                approve: true,
+                credential_id: Some(id),
+                passphrase: Zeroizing::new(PASS.into()),
+            },
+        )
+        .unwrap();
+
+        let Response::PasskeyResult {
+            signature,
+            client_data_json,
+            ..
+        } = ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap()
+        else {
+            panic!("the right passphrase must approve it")
+        };
+        assert!(!signature.is_empty());
+
+        // The agent built the signed bytes, and they name the origin the human
+        // was shown — not anything a caller supplied.
+        let cdj = String::from_utf8(unhex(&client_data_json).unwrap()).unwrap();
+        assert!(cdj.contains(r#""origin":"https://bank.example""#), "{cdj}");
+        assert!(cdj.contains(r#""type":"webauthn.get""#), "{cdj}");
+        assert!(cdj.contains(r#""challenge":"Y2hhbGxlbmdl""#), "{cdj}");
+    }
+
     #[test]
     fn a_refused_ceremony_signs_nothing() {
         let (_d, _v, sock) = spawn_test_agent(60, 3600);
@@ -2293,7 +2465,16 @@ mod passkey_agent_tests {
         ) else {
             panic!()
         };
-        ask_at(&sock, &Request::PasskeyRefuse { nonce: nonce.clone() }).unwrap();
+        ask_at(
+            &sock,
+            &Request::PasskeyAnswer {
+                nonce: nonce.clone(),
+                approve: false,
+                credential_id: None,
+                passphrase: Zeroizing::new(String::new()),
+            },
+        )
+        .unwrap();
         assert!(matches!(
             ask_at(&sock, &Request::PasskeyCollect { nonce }).unwrap(),
             Response::Error { .. }
@@ -2395,6 +2576,8 @@ mod passkey_reveal_tests {
     use super::*;
     use crate::consent::Operation;
 
+    const PASS: &str = "agent test passphrase";
+
     /// A passkey's private key must not be reachable through the one path that
     /// returns secret bytes.
     #[test]
@@ -2417,7 +2600,8 @@ mod passkey_reveal_tests {
                 rp_id: "example.com".into(),
                 rp_name: None,
                 allow_credentials: vec![],
-                client_data_json: hex(b"{}"),
+                challenge: "Y2hhbGxlbmdl".into(),
+                cross_origin: false,
                 user_handle: Some(hex(b"u")),
                 user_name: Some("ada".into()),
                 user_display_name: None,
@@ -2431,9 +2615,11 @@ mod passkey_reveal_tests {
         };
         ask_at(
             &sock,
-            &Request::PasskeyApprove {
+            &Request::PasskeyAnswer {
                 nonce: nonce.clone(),
+                approve: true,
                 credential_id: None,
+                passphrase: Zeroizing::new(PASS.into()),
             },
         )
         .unwrap();
@@ -2528,5 +2714,46 @@ mod passkey_edit_tests {
             record.field("private_key").is_none(),
             "the passkey exemption must not leak to other kinds"
         );
+    }
+}
+
+#[cfg(test)]
+mod client_data_tests {
+    use super::*;
+
+    /// These bytes are hashed into a signature and stored by relying parties.
+    /// Their shape is part of the contract, so it is pinned.
+    #[test]
+    fn client_data_has_the_shape_browsers_emit() {
+        let bytes = client_data_json("webauthn.get", "Y2hhbGxlbmdl", "https://bank.example", false);
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"type":"webauthn.get","challenge":"Y2hhbGxlbmdl","origin":"https://bank.example","crossOrigin":false}"#
+        );
+    }
+
+    /// An origin reaches us from a browser. It must not be able to escape the
+    /// string it is written into and forge the fields around it.
+    #[test]
+    fn a_hostile_origin_cannot_break_out_of_its_own_field() {
+        let bytes = client_data_json(
+            "webauthn.get",
+            "c",
+            r#"https://evil","crossOrigin":true,"x":"#,
+            false,
+        );
+        let text = String::from_utf8(bytes).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["crossOrigin"], serde_json::json!(false), "{text}");
+        assert!(parsed.get("x").is_none(), "an injected field appeared: {text}");
+    }
+
+    #[test]
+    fn a_cross_origin_ceremony_says_so() {
+        let text =
+            String::from_utf8(client_data_json("webauthn.create", "c", "https://x.test", true))
+                .unwrap();
+        assert!(text.contains(r#""crossOrigin":true"#), "{text}");
+        assert!(text.contains(r#""type":"webauthn.create""#), "{text}");
     }
 }

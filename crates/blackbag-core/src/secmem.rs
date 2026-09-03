@@ -935,12 +935,19 @@ mod tests {
         assert_eq!(&s[..4], b"abcd");
         assert!(s[4..].iter().all(|&b| b == b'x'));
         assert!(s.capacity() >= 1004);
-        // The vacated range must read back as zeros. It is still mapped
-        // (slabs are pools), so this is safe to inspect.
-        if first_ptr != s.ptr.as_ptr() && first_cap > 0 {
-            let old = unsafe { std::slice::from_raw_parts(first_ptr, first_cap) };
-            assert!(old.iter().all(|&b| b == 0), "vacated range was not wiped");
-        }
+        assert!(first_ptr != s.ptr.as_ptr() || first_cap == 0, "it really moved");
+
+        // The vacated range is NOT inspected here, and that is deliberate. It
+        // goes straight back to the slab pool, so any other test in this binary
+        // may legitimately allocate and write it between the growth and the
+        // read — which failed this assertion for a reason that had nothing to
+        // do with wiping. Reading memory the allocator has reclaimed cannot be
+        // made sound by looking quickly.
+        //
+        // The property still matters and is still covered:
+        // `freed_ranges_are_zeroed_and_reused` proves it from the only side
+        // that is race-free, by taking a range back out of the pool and
+        // observing that it comes back zeroed.
     }
 
     #[test]

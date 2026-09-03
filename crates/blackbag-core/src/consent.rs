@@ -15,8 +15,16 @@
 //! you, to anything, for as long as the vault stayed open — with nothing on
 //! screen.
 //!
-//! So the socket never authorizes a signature. A human does, per ceremony, in a
-//! surface the agent controls.
+//! So the socket never authorizes a signature. An approval must carry something
+//! a socket client cannot manufacture: **the vault passphrase, re-entered for
+//! this ceremony**, checked against the vault itself. That is the same secret
+//! the vault already rests on, so this adds no new thing to steal, and it is
+//! the one thing a process running as you does not have.
+//!
+//! This is a bar, not a boundary. A keylogger at the same uid defeats it — as
+//! it defeats every other use of that passphrase. What it stops is the silent
+//! case: a process that can write one line to a socket and be logged in as you
+//! at a bank, with nothing on screen and nothing typed.
 //!
 //! # Why it is two-phase
 //!
@@ -61,6 +69,14 @@ pub const CEREMONY_TTL_SECS: i64 = 120;
 /// keeps it from burying a real prompt under a hundred fake ones the user
 /// dismisses without reading.
 pub const MAX_PENDING: usize = 8;
+
+/// Wrong passphrases allowed on one ceremony before it is refused outright.
+///
+/// A passkey prompt that accepted guesses without limit would be a passphrase
+/// oracle that any local process could raise at will — and each guess costs the
+/// attacker one Argon2id evaluation, which is a price worth making them pay
+/// only three times.
+pub const MAX_PROOF_ATTEMPTS: u8 = 3;
 
 /// What the browser asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,8 +124,18 @@ pub struct Ceremony {
     pub rp_name: Option<String>,
     /// Credentials this ceremony may use. Frozen at registration.
     pub choices: Vec<Choice>,
-    /// The bytes that will be hashed into the signature.
-    pub client_data_json: Vec<u8>,
+    /// The relying party's challenge, base64url, exactly as the browser
+    /// supplied it.
+    ///
+    /// The *bytes* that get signed are built by the agent from this plus the
+    /// origin above — never handed in by a caller. A caller that could supply
+    /// the signed bytes directly would have a signing oracle with 32
+    /// attacker-chosen bytes in a fixed position, and the origin the human read
+    /// would have no mechanical relationship to the origin the relying party
+    /// verifies.
+    pub challenge: String,
+    /// Whether the caller was a cross-origin iframe, for `crossOrigin`.
+    pub cross_origin: bool,
     /// Create-only: who the credential will be for.
     pub user_handle: Option<Vec<u8>>,
     pub user_name: Option<String>,
@@ -123,6 +149,9 @@ pub struct Ceremony {
     pub prf_first_salt: Option<Vec<u8>>,
     pub prf_second_salt: Option<Vec<u8>>,
     pub registered_at: DateTime<Utc>,
+    /// Failed proofs so far. A ceremony is refused outright after
+    /// [`MAX_PROOF_ATTEMPTS`], so this is not an oracle to guess against.
+    pub attempts: u8,
     pub state: State,
 }
 
@@ -219,6 +248,7 @@ impl Desk {
         }
         ceremony.state = State::AwaitingHuman;
         ceremony.registered_at = now;
+        ceremony.attempts = 0;
         let nonce = ceremony.nonce.clone();
         self.pending.push(ceremony);
         Ok(nonce)
@@ -229,10 +259,18 @@ impl Desk {
     /// A credential that was not among the choices recorded at registration is
     /// refused. This is the check that stops an approval being redirected: the
     /// human agreed to one specific thing, and only that thing can happen.
+    /// Approve a ceremony, naming which of its recorded credentials to use.
+    ///
+    /// `proof_ok` is whether the answerer proved they know the vault
+    /// passphrase. It is a parameter rather than something checked here because
+    /// the check costs an Argon2id derivation and belongs to the agent that
+    /// owns the vault path; what belongs here is that a false proof cannot
+    /// approve anything, and that guesses are counted and run out.
     pub fn approve(
         &mut self,
         nonce: &str,
         credential_id: Option<&[u8]>,
+        proof_ok: bool,
         now: DateTime<Utc>,
     ) -> Result<()> {
         self.expire(now);
@@ -244,6 +282,17 @@ impl Desk {
 
         if ceremony.state != State::AwaitingHuman {
             bail!("that passkey request has already been answered");
+        }
+
+        if !proof_ok {
+            ceremony.attempts = ceremony.attempts.saturating_add(1);
+            if ceremony.attempts >= MAX_PROOF_ATTEMPTS {
+                ceremony.state = State::Refused {
+                    reason: "too many wrong passphrases; the request was refused",
+                };
+                bail!("that is not the vault passphrase; the request was refused");
+            }
+            bail!("that is not the vault passphrase");
         }
 
         let chosen = match credential_id {
@@ -395,7 +444,8 @@ mod tests {
             rp_id: "bank.example".into(),
             rp_name: Some("Bank".into()),
             choices,
-            client_data_json: b"{}".to_vec(),
+            challenge: "Y2hhbGxlbmdl".into(),
+            cross_origin: false,
             user_handle: None,
             user_name: Some("ada".into()),
             user_display_name: None,
@@ -403,6 +453,7 @@ mod tests {
             prf_first_salt: None,
             prf_second_salt: None,
             registered_at: at(0),
+            attempts: 0,
             state: State::AwaitingHuman,
         }
     }
@@ -418,10 +469,10 @@ mod tests {
 
         // The swap a hostile caller wants: approve the ceremony the human saw,
         // but sign with a credential it never mentioned.
-        assert!(desk.approve(N1, Some(b"bbbb"), at(1)).is_err());
+        assert!(desk.approve(N1, Some(b"bbbb"), true, at(1)).is_err());
         assert!(desk.is_waiting(N1), "a refused swap must not answer it");
 
-        desk.approve(N1, Some(b"aaaa"), at(1)).unwrap();
+        desk.approve(N1, Some(b"aaaa"), true, at(1)).unwrap();
         let done = desk.take_answered(N1, at(1)).unwrap();
         assert_eq!(
             done.state,
@@ -436,7 +487,7 @@ mod tests {
         let mut desk = Desk::new();
         desk.register(ceremony(N1, vec![choice(b"aaaa", "ada")]), at(0))
             .unwrap();
-        desk.approve(N1, None, at(1)).unwrap();
+        desk.approve(N1, None, true, at(1)).unwrap();
 
         assert!(desk.take_answered(N1, at(1)).is_some());
         assert!(
@@ -472,7 +523,7 @@ mod tests {
         desk.register(ceremony(N1, vec![choice(b"aaaa", "ada")]), at(0))
             .unwrap();
         // The human clicks approve a fraction after it lapsed.
-        assert!(desk.approve(N1, None, at(CEREMONY_TTL_SECS + 1)).is_err());
+        assert!(desk.approve(N1, None, true, at(CEREMONY_TTL_SECS + 1)).is_err());
     }
 
     #[test]
@@ -484,10 +535,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            desk.approve(N1, None, at(1)).is_err(),
+            desk.approve(N1, None, true, at(1)).is_err(),
             "two accounts and no choice named is not consent to either"
         );
-        desk.approve(N1, Some(b"bbbb"), at(1)).unwrap();
+        desk.approve(N1, Some(b"bbbb"), true, at(1)).unwrap();
     }
 
     #[test]
@@ -530,7 +581,7 @@ mod tests {
         let mut desk = Desk::new();
         desk.register(ceremony(N1, vec![choice(b"aaaa", "ada")]), at(0))
             .unwrap();
-        desk.approve(N1, None, at(1)).unwrap();
+        desk.approve(N1, None, true, at(1)).unwrap();
         desk.clear();
         assert!(desk.is_empty());
         assert!(
@@ -559,7 +610,7 @@ mod tests {
     #[test]
     fn a_nonce_that_was_never_registered_answers_nothing() {
         let mut desk = Desk::new();
-        assert!(desk.approve(N1, None, at(0)).is_err());
+        assert!(desk.approve(N1, None, true, at(0)).is_err());
         assert!(desk.refuse(N1, "no", at(0)).is_err());
         assert!(desk.take_answered(N1, at(0)).is_none());
     }

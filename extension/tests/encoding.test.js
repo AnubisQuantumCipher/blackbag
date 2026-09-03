@@ -33,7 +33,6 @@ const {
   bytesToB64url,
   hexToBytes,
   bytesToHex,
-  clientDataJSON,
   callerOrigin,
 } = require('../sw.js');
 
@@ -78,19 +77,13 @@ check('hex and base64url agree through a full conversion', () => {
   assert.strictEqual(bytesToB64url(hexToBytes(hex)), b64);
 });
 
-check('client data carries the caller origin and the challenge verbatim', () => {
-  const bytes = clientDataJSON('webauthn.get', 'Y2hhbGxlbmdl', 'https://bank.example', false);
-  const parsed = JSON.parse(new TextDecoder().decode(bytes));
-  assert.strictEqual(parsed.type, 'webauthn.get');
-  assert.strictEqual(parsed.challenge, 'Y2hhbGxlbmdl');
-  assert.strictEqual(parsed.origin, 'https://bank.example');
-  assert.strictEqual(parsed.crossOrigin, false);
-});
-
-check('client data is byte-stable, so the signature verifies against it', () => {
-  const a = clientDataJSON('webauthn.get', 'abc', 'https://x.example', false);
-  const b = clientDataJSON('webauthn.get', 'abc', 'https://x.example', false);
-  assert.strictEqual(bytesToHex(a), bytesToHex(b));
+// The extension deliberately does NOT build client data any more — the agent
+// does, so the origin a human approved and the origin a relying party verifies
+// are the same string by construction. Assert the capability is really gone
+// rather than leaving a stale test passing.
+check('the extension exports no client-data builder', () => {
+  const mod = require('../sw.js');
+  assert.strictEqual(mod.clientDataJSON, undefined);
 });
 
 check('the caller origin comes from the browser override, not from a tab', () => {

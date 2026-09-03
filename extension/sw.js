@@ -9,11 +9,16 @@
 //
 // The consent prompt is NOT here. It is in Black-Bag itself, on a layer-shell
 // surface that genuinely takes the keyboard, showing the origin this file
-// claimed. That arrangement is deliberate: an extension is the most exposed
-// component in the chain, so it must not be the thing that says yes. If this
-// file were replaced by a hostile one, the most it could do is ask for a
-// ceremony and be refused by the person looking at the screen — and if it lied
-// about the origin, that is the lie the person would see.
+// claimed, and it will not approve without the vault passphrase. That
+// arrangement is deliberate: an extension is the most exposed component in the
+// chain, so it must not be the thing that says yes. If this file were replaced
+// by a hostile one, the most it could do is ask for a ceremony — and if it lied
+// about the origin, that lie is what the person reads before typing.
+//
+// One thing a hostile replacement COULD still do: lie about the challenge.
+// Chromium does not authenticate requestDetailsJson to anything downstream, so
+// freshness rests on this file being honest. Consent does not close that, and
+// the docs say so rather than implying otherwise.
 //
 // THE ONE THING IN HERE THAT IS SECURITY-CRITICAL
 //
@@ -143,20 +148,16 @@ async function awaitAnswer(requestId, nonce) {
   throw new Error('Black-Bag was not answered in time');
 }
 
-/**
- * The client data the relying party will verify.
- *
- * Built here and returned verbatim alongside the signature, so the bytes the
- * agent hashed are exactly the bytes the relying party hashes. Anything that
- * regenerated this string on the way back — different key order, different
- * escaping — would produce a signature that does not verify, and the failure
- * would look like a broken key rather than a broken encoder.
- */
-function clientDataJSON(type, challengeB64url, origin, crossOrigin) {
-  return new TextEncoder().encode(
-    JSON.stringify({ type, challenge: challengeB64url, origin, crossOrigin: !!crossOrigin }),
-  );
-}
+// NOTE: this extension does NOT build clientDataJSON, and must not start.
+//
+// Those are the bytes that get hashed into the signature. Black-Bag builds them
+// itself, from the challenge and the origin it showed the human, and returns
+// them with the result for us to hand to Chromium verbatim. If this file
+// supplied them instead, the origin a person read on the consent screen would
+// bear no mechanical relationship to the origin the relying party verifies —
+// they would merely be two strings that usually agree — and a compromised
+// extension would have a signing oracle with attacker-chosen content in a fixed
+// position of the signed message.
 
 /** The true caller origin, from the browser rather than from us. */
 function callerOrigin(details) {
@@ -174,7 +175,6 @@ async function onCreate(info) {
   const rpId = details.rp?.id;
   if (!rpId) throw new Error('the relying party did not name itself');
 
-  const cdj = clientDataJSON('webauthn.create', details.challenge, caller.origin, caller.crossOrigin);
   const wantPrf = !!details.extensions?.prf;
 
   const begun = await callHost({
@@ -183,7 +183,8 @@ async function onCreate(info) {
     origin: caller.origin,
     rp_id: rpId,
     rp_name: details.rp?.name ?? null,
-    client_data_json: bytesToHex(cdj),
+    challenge: details.challenge,
+    cross_origin: caller.crossOrigin,
     user_handle: hexFromB64url(details.user.id),
     user_name: details.user.name ?? null,
     user_display_name: details.user.displayName ?? null,
@@ -200,7 +201,7 @@ async function onCreate(info) {
     rawId: b64urlFromHex(result.credential_id),
     authenticatorAttachment: 'platform',
     response: {
-      clientDataJSON: bytesToB64url(cdj),
+      clientDataJSON: b64urlFromHex(result.client_data_json),
       attestationObject: b64urlFromHex(result.attestation_object),
       authenticatorData: b64urlFromHex(result.authenticator_data),
       // Chromium REQUIRES this for ES256 and rejects the response without it.
@@ -226,8 +227,6 @@ async function onGet(info) {
   const rpId = details.rpId;
   if (!rpId) throw new Error('the relying party did not name itself');
 
-  const cdj = clientDataJSON('webauthn.get', details.challenge, caller.origin, caller.crossOrigin);
-
   // The PRF salts arrive RAW, exactly as the relying party supplied them.
   // Chromium does not apply SHA-256("WebAuthn PRF" || 0x00 || salt); the agent
   // does, so that an output is the same value a CTAP authenticator would give
@@ -239,7 +238,8 @@ async function onGet(info) {
     operation: 'assert',
     origin: caller.origin,
     rp_id: rpId,
-    client_data_json: bytesToHex(cdj),
+    challenge: details.challenge,
+    cross_origin: caller.crossOrigin,
     allow_credentials: (details.allowCredentials ?? []).map(c => hexFromB64url(c.id)),
     want_prf: !!evalSalts,
     prf_first_salt: evalSalts?.first ? hexFromB64url(evalSalts.first) : null,
@@ -266,7 +266,7 @@ async function onGet(info) {
     rawId: b64urlFromHex(result.credential_id),
     authenticatorAttachment: 'platform',
     response: {
-      clientDataJSON: bytesToB64url(cdj),
+      clientDataJSON: b64urlFromHex(result.client_data_json),
       authenticatorData: b64urlFromHex(result.authenticator_data),
       signature: b64urlFromHex(result.signature),
       userHandle: result.user_handle ? b64urlFromHex(result.user_handle) : null,
@@ -350,5 +350,5 @@ serialize(attach);
 
 // Exported for the test harness; unused in the browser.
 if (typeof module !== 'undefined') {
-  module.exports = { b64urlToBytes, bytesToB64url, hexToBytes, bytesToHex, clientDataJSON, callerOrigin };
+  module.exports = { b64urlToBytes, bytesToB64url, hexToBytes, bytesToHex, callerOrigin };
 }

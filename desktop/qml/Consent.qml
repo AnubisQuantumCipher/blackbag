@@ -11,11 +11,21 @@
 //
 // Three rules this sheet exists to enforce:
 //
-//   1. Nothing is approved by pressing Return. The primary action of every
-//      other sheet is Return or Ctrl+Return; here it is neither, because a
-//      person clearing a stack of dialogs must not be able to sign a login by
-//      reflex. Approval is Ctrl+Y, it is stated on screen, and there is a
-//      button for the mouse.
+//   1. Approving costs the master passphrase, every time. Not because the
+//      vault is locked — it is open, or this prompt would not be here — but
+//      because the agent socket only establishes that the caller runs as you,
+//      and everything in your session does. Without a proof, any process could
+//      register a ceremony, approve its own ceremony and be signed into your
+//      bank in silence. It is typed here, it crosses on stdin, and three wrong
+//      answers refuse the request outright.
+//
+//      This is a bar, not a boundary: a keylogger running as you defeats it,
+//      as it defeats every other use of that passphrase. What it removes is
+//      the silent case.
+//
+//   1b. Nothing is approved by pressing Return alone. Approval is Ctrl+Y, it
+//      is stated on screen, and there is a button for the mouse — a person
+//      clearing a stack of dialogs must not sign a login by reflex.
 //   2. The origin is rendered so a lookalike is visible: the registrable
 //      domain is bright and the rest is dimmed, so `bank.example.evil.test`
 //      reads as `evil.test` at a glance.
@@ -47,6 +57,8 @@ Item {
   property var ceremony: null
   /// Which credential the person has selected, when there is more than one.
   property string chosenCredential: ""
+  /// The proof. Never stored, never logged, wiped on every exit path.
+  property string passphrase: ""
 
   property string errorText: ""
   property bool busy: false
@@ -91,7 +103,7 @@ Item {
     consent.chosenCredential = offered.length === 1
       ? String(offered[0].credential_id) : ""
     consent.open_ = true
-    Qt.callLater(function () { consent.forceActiveFocus() })
+    Qt.callLater(function () { passField.forceActiveFocus() })
   }
 
   /// Host-initiated close: the ceremony went away underneath us, because it was
@@ -101,6 +113,8 @@ Item {
     consent.ceremony = null
     consent.chosenCredential = ""
     consent.errorText = ""
+    consent.passphrase = ""
+    passField.text = ""
   }
 
   function lapse() {
@@ -114,13 +128,18 @@ Item {
       consent.errorText = "choose which passkey to use"
       return
     }
+    if (consent.passphrase.length === 0) {
+      consent.errorText = "type your master passphrase to approve"
+      passField.forceActiveFocus()
+      return
+    }
     consent.errorText = ""
     consent.busy = true
     answerProcess.approving = true
     answerProcess.command = consent.chosenCredential.length > 0
-      ? ["black-bag", "agent", "passkey-approve", String(consent.ceremony.nonce),
+      ? ["black-bag", "agent", "passkey-answer", String(consent.ceremony.nonce),
          "--credential", consent.chosenCredential]
-      : ["black-bag", "agent", "passkey-approve", String(consent.ceremony.nonce)]
+      : ["black-bag", "agent", "passkey-answer", String(consent.ceremony.nonce)]
     answerProcess.running = true
   }
 
@@ -129,8 +148,8 @@ Item {
     consent.errorText = ""
     consent.busy = true
     answerProcess.approving = false
-    answerProcess.command = ["black-bag", "agent", "passkey-refuse",
-                             String(consent.ceremony.nonce)]
+    answerProcess.command = ["black-bag", "agent", "passkey-answer",
+                             String(consent.ceremony.nonce), "--refuse"]
     answerProcess.running = true
   }
 
@@ -138,10 +157,22 @@ Item {
     id: answerProcess
     property bool approving: true
     running: false
+    stdinEnabled: true
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
+    onStarted: {
+      // The passphrase crosses on stdin and the pipe closes immediately. There
+      // is no --passphrase flag anywhere in this project: /proc/<pid>/cmdline
+      // is world-readable, so an argv secret is a published secret.
+      if (answerProcess.approving) write(consent.passphrase + "\n")
+      stdinEnabled = false
+    }
     onExited: function (code) {
       consent.busy = false
+      // Wiped whether it worked or not, so a wrong answer does not leave the
+      // master passphrase sitting in a property until the next prompt.
+      consent.passphrase = ""
+      passField.text = ""
       if (code !== 0) {
         var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
         consent.errorText = err.length > 0 ? err : "the answer did not reach the vault"
@@ -362,6 +393,50 @@ Item {
       wrapMode: Text.WrapAtWordBoundaryOrAnywhere
       textFormat: Text.PlainText
       renderType: Text.NativeRendering
+    }
+
+    // ── the proof ────────────────────────────────────────────────────────────
+    ColumnLayout {
+      Layout.fillWidth: true
+      spacing: metric.space(6)
+
+      Text {
+        text: "YOUR MASTER PASSPHRASE"
+        color: Util.alpha(Color.foreground, 0.45)
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
+        font.letterSpacing: metric.spaceReal(1.2)
+        textFormat: Text.PlainText
+        renderType: Text.NativeRendering
+      }
+
+      InputField {
+        id: passField
+        Layout.fillWidth: true
+        echoMode: TextInput.Password
+        enabled: !consent.busy
+        placeholderText: "required to approve"
+        font.family: metric.font.family
+        font.pixelSize: metric.font.body
+        onTextChanged: consent.passphrase = text
+        // Return in this field approves, because reaching it took a deliberate
+        // act — typing the passphrase — which is the opposite of reflex.
+        Keys.onReturnPressed: consent.approve()
+        Keys.onEnterPressed: consent.approve()
+      }
+
+      Text {
+        Layout.fillWidth: true
+        text: "The vault is already open. This is asked because the socket "
+            + "cannot tell you from anything else running as you, and a "
+            + "signature is a login."
+        color: Util.alpha(Color.foreground, 0.4)
+        font.family: metric.font.family
+        font.pixelSize: metric.font.caption
+        wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+        textFormat: Text.PlainText
+        renderType: Text.NativeRendering
+      }
     }
 
     Text {
