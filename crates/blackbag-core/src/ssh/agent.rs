@@ -90,6 +90,12 @@ fn parse_sign(r: &mut Reader) -> Option<(Vec<u8>, Vec<u8>, u32)> {
     let key_blob = r.string().ok()?;
     let data = r.string().ok()?;
     let flags = r.u32().ok()?;
+    // A request with bytes left over is not one we understood. Ignoring the
+    // tail would sign `data` for a message whose real shape we do not know —
+    // and signing is the one thing here that cannot be taken back.
+    if !r.is_empty() {
+        return None;
+    }
     Some((key_blob, data, flags))
 }
 
@@ -328,5 +334,40 @@ mod tests {
             last_signed: None,
         };
         assert_eq!(respond(&mut f, &[99]), vec![reply::FAILURE]);
+    }
+
+    /// A SIGN_REQUEST with bytes left over is not one we understood, and
+    /// signing is the one thing here that cannot be taken back. The fuzz pass
+    /// that hardened the other parsers guarded the framing reader and left
+    /// this one, which is the parser that reaches a private key.
+    #[test]
+    fn a_sign_request_with_trailing_bytes_is_refused() {
+        let mut w = Writer::new();
+        w.u8(client::SIGN_REQUEST);
+        w.string(&ed25519_public_blob(&[1; 32]));
+        w.string(b"payload");
+        w.u32(0);
+        w.u8(0x41); // one byte we never asked for
+        let framed = w.into_bytes();
+        let mut r = Reader::new(&framed[1..]);
+        assert!(
+            parse_sign(&mut r).is_none(),
+            "a request we did not fully understand must not be signed");
+    }
+
+    /// And the exact same request without the tail still signs, so the guard
+    /// refuses the surprise rather than the shape.
+    #[test]
+    fn the_same_sign_request_without_the_tail_is_accepted() {
+        let mut w = Writer::new();
+        w.u8(client::SIGN_REQUEST);
+        w.string(&ed25519_public_blob(&[1; 32]));
+        w.string(b"payload");
+        w.u32(0);
+        let framed = w.into_bytes();
+        let mut r = Reader::new(&framed[1..]);
+        let parsed = parse_sign(&mut r).expect("a well-formed request parses");
+        assert_eq!(parsed.1, b"payload");
+        assert_eq!(parsed.2, 0);
     }
 }

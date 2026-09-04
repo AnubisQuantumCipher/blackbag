@@ -104,6 +104,21 @@ fn black_bag_json(text: &str) -> Result<Imported> {
     if doc.get("format").and_then(|f| f.as_str()) != Some("black-bag-export") {
         bail!("this is not a Black-Bag export; its `format` field does not say so");
     }
+    // Our own writer stamps `version` and, until now, our reader never looked.
+    // We check the foreign format's version (see the CXF reader below) and
+    // skipped our own, so a newer export read by an older build was accepted
+    // with its unknown fields dropped — the same silent drop the agent socket
+    // was hardened against. Absent means an export predating the field, which
+    // is version 1 by definition; anything else refuses by name.
+    match doc.get("version").map(|v| v.as_u64()) {
+        None | Some(Some(1)) => {}
+        Some(_) => bail!(
+            "this export was written by a newer Black-Bag ({}); this build \
+             understands version 1, and reading it anyway would drop whatever \
+             it added",
+            doc.get("version").map(|v| v.to_string()).unwrap_or_default()
+        ),
+    }
     let records = doc
         .get("records")
         .and_then(|r| r.as_array())
@@ -1904,5 +1919,31 @@ mod tests {
         assert_eq!(host_of("http://user:pw@host.tld:8443/"), Some("host.tld".into()));
         assert_eq!(host_of("example.org"), Some("example.org".into()));
         assert_eq!(host_of(""), None);
+    }
+
+    /// We check the foreign format's version and, until now, skipped our own.
+    /// A newer export read by an older build was accepted with whatever it
+    /// added silently dropped — the same class of defect the agent socket was
+    /// hardened against, on the format we control.
+    #[test]
+    fn a_newer_black_bag_export_is_refused_by_name() {
+        let doc = r#"{"format":"black-bag-export","version":2,"records":[]}"#;
+        let err = black_bag_json(doc).unwrap_err().to_string();
+        assert!(
+            err.contains("newer Black-Bag"),
+            "a version we do not understand must say so: {err}");
+    }
+
+    /// Version 1 is what we write, and an export predating the field is
+    /// version 1 by definition; neither may be refused.
+    #[test]
+    fn the_version_we_write_and_older_exports_without_one_are_accepted() {
+        for doc in [
+            r#"{"format":"black-bag-export","version":1,"records":[]}"#,
+            r#"{"format":"black-bag-export","records":[]}"#,
+        ] {
+            black_bag_json(doc)
+                .unwrap_or_else(|e| panic!("must accept {doc}: {e}"));
+        }
     }
 }

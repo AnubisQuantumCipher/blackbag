@@ -260,6 +260,34 @@ impl ServiceIface {
 
 // ── org.freedesktop.Secret.Collection ────────────────────────────────────────
 
+
+/// Read one `a{sv}` property, distinguishing "absent" from "unreadable".
+///
+/// An absent property is the caller declining to set it and yields the type's
+/// default. A property that is present but cannot be converted to its declared
+/// type is a caller error, and answering it with a default silently stores
+/// something the caller did not ask for.
+fn read_property<T>(
+    properties: &HashMap<String, OwnedValue>,
+    name: &str,
+) -> zbus::fdo::Result<T>
+where
+    T: Default + TryFrom<OwnedValue>,
+{
+    match properties.get(name) {
+        None => Ok(T::default()),
+        Some(value) => value
+            .try_clone()
+            .ok()
+            .and_then(|owned| T::try_from(owned).ok())
+            .ok_or_else(|| {
+                zbus::fdo::Error::InvalidArgs(format!(
+                    "{name} was set but could not be read as its declared type"
+                ))
+            }),
+    }
+}
+
 struct CollectionIface;
 
 #[interface(name = "org.freedesktop.Secret.Collection")]
@@ -284,14 +312,18 @@ impl CollectionIface {
         replace: bool,
         #[zbus(object_server)] object_server: &zbus::ObjectServer,
     ) -> zbus::fdo::Result<(OwnedObjectPath, OwnedObjectPath)> {
-        let label = properties
-            .get("org.freedesktop.Secret.Item.Label")
-            .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
-            .unwrap_or_default();
-        let attributes = properties
-            .get("org.freedesktop.Secret.Item.Attributes")
-            .and_then(|v| HashMap::<String, String>::try_from(v.try_clone().ok()?).ok())
-            .unwrap_or_default();
+        // `a{sv}` is the spec's own extension point, so a property a client
+        // never set is legitimate and defaults. A property that IS set and
+        // cannot be read as its declared type is not: silently defaulting it
+        // stored an item under a label or an attribute set the caller never
+        // asked for. Attributes matter most — `replace` below is gated on an
+        // exact attribute-set match, so an emptied set changes which item a
+        // store overwrites, and an item stored with no attributes is one
+        // nothing can look up again.
+        let label = read_property::<String>(
+            &properties, "org.freedesktop.Secret.Item.Label")?;
+        let attributes = read_property::<HashMap<String, String>>(
+            &properties, "org.freedesktop.Secret.Item.Attributes")?;
 
         let value = decrypt_secret(&secret)
             .await
