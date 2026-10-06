@@ -233,6 +233,108 @@ pub fn digest_of(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// ── the offsite step ───────────────────────────────────────────────────────
+
+/// Where the owner may put an offsite step: `$XDG_CONFIG_HOME/black-bag/offsite`,
+/// or `~/.config/black-bag/offsite`.
+///
+/// A copy on the same disk survives a deleted file, not a dead disk. Getting it
+/// further away is different on every machine — a NAS, a phone, a backup tool
+/// the owner already trusts — so this program does not pretend to know how. It
+/// runs one executable the owner put there, hands it the path of the copy it
+/// has just checked, and repeats what that executable says.
+pub fn offsite_hook_path() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir).join("black-bag/offsite"));
+        }
+    }
+    let home = std::env::var("HOME").map_err(|_| anyhow!("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".config/black-bag/offsite"))
+}
+
+/// The offsite step at `path`, if there is one and it can be trusted.
+///
+/// `Ok(None)` when nothing is there: no step configured, which is not an
+/// error. An error when something is there that this program will not run —
+/// a symlink, a file another account owns, or one that anyone but the owner
+/// could rewrite. The deck runs it when asked to back up, so whoever can
+/// change this file can run code as the owner the next time they press it.
+pub fn trusted_offsite_hook(path: &Path) -> Result<Option<PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("failed to look at {}: {e}", path.display())),
+    };
+    let uid = unsafe { libc::geteuid() };
+    let refuse = |why: &str| Err(anyhow!("the offsite step {} was not run: {why}", path.display()));
+    if meta.file_type().is_symlink() {
+        return refuse("it is a symlink; put the program itself there");
+    }
+    if !meta.is_file() {
+        return refuse("it is not a regular file");
+    }
+    if meta.uid() != uid {
+        return refuse("another account owns it");
+    }
+    if meta.mode() & 0o022 != 0 {
+        return refuse("someone other than its owner can change it (chmod go-w)");
+    }
+    if meta.mode() & 0o100 == 0 {
+        return refuse("it is not executable (chmod u+x)");
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid path {}", path.display()))?;
+    let dmeta = fs::metadata(dir).with_context(|| format!("failed to look at {}", dir.display()))?;
+    if dmeta.uid() != uid || dmeta.mode() & 0o022 != 0 {
+        return refuse("its directory is not the owner's alone, so the file could be swapped");
+    }
+    Ok(Some(path.to_path_buf()))
+}
+
+/// What the offsite step said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offsite {
+    pub ok: bool,
+    /// Its last line of output — the verdict on success, the reason on failure.
+    pub said: String,
+}
+
+/// Run the offsite step on `copy` and wait for it.
+///
+/// Nothing is read from the terminal and no secret is passed: the copy is the
+/// sealed file, already encrypted, and its path is the only argument.
+pub fn run_offsite(hook: &Path, copy: &Path) -> Result<Offsite> {
+    let out = std::process::Command::new(hook)
+        .arg(copy)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("failed to start {}", hook.display()))?;
+    let last = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string()
+    };
+    let ok = out.status.success();
+    let mut said = if ok { last(&out.stdout) } else { last(&out.stderr) };
+    if said.is_empty() {
+        said = if ok { last(&out.stderr) } else { last(&out.stdout) };
+    }
+    if said.is_empty() {
+        said = match out.status.code() {
+            Some(c) => format!("it said nothing and exited {c}"),
+            None => "it said nothing and was killed by a signal".to_string(),
+        };
+    }
+    Ok(Offsite { ok, said })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +459,88 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = Log::load(&dir.path().join("nope.json")).unwrap();
         assert!(log.entries.is_empty());
+    }
+
+    fn hook(dir: &Path, body: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("offsite");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    fn private_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn no_offsite_step_is_not_an_error() {
+        let dir = private_dir();
+        assert_eq!(trusted_offsite_hook(&dir.path().join("offsite")).unwrap(), None);
+    }
+
+    #[test]
+    fn an_offsite_step_anyone_could_rewrite_is_not_run() {
+        let dir = private_dir();
+        let path = hook(dir.path(), "echo ran", 0o772);
+        let err = trusted_offsite_hook(&path).unwrap_err().to_string();
+        assert!(err.contains("other than its owner"), "{err}");
+    }
+
+    #[test]
+    fn an_offsite_step_in_a_shared_directory_is_not_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_dir();
+        let path = hook(dir.path(), "echo ran", 0o700);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let err = trusted_offsite_hook(&path).unwrap_err().to_string();
+        assert!(err.contains("directory"), "{err}");
+    }
+
+    #[test]
+    fn a_symlinked_offsite_step_is_not_run() {
+        let dir = private_dir();
+        let real = hook(dir.path(), "echo ran", 0o700);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = trusted_offsite_hook(&link).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn a_non_executable_offsite_step_is_named_not_ignored() {
+        let dir = private_dir();
+        let path = hook(dir.path(), "echo ran", 0o600);
+        let err = trusted_offsite_hook(&path).unwrap_err().to_string();
+        assert!(err.contains("not executable"), "{err}");
+    }
+
+    #[test]
+    fn the_offsite_step_gets_the_copy_and_its_verdict_is_repeated() {
+        let dir = private_dir();
+        let path = hook(dir.path(), "echo working; echo \"sent $1\"", 0o700);
+        let hook = trusted_offsite_hook(&path).unwrap().unwrap();
+        let got = run_offsite(&hook, Path::new("/copy/vault.cbor")).unwrap();
+        assert_eq!(got, Offsite { ok: true, said: "sent /copy/vault.cbor".into() });
+    }
+
+    #[test]
+    fn a_failed_offsite_step_reports_its_reason() {
+        let dir = private_dir();
+        let path = hook(dir.path(), "echo progress; echo 'disk is offline' >&2; exit 3", 0o700);
+        let got = run_offsite(&path, Path::new("/copy")).unwrap();
+        assert_eq!(got, Offsite { ok: false, said: "disk is offline".into() });
+    }
+
+    #[test]
+    fn a_silent_failure_still_says_something() {
+        let dir = private_dir();
+        let path = hook(dir.path(), "exit 4", 0o700);
+        let got = run_offsite(&path, Path::new("/copy")).unwrap();
+        assert!(!got.ok);
+        assert!(got.said.contains("exited 4"), "{}", got.said);
     }
 }

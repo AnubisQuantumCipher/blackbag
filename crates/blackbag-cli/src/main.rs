@@ -93,6 +93,10 @@ enum Command {
     /// to forget. What this adds over `cp` is the record — what was copied,
     /// when, at what epoch, and its digest — which is what lets a passkey say
     /// truthfully whether it is backed up.
+    ///
+    /// If `~/.config/black-bag/offsite` is an executable only you can change,
+    /// it runs next with the copy's path and what it says is repeated: that is
+    /// how a copy gets off this machine when you press back up in the deck.
     Backup(BackupArgs),
     /// Report vault and host posture.
     Doctor(DoctorArgs),
@@ -1939,6 +1943,22 @@ fn cmd_backup(path: &std::path::Path, args: BackupArgs) -> Result<()> {
         "Passkeys written at or before epoch {} now report themselves backed up.",
         file.header.epoch
     );
+
+    // The copy above is made, checked and recorded whatever happens next. If
+    // the owner configured a way to take it off this machine, run that now and
+    // repeat its verdict — not ours, because only it knows where it went.
+    let hook = blackbag_core::backup::offsite_hook_path()?;
+    if let Some(hook) = blackbag_core::backup::trusted_offsite_hook(&hook)? {
+        let copy = to.canonicalize().unwrap_or(to.clone());
+        let got = blackbag_core::backup::run_offsite(&hook, &copy)?;
+        if !got.ok {
+            bail!(
+                "the copy here is made and recorded, but the offsite step did not finish: {}",
+                got.said
+            );
+        }
+        println!("offsite: {}", got.said);
+    }
     Ok(())
 }
 

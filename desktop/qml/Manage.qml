@@ -168,14 +168,17 @@ Item {
     onExited: function (code) {
       manage.busy = false
       var err = String(this.stderr && this.stderr.text ? this.stderr.text : "").trim()
+      // A failed offsite step still leaves a recorded copy here, so the list
+      // and the posture are refreshed either way.
+      manage.loadCopies(false)
+      manage.changed()
       if (code !== 0) { manage.errorText = err.length > 0 ? err : "the copy was not made"; return }
       // The engine's own sentence: it names the byte count and the epoch, and
-      // says the copy was read back and checked. Repeated, not paraphrased.
-      manage.noteText = String(this.stdout.text || "").trim().split("\n")[0]
-      manage.loadCopies(false)
-      // A backup changes what the passkeys say about themselves, so the deck's
-      // posture is now out of date.
-      manage.changed()
+      // says the copy was read back and checked. Repeated, not paraphrased —
+      // and so is the offsite step's verdict, when one ran.
+      var lines = String(this.stdout.text || "").trim().split("\n")
+      var offsite = lines.filter(function (l) { return l.indexOf("offsite: ") === 0 })
+      manage.noteText = lines[0] + (offsite.length > 0 ? "\n" + offsite[offsite.length - 1] : "")
     }
   }
 
@@ -1459,6 +1462,13 @@ Item {
             Blurb {
               text: "Put it on removable media or another machine. Beside the vault it "
                   + "survives a deleted file and nothing else."
+              tone: Util.alpha(Color.foreground, 0.5)
+            }
+
+            Blurb {
+              visible: backupProcess.running
+              text: "Copying and checking. If you set up an offsite step, it runs next "
+                  + "and can take a few minutes; this sheet waits for its answer."
               tone: Util.alpha(Color.foreground, 0.5)
             }
 
