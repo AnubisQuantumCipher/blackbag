@@ -222,8 +222,10 @@ Item {
     manage.keyPath = (manage.homeDir.length > 0 ? manage.homeDir : "~") + "/black-bag-recovery.key"
     manage.importPath = (manage.homeDir.length > 0 ? manage.homeDir : "~") + "/export.json"
     manage.exportPath = (manage.homeDir.length > 0 ? manage.homeDir : "~") + "/black-bag-export.json"
+    // One place, not a new file in the home directory on every press. A copy
+    // already there is moved aside with a timestamp by the engine, never lost.
     manage.backupPath = (manage.homeDir.length > 0 ? manage.homeDir : "~")
-                      + "/black-bag-backup-" + Model.shortStamp() + ".cbor"
+                      + "/.local/share/black-bag-copies/vault.cbor"
     manage.clear()
     manage.open_ = true
     if (manage.section === "access") manage.loadAccess()

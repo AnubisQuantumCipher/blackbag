@@ -2866,6 +2866,18 @@ Item {
                       if (root.unlocked) root.refreshRecords()
                     }
                   }
+                  // One press, the whole backup: the sheet opens on BACKUP and
+                  // starts at once, so its progress and verdict are on screen.
+                  // The sealed file needs no passphrase, so this works locked too.
+                  ActionButton {
+                    label: "BACK UP"
+                    tone: Color.accent
+                    enabledAction: !manageSheet.open_
+                    onActivated: {
+                      manageSheet.begin("backup")
+                      manageSheet.runBackup()
+                    }
+                  }
                   Item { Layout.fillWidth: true }
                 }
               }
